@@ -36,7 +36,7 @@ jobs:
   build:
     # macos-14 still ships Xcode 15.x: its iig matches the xnu-8796 IORPC ABI
     # (Xcode 16's iig emits IORPC.kernelContent, which this xnu lacks)
-    runs-on: macos-14
+    runs-on: macos-13
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
@@ -61,7 +61,9 @@ jobs:
           sudo chmod +x /usr/local/bin/xcodes
           sw_vers
           ls -d /Applications/Xcode*.app
-          XC=$(ls -d /Applications/Xcode_*.app | sort -V | head -1)
+          XC=$(ls -d /Applications/Xcode_15*.app 2>/dev/null | sort -V | head -1)
+          if [ -z "$XC" ]; then XC=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1); fi
+          echo "selected Xcode: $XC"
           echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"
           sudo xcode-select -s "$XC"
           xcodebuild -version
