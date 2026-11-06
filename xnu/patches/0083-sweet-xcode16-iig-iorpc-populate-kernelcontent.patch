@@ -1,0 +1,37 @@
+diff --git a/iokit/Kernel/IOUserServer.cpp b/iokit/Kernel/IOUserServer.cpp
+index 5d1d922..067fa6e 100644
+--- a/iokit/Kernel/IOUserServer.cpp
++++ b/iokit/Kernel/IOUserServer.cpp
+@@ -2381,6 +2381,7 @@ OSMetaClassBase::Invoke(IORPC rpc)
+ 	if (!message) {
+ 		return kIOReturnIPCError;
+ 	}
++	rpc.kernelContent = message;
+ 	message->flags |= kIORPCMessageKernel;
+ 
+ 	us = NULL;
+@@ -3054,6 +3055,7 @@ IOUserServer::kernelDispatch(OSObject * obj, IORPC rpc)
+ 	if (!message) {
+ 		return kIOReturnIPCError;
+ 	}
++	rpc.kernelContent = message;
+ 
+ 	if (OSObject_Instantiate_ID == message->msgid) {
+ 		ret = objectInstantiate(obj, rpc, message);
+@@ -3209,7 +3211,7 @@ IOUserServer::server(ipc_kmsg_t requestkmsg, ipc_kmsg_t * pReply)
+ 		msgout = (typeof(msgout))ikm_header(replykmsg);
+ 	}
+ 
+-	IORPC rpc = { .message = msgin, .reply = msgout, .sendSize = msgin->msgh.msgh_size, .replySize = replyAlloc };
++	IORPC rpc = { .message = msgin, .reply = msgout, .sendSize = msgin->msgh.msgh_size, .replySize = replyAlloc, .kernelContent = message };
+ 
+ 	if (object) {
+ 		kern_allocation_name_t prior;
+@@ -3358,6 +3360,7 @@ IOUserServerUEXTTrap(OSObject * object, void * p1, void * p2, void * p3, void *
+ 	rpc.sendSize  = mach->msgh.msgh_size;
+ 	rpc.reply     = (IORPCMessageMach *) (p + inSize);
+ 	rpc.replySize = ((uint32_t) (sizeof(buffer.buffer) - inSize));    // inSize was checked
++	rpc.kernelContent = message;
+ 
+ 	message->objects[0] = 0;
+ 	if ((action = OSDynamicCast(OSAction, object))) {
