@@ -1,0 +1,57 @@
+name: ios-root
+
+on:
+  workflow_dispatch:
+    inputs:
+      ipsw_url:
+        description: "iPhone X (D22AP) iOS 16 IPSW URL"
+        default: "https://updates.cdn-apple.com/2025FallFCS/fullrestores/122-77006/1158E502-D76D-4226-AA06-ED5E30CD1111/iPhone10,3,iPhone10,6_16.7.16_20H392_Restore.ipsw"
+      size:
+        description: "HFS+ root image size"
+        default: "12G"
+
+# The root image is several GiB: the download of the APFS components plus the
+# output has to fit on the runner disk, so this job runs alone.
+concurrency:
+  group: ios-root
+  cancel-in-progress: false
+
+jobs:
+  root:
+    runs-on: macos-15
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tools
+        run: |
+          brew install apfs-fuse hfsprogs rsync
+          which apfs-fuse mkfs.hfsplus rsync
+          df -h "$HOME"
+
+      - name: Build the HFS+ root
+        run: |
+          mkdir -p work
+          bash tools/mkiosroot-staged.sh work "${{ inputs.ipsw_url }}" work/ios-root.img "${{ inputs.size }}"
+          ls -la work/ios-root.img
+          shasum -a 256 work/ios-root.img | tee work/ios-root.img.sha256
+
+      - name: Split into chunks for the microSD transfer
+        run: |
+          # the phone is flashed through TWRP from a FAT32 card, so a single
+          # >4 GiB file cannot be copied there; split it into 2 GiB parts
+          mkdir -p work/parts
+          split -b 2G -d -a 3 work/ios-root.img work/parts/ios-root.img.part
+          ls -la work/parts
+          (cd work/parts && shasum -a 256 * > SHA256SUMS)
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ios-root
+          path: |
+            work/ios-root.img
+            work/ios-root.img.sha256
+            work/parts/
+          retention-days: 7
+          if-no-files-found: warn
