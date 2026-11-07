@@ -79,6 +79,36 @@ jobs:
           MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }}
         run: bash build.sh
 
+      - name: Verify A10 port patches applied
+        run: |
+          # dxb applies patches with `git apply --check` and SKIPS a patch that
+          # does not apply, so a broken port patch would still yield a green
+          # build - with a stock kernel.  Fail the job if the A10 markers are
+          # missing from the patched source tree.
+          set -uo pipefail
+          fail=0
+          need() { # file pattern mode what
+            if [ ! -f "$1" ]; then echo "FAIL $4: $1 missing"; fail=1; return; fi
+            if grep -q -- "$2" "$1"; then
+              if [ "$3" = present ]; then echo "ok   $4"; else echo "FAIL $4: '$2' still present in $1"; fail=1; fi
+            else
+              if [ "$3" = absent ]; then echo "ok   $4"; else echo "FAIL $4: '$2' not found in $1"; fail=1; fi
+            fi
+          }
+          need xnu/pexpert/pexpert/arm64/SWEET.h 'SWEET_GICV2' present '0084 GICv2 support'
+          need xnu/pexpert/pexpert/arm64/SWEET.h '#define __ARM_16K_PG__' absent '0085 16K page knob removed'
+          need xnu/makedefs/MakeInc.def 'SWEET_4K_USERVA' present '0086 4K user VA'
+          need xnu/osfmk/arm64/arm_vm_init.c 'SWEET_EARLY_FB_PA   0xEC000000ULL' present '0087 early framebuffer'
+          need xnu/bsd/dev/sweet_emmc.c 'A10 Samsung DW-MMC0' present '0090 A10 eMMC driver'
+          need xnu/bsd/dev/sweet_emmc.c 'HDATA_WIDTH' present '0090 64-bit FIFO handling'
+          need xnu/bsd/kern/bsd_init.c 'SWEET root selection' present '0091 root diagnostics'
+          need xnu/bsd/vfs/vfs_subr.c 'SWEET root mount: bdev' present '0091 mount diagnostics'
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::A10 port patches did not apply cleanly"
+            exit 1
+          fi
+          echo "A10 port markers OK"
+
       - name: Package build tree for local compiles
         if: always()
         run: |
