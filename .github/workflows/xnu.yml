@@ -48,9 +48,23 @@ jobs:
           git -C dxb checkout -q FETCH_HEAD
           # 12.5-14.3 use the top-level patches dir; ours go next to blacktop's
           cp xnu/patches/*.patch xnu/patches/*.sh dxb/patches/
-          # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64
-          sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
-          grep -c 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh
+          # libfirehose_kernel is a separate Xcode build.  Build only its arm64
+          # slice; it is kernel code, so make the compile freestanding to use
+          # XNU's C11 atomic definitions, and target the lowest common CPU core
+          # (Cortex-A53 = ARMv8.0, no LSE).  Otherwise clang emits ARMv8.1
+          # ldadd/cas/swp and the kernel dies with "Undefined kernel
+          # instruction" in __firehose_buffer_tracepoint_flush.
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("dxb/build.sh")
+          s = p.read_text()
+          old = 'ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"'
+          new = 'ARCHS="arm64" VALID_ARCHS="arm64" OTHER_CFLAGS="-I${WORK_DIR}/xnu/EXTERNAL_HEADERS -I${WORK_DIR}/xnu/bsd -ffreestanding -mcpu=cortex-a53+crypto"'
+          if s.count(old) != 1:
+              raise SystemExit("pinned build.sh libfirehose target changed; refusing an unverified edit")
+          p.write_text(s.replace(old, new))
+          PY
+          grep -F 'ARCHS="arm64" VALID_ARCHS="arm64" OTHER_CFLAGS="-I${WORK_DIR}/xnu/EXTERNAL_HEADERS -I${WORK_DIR}/xnu/bsd -ffreestanding -mcpu=cortex-a53+crypto"' dxb/build.sh
           ls dxb/patches
 
       - name: Deps
@@ -77,7 +91,20 @@ jobs:
         env:
           # keep going after errors so one run reports every compile failure
           MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }}
-        run: bash build.sh
+        run: |
+          set -o pipefail
+          bash build.sh 2>&1 | tee ../xnu-build.log
+
+      - name: Scan built kernel for ARMv8.1 LSE instructions
+        run: |
+          set -euo pipefail
+          # Cortex-A73/A53 are ARMv8.0: an LSE (ldadd/cas/swp) in kernel text is
+          # an undefined-instruction panic waiting to happen.  This is exactly
+          # what killed probe #10 inside libfirehose_kernel.
+          python3 -m venv .venv-lse-check
+          . .venv-lse-check/bin/activate
+          python -m pip install --disable-pip-version-check 'capstone==5.0.6'
+          python tools/check-arm64-lse.py dxb/fakeroot/System/Library/Kernels/kernel.development.sweet
 
       - name: Verify A10 port patches applied
         run: |
