@@ -103,6 +103,7 @@ jobs:
           need dxb/xnu/bsd/dev/sweet_emmc.c 'HDATA_WIDTH' present '0090 64-bit FIFO handling'
           need dxb/xnu/bsd/kern/bsd_init.c 'SWEET root selection' present '0091 root diagnostics'
           need dxb/xnu/bsd/vfs/vfs_subr.c 'SWEET root mount: bdev' present '0091 mount diagnostics'
+          need dxb/xnu/iokit/bsddev/IOKitBSDInit.cpp 'sweet_emmc_rootdev' present '0092 eMMC root hook'
           if [ "$fail" -ne 0 ]; then
             echo "::error::A10 port patches did not apply cleanly"
             exit 1

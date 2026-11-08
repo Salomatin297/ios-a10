@@ -1,0 +1,33 @@
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -769,19 +769,23 @@
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ //
+ //	SWEET: root on a GPT partition of the internal UFS (bsd/dev/sweet_ufs.c)
++//	or of the A10 eMMC (bsd/dev/sweet_emmc.c).  Both drivers expose a
++//	synthetic block device that the generic IOKit lookup cannot find.
+ //
+-	if (strcmp(rdBootVar, "ufsroot0") == 0) {
++	if (strcmp(rdBootVar, "ufsroot0") == 0 ||
++	    strcmp(rdBootVar, "emmcroot0") == 0) {
+ 		extern int sweet_ufs_rootdev(dev_t *dev);
++		extern int sweet_emmc_rootdev(dev_t *dev);
++		int root_error = (strncmp(rdBootVar, "emmc", 4) == 0) ?
++		    sweet_emmc_rootdev(root) : sweet_ufs_rootdev(root);
++
+ 		OSSafeReleaseNULL(matching);
+-		int ufs_error = sweet_ufs_rootdev(root);
+-		if (ufs_error) {
+-			panic("IOFindBSDRoot: SWEET UFS root %s unavailable: %d", rdBootVar, ufs_error);
++		if (root_error) {
++			panic("IOFindBSDRoot: SWEET root %s unavailable: %d", rdBootVar, root_error);
+ 		}
+ 		strlcpy(rootName, rdBootVar, rootNameSize);
+ 		IOLog("BSD root: %s, major %d, minor %d\n", rootName, major(*root), minor(*root));
+-#if defined(ARM64_BOARD_CONFIG_SWEET)
+-		IOLog("SWEET root handoff: emmcroot0 -> VFS root mount\n");
+-#endif
++		IOLog("SWEET root handoff: %s -> VFS root mount\n", rdBootVar);
+ 		*oflags = 0;
+ 		goto iofrootx;
+ 	}
