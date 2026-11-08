@@ -22,20 +22,32 @@ then failed where expected:
 * Root image: `tools/mkiosroot-staged.sh` is now macOS-native (`hdiutil`,
   `newfs_hfs -s -J`, `rsync -aH --numeric-ids`), copies the APFS volume roots
   directly, hardlinks the dyld cache/cryptex fallbacks, adds logd markers and
-  the keybag. `root.yml` builds a 12 GiB image on `macos-15-arm64`, verifies
-  ownership, gzips it and splits it into 2 GiB parts for the FAT32 microSD.
+  the keybag. `root.yml` builds a **20 GiB** image on `macos-15-arm64`, verifies
+  ownership as root, gzips it and splits it into 2 GiB parts for the FAT32
+  microSD.
 * CI probes: `42490749750` measured the root (OS 4.8G + SystemOS 2.4G +
   AppOS 4.4M ~= 7.2G, 46 GiB free on the runner); `42491853716` confirmed
   `hdiutil attach -owners on` preserves uid/gid 0 and survives remount +
   `fsck_hfs`.
-* Root build run: `42492282763` (commit `d136639`), artifact `ios-root`.
-  **Writing the image into `userdata` is destructive and still needs explicit
-  user confirmation.**
+* Root build run: `42495934001` (commit `01eb781`), artifact `ios-root` id
+  `13624355897` (6,021,319,162 bytes). The 20 GiB HFSX image holds 11 GiB
+  (a 12 GiB volume left only 923 MiB free), fsck clean; `Applications` 0:80 and
+  `System` 0:0 verified. Parts: 2,147,483,648 + 2,147,483,648 + 1,726,350,783,
+  gzip total 6,021,318,079, plus `SHA256SUMS` (431 bytes).
+* Probe16 (`dist/a10_probe16.zip`, 6,050,466 bytes) adds
+  `emmcw=1 rootrw=1 ignition_level=1 ...` so the root mounts read-write and
+  launchd starts after the write. Boot SHA256 `110846EB...245B946`.
+* `dist/a10_write_root.zip` runs in TWRP, checks the three part sizes, `gzip -t`,
+  refuses parts on internal storage, streams
+  `cat parts | gzip -dc > /dev/block/by-name/userdata`, then checks the HFSX
+  signature `HX` at offset 1024. **Writing the image into `userdata` is
+  destructive and still needs explicit user confirmation.**
 
-**Next action:** wait for `42492282763`, download/verify the parts one at a
-time, put them on the microSD, then (after confirmation) run in TWRP:
-`cat ios-root.img.gz.part* | gzip -dc | dd of=/dev/block/by-name/userdata bs=4M`.
-Boot probe15 again and check for a successful HFS+ mount / launchd.
+**Next action:** download artifact `13624355897`, extract the three parts
+straight to the microSD (`tools/stage_root_to_sd.py`), copy
+`a10_write_root.zip` + `a10_probe16.zip`, then (after confirmation) flash
+`a10_write_root.zip`, reboot with `a10_probe16.zip` and check for a successful
+HFS+ mount / `launchd`.
 
 **Brief history:** probe11 fixed the ARMv8.1 LSE `ldadd` panic (0 LSE in the
 kernel) but stopped in `kperf_init_early()` because `SweetCPU` did not match
