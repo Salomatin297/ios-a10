@@ -15,7 +15,7 @@ works.** Probe15 selected `emmcroot0` / GPT `userdata` (`bdev=1,0`) with no
 
 * probe15 kernel CI run `42490085753` (commit `0a5cef1`); ZIP
   `a10_probe15.zip` sha256 `B61967E6...F41E6`, rollback
-  `a10_restore_boot.zip` sha256 `A8ACB70E...703434F1` (extended to probe16).
+  `a10_restore_boot.zip` sha256 `21B5DD5A...13556` (extended to probe17).
 * Patch `0095` reserves 32 MiB of low-globals VA under
   `ARM64_BOARD_CONFIG_SWEET` for the early framebuffer alias; this fixed the
   probe14 `pmap_ttne` collision.

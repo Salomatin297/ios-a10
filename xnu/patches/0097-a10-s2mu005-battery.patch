@@ -78,7 +78,7 @@ diff --git a/bsd/dev/a10_battery.c b/bsd/dev/a10_battery.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/a10_battery.c
-@@ -0,0 +1,324 @@
+@@ -0,0 +1,339 @@
 +/*
 + * A10 (Exynos 7884B) S2MU005 fuel gauge and charger status.
 + *
@@ -187,7 +187,11 @@ new file mode 100644
 +		return EBUSY;
 +	}
 +	con = a10_i2c_rd(base, S3C_IICCON);
-+	con &= ~(IICCON_IRQEN | IICCON_IRQPEND);
++	con &= ~IICCON_IRQEN;
++	if (!repeated) {
++		/* Idle bus: drop a stale pending bit before the first START. */
++		con &= ~IICCON_IRQPEND;
++	}
 +	con |= IICCON_ACKEN;
 +	a10_i2c_wr(base, S3C_IICCON, con);
 +
@@ -197,6 +201,10 @@ new file mode 100644
 +	delay(1);
 +	a10_i2c_wr(base, S3C_IICCON, con);
 +	a10_i2c_wr(base, S3C_IICSTAT, stat | IICSTAT_START);
++	if (repeated) {
++		/* Release the pending bit now that the START is armed. */
++		a10_i2c_wr(base, S3C_IICCON, con & ~IICCON_IRQPEND);
++	}
 +
 +	if (a10_i2c_wait(base, S3C_IICCON, IICCON_IRQPEND, true) != 0) {
 +		a10_i2c_stop(base);
@@ -211,8 +219,13 @@ new file mode 100644
 +	return 0;
 +}
 +
++/*
++ * keep_pending leaves the interrupt-pending bit set for the last byte of the
++ * write phase: the s3c2440 needs it held until the repeated START is armed,
++ * otherwise writing IICSTAT without START first generates a STOP.
++ */
 +static int
-+a10_i2c_write(vm_offset_t base, uint8_t byte)
++a10_i2c_write(vm_offset_t base, uint8_t byte, bool keep_pending)
 +{
 +	uint32_t con;
 +
@@ -225,8 +238,10 @@ new file mode 100644
 +		a10_i2c_stop(base);
 +		return ENXIO;
 +	}
-+	con = a10_i2c_rd(base, S3C_IICCON);
-+	a10_i2c_wr(base, S3C_IICCON, con & ~IICCON_IRQPEND);
++	if (!keep_pending) {
++		con = a10_i2c_rd(base, S3C_IICCON);
++		a10_i2c_wr(base, S3C_IICCON, con & ~IICCON_IRQPEND);
++	}
 +	return 0;
 +}
 +
@@ -244,7 +259,7 @@ new file mode 100644
 +	if (error != 0) {
 +		return error;
 +	}
-+	error = a10_i2c_write(base, reg);
++	error = a10_i2c_write(base, reg, true);
 +	if (error != 0) {
 +		return error;
 +	}
