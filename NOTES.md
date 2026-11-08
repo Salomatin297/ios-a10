@@ -32,14 +32,27 @@ registered, and `ml_set_max_cpus()` was never called. KPERF is enabled
   `IOService::startCandidate()` start call.
 CI verifies the 0093 markers so a silently-skipped patch fails the job.
 
-**Next action:** flash `C:\Users\User\iOS-Port\dist\a10_probe12.zip` via TWRP
-(microSD only; USB data lines are broken) and photograph the screen. Probe12
-kernel `0DF910C5...BF566464`, boot image `462C267A...3236C5A6`, ZIP
-`A0BA8717...FE49CA16`. Expected: `SWEET CPU: start node=cpu0 ...`,
-`ml_processor_register>` lines, `... came alive; SGI1 OK`,
-`A10_IOKIT_MATCHING_RETURNED`, `A10_VM_RESTRICTIONS_DONE`, `A10_KPERF_DONE`,
-then `A10_BSD_INIT_ENTER`. Rollback: `dist/a10_restore_boot.zip` (searches
-probe6/7/8/9/10/11/12 backups; sha256 `232C4EFC...D6087CB9`).
+**Probe12 result (2026-11-08):** XNU matched and registered the boot CPU,
+then panicked at `SweetCPU.cpp:198` (`startup timeout (reset/MMU/GIC/SGI)`,
+tid 131). `processor_start()` had returned and `initialized` was set, but
+`SIGPdisabled` was never cleared: the GICv2 self-SGI was not delivered.
+Root cause: `GICD_SGIR_FILTER_SELF` was `(2U << 8)`, while GICv2 places
+`TargetListFilter` in bits `[25:24]`; the write `0x201` decoded as filter
+`0b00` with an empty target list.
+
+**Probe13 fix (patch `0094`, CI run `42484824494`, green):** correct the
+filter to `(2U << 24)` in a new patch after 0093 (do not rewrite 0084, to keep
+CI patch ordering stable) and print `initialized`/`signal_enabled` on a
+startup timeout. CI verifies both markers.
+
+**Next action:** flash `C:\Users\User\iOS-Port\dist\a10_probe13.zip` via TWRP
+(microSD only; USB data lines are broken) and photograph the screen. Probe13
+kernel `3EF17950...B30564`, boot image `300939BB...01FF86`, ZIP
+`2AABDAB3...21C89B`; rollback ZIP `B739C26B...4FB10F60` (searches through
+`boot.before-probe13.img`). Expected: `... came alive; SGI1 OK`,
+`A10_KPERF_DONE`, then `A10_BSD_INIT_ENTER`. If it times out again, the new
+line distinguishes `initialized=1 signal_enabled=0` (SGI still not delivered)
+from `initialized=0` (reset/MMU path did not reach `initCPU()`).
 
 ## Agent handoff / active work (2026-10-15, latest)
 
