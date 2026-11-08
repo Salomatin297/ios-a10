@@ -6,16 +6,16 @@ The A10 bring-up lives in `C:\Users\User\iOS-Port`; its consolidated handoff is
 **`C:\Users\User\iOS-Port\STATUS.md`** (read it first). This repo is the build
 source + CI for it (`a10` branch, pushed to `https://github.com/Salomin297/ios-a10`).
 
-**State (2026-11-08 evening, probe15): the eMMC root path works.** Probe15
-selected `emmcroot0` / GPT `userdata` (`bdev=1,0`) with no `pmap_ttne` panic,
-then failed where expected:
+**State (2026-11-08 night, root image ready to write): the eMMC root path
+works.** Probe15 selected `emmcroot0` / GPT `userdata` (`bdev=1,0`) with no
+`pmap_ttne` panic, then failed where expected:
 `hfs_validateHFSPlusVolumeHeader: unknown volume signature: 20` and
 `hfs_mountfs returned error=22` — `userdata` is not HFS+ yet. Photo:
 `C:\Users\User\iOS-Port\dist\probe15_emmcroot.jpg`.
 
 * probe15 kernel CI run `42490085753` (commit `0a5cef1`); ZIP
   `a10_probe15.zip` sha256 `B61967E6...F41E6`, rollback
-  `a10_restore_boot.zip` sha256 `8F92F023...E827`.
+  `a10_restore_boot.zip` sha256 `A8ACB70E...703434F1` (extended to probe16).
 * Patch `0095` reserves 32 MiB of low-globals VA under
   `ARM64_BOARD_CONFIG_SWEET` for the early framebuffer alias; this fixed the
   probe14 `pmap_ttne` collision.
@@ -25,29 +25,36 @@ then failed where expected:
   the keybag. `root.yml` builds a **20 GiB** image on `macos-15-arm64`, verifies
   ownership as root, gzips it and splits it into 2 GiB parts for the FAT32
   microSD.
-* CI probes: `42490749750` measured the root (OS 4.8G + SystemOS 2.4G +
-  AppOS 4.4M ~= 7.2G, 46 GiB free on the runner); `42491853716` confirmed
-  `hdiutil attach -owners on` preserves uid/gid 0 and survives remount +
-  `fsck_hfs`.
-* Root build run: `42495934001` (commit `01eb781`), artifact `ios-root` id
-  `13624355897` (6,021,319,162 bytes). The 20 GiB HFSX image holds 11 GiB
-  (a 12 GiB volume left only 923 MiB free), fsck clean; `Applications` 0:80 and
-  `System` 0:0 verified. Parts: 2,147,483,648 + 2,147,483,648 + 1,726,350,783,
-  gzip total 6,021,318,079, plus `SHA256SUMS` (431 bytes).
+* Root build run `42495934001` (commit `01eb781`), artifact `ios-root` id
+  `13624355897` (6,021,319,162 bytes). **Downloaded and verified 2026-11-08:**
+  all three part SHA256 match `SHA256SUMS` (`5b793e...7624`, `a5df34...8bcd`,
+  `6b8cde...e113`). Local copy:
+  `C:\Users\User\AppData\Local\Temp\opencode\ios-root.zip`. The 20 GiB HFSX
+  image holds 11 GiB, fsck clean; `Applications` 0:80 and `System` 0:0 verified.
+  Parts: 2,147,483,648 + 2,147,483,648 + 1,726,350,783, gzip total
+  6,021,318,079, plus `SHA256SUMS` (431 bytes).
 * Probe16 (`dist/a10_probe16.zip`, 6,050,466 bytes) adds
   `emmcw=1 rootrw=1 ignition_level=1 ...` so the root mounts read-write and
-  launchd starts after the write. Boot SHA256 `110846EB...245B946`.
+  launchd starts after the write. Boot SHA256 `110846EB...245B946`. This is the
+  baseline kernel (no 0096/0097).
+* Patches `0096` (GPIO keys: GPA1.7/5/6 polled at 20 ms -> `sweet_hid_key`) and
+  `0097` (`a10_battery.c`: read-only S2MU005 RVBAT/RSOC/RCUR over I2C3 plus
+  charger STATUS0 over I2C4, enabled by `a10battery=1`). Both committed in
+  `a9d273d`; CI run `42505959344` builds them.
+* `docs/A10_FORECAST.ru.md` records the first-boot forecast: HFSX mount 95 %,
+  launchd 80 %, SpringBoard start 50 %, first GUI 35 %, touch 0 %; GPU via Mali
+  is impossible and not needed for the CPU-composited GUI.
 * `dist/a10_write_root.zip` runs in TWRP, checks the three part sizes, `gzip -t`,
   refuses parts on internal storage, streams
   `cat parts | gzip -dc > /dev/block/by-name/userdata`, then checks the HFSX
   signature `HX` at offset 1024. **Writing the image into `userdata` is
   destructive and still needs explicit user confirmation.**
 
-**Next action:** download artifact `13624355897`, extract the three parts
-straight to the microSD (`tools/stage_root_to_sd.py`), copy
-`a10_write_root.zip` + `a10_probe16.zip`, then (after confirmation) flash
-`a10_write_root.zip`, reboot with `a10_probe16.zip` and check for a successful
-HFS+ mount / `launchd`.
+**Next action:** insert the microSD; `tools/stage_root_to_sd.py` extracts the
+three parts straight to `<card>\ios-root`, then copy `a10_write_root.zip`,
+`a10_probe16.zip` and (after CI) `a10_probe17.zip` (`a10battery=1`). Writing
+`userdata` needs explicit user confirmation. After the write, boot probe16
+first (known baseline), then probe17 to exercise keys/battery.
 
 **Brief history:** probe11 fixed the ARMv8.1 LSE `ldadd` panic (0 LSE in the
 kernel) but stopped in `kperf_init_early()` because `SweetCPU` did not match

@@ -5,7 +5,7 @@
 This is the Galaxy A10 branch of the ios-sweet work. It ports Apple's open-source XNU kernel (xnu-8796.141.3, the iOS 16 generation) to the Exynos 7884B, with the stock iOS 16.7.16 (20H392) iPhone X userland as the target. The original ios-sweet sources are the starting point; the platform layer here is Exynos-specific.
 
 > **Status: 2026-11-08, milestone M2 complete — M3 in progress.**
-> The A10 boots XNU through the IOKit platform expert, CPU bring-up and `bsd_init`; probe13 reached `bsd_autoconf`/`kminit` and brought up the loopback and tunnel interfaces. Probe15 selected the internal eMMC root (`rd=emmcroot0`, GPT partition `userdata`) and opened it read-only; the HFS+ mount fails only because `userdata` does not contain an HFS+ volume yet. A 20 GiB HFSX root image is now built in CI from the iPhone X IPSW, and probe16 plus the TWRP write ZIP are ready; the destructive write into `userdata` is pending. No iOS userland, `launchd` or GUI runs on the phone yet.
+> The A10 boots XNU through the IOKit platform expert, CPU bring-up and `bsd_init`; probe13 reached `bsd_autoconf`/`kminit` and brought up the loopback and tunnel interfaces. Probe15 selected the internal eMMC root (`rd=emmcroot0`, GPT partition `userdata`) and opened it read-only; the HFS+ mount fails only because `userdata` does not contain an HFS+ volume yet. A 20 GiB HFSX root image is built in CI from the iPhone X IPSW, downloaded and SHA256-verified; probe16 plus the TWRP write ZIP are ready, and the destructive write into `userdata` is pending. New drivers for the GPIO keys (0096) and the S2MU005 fuel gauge (0097, `a10battery=1`) are in CI for probe17. No iOS userland, `launchd` or GUI runs on the phone yet. The first-boot forecast is in `docs/A10_FORECAST.ru.md`.
 
 ## Device
 
@@ -29,8 +29,8 @@ The device is an experimental bring-up target. Android is already erased; the st
 | **M0** — EL1, live FDT, GICv2, framebuffer | ✅ confirmed on device (probe #1/#2) |
 | **M1** — eMMC read-only, 64-bit FIFO | ✅ confirmed on device (probe #8, 2026-11-07) |
 | **M2** — XNU boots on the A10 to the console | ✅ confirmed on device (probe #13, 2026-11-08): XNU reaches `bsd_init`/`kminit` |
-| **M3** — HFS+ root + `launchd` | 🔄 probe15 opened the eMMC root (`userdata`); 20 GiB HFSX image built in CI, write ZIP ready, not yet written |
-| **M4** — iOS GUI (SpringBoard, touch, buttons) | ⏳ blocked on M3 |
+| **M3** — HFS+ root + `launchd` | 🔄 probe15 opened the eMMC root (`userdata`); 20 GiB HFSX image built, downloaded and verified, write ZIP ready, not yet written |
+| **M4** — iOS GUI (SpringBoard, touch, buttons) | ⏳ blocked on M3; GPIO buttons (0096) and S2MU005 battery (0097) are ready for probe17 |
 
 ### What works today
 
@@ -41,12 +41,13 @@ The device is an experimental bring-up target. Android is already erased; the st
 - XNU completes CPU startup, `bsd_init` and `kminit`; `bsd_autoconf` configures `lo0`, `gif0` and `stf0` (probe #13).
 - The DW-MMC eMMC path reads CID, EXT_CSD, MBR (`0xAA55`) and the GPT header (`EFI PART`) using 64-bit FIFO elements.
 - The kernel contains no ARMv8.1 LSE instructions; CI scans for them.
+- New A10 drivers (probe17, in CI): polled GPIO buttons on GPA1 (`0096`) and a read-only S2MU005 fuel-gauge/charger backend for `IOPMPowerSource` (`0097`, enabled with `a10battery=1`). Both are compile-tested only so far.
 
 ### What does not work yet
 
 - **SMP:** the A10 firmware accepts `PSCI CPU_ON` but secondary cores do not acknowledge it. Bring-up is single-CPU for now.
-- **iOS root:** there is no HFS+ volume yet, so `IOFindBSDRoot` mounts nothing. Probe15 validated the eMMC/GPT path; the 20 GiB HFSX image is built but not yet written to `userdata`, so `launchd` is still M3 work.
-- **GUI:** no SpringBoard, touch, buttons, battery, Wi-Fi, Bluetooth, cellular, audio, camera or GPU.
+- **iOS root:** there is no HFS+ volume yet, so `IOFindBSDRoot` mounts nothing. Probe15 validated the eMMC/GPT path; the 20 GiB HFSX image is built, downloaded and verified but not yet written to `userdata`, so `launchd` is still M3 work.
+- **GUI:** no SpringBoard. Buttons and battery have drivers awaiting a device run; touch, Wi-Fi, Bluetooth, cellular, audio, camera and GPU have no drivers.
 - **USB:** no data connection; logs are read by photographing the screen or from the TWRP/ZIP log on the microSD card.
 
 ## How it boots
