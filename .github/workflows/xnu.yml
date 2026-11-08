@@ -86,6 +86,21 @@ jobs:
           xcodebuild -version
           xcrun --find iig
 
+      - name: Use no-op KDK
+        run: |
+          # dxb refuses to build unless KDKROOT is an existing directory and
+          # otherwise downloads a ~628 MB KDK from a GitHub release asset.  But
+          # xnu only consumes the KDK here:
+          #   makedefs/MakeInc.def: LDFLAGS_KERNEL_ONLY += ... lib$(MACHINE).os...
+          # and that line is limited to T6000 T8101 VMAPPLE.  MACHINE_CONFIG is
+          # SWEET, so no KDK file is ever referenced.  GitHub's release CDN has
+          # been serving a 504 HTML page instead of the DMG, which dxb then
+          # tries to hdiutil-attach ("image not recognized").  Point dxb at an
+          # empty directory instead: the build is then independent of that CDN.
+          mkdir -p "$RUNNER_TEMP/kdk-none"
+          echo "KDKROOT=$RUNNER_TEMP/kdk-none" >> "$GITHUB_ENV"
+          echo "KDKROOT=$RUNNER_TEMP/kdk-none (SWEET links no KDK support lib)"
+
       - name: Build
         working-directory: dxb
         env:
@@ -162,8 +177,15 @@ jobs:
       - name: Inspect closed KDK support libs
         if: always()
         run: |
+          shopt -s nullglob
           mkdir -p out/kdk-libs
-          for lib in /Library/Developer/KDKs/*/System/Library/KernelSupport/lib*.a; do
+          libs=(/Library/Developer/KDKs/*/System/Library/KernelSupport/lib*.a)
+          if [ ${#libs[@]} -eq 0 ]; then
+            echo "no installed KDK (SWEET never links one)" > out/kdk-libs/README.txt
+            ls -la out/kdk-libs
+            exit 0
+          fi
+          for lib in "${libs[@]}"; do
             b=$(basename "$lib" .a)
             ar t "$lib" > "out/kdk-libs/$b.members.txt" 2>&1 || true
             nm -m "$lib" > "out/kdk-libs/$b.nm.txt" 2>&1 || true
