@@ -6,24 +6,40 @@ The A10 bring-up lives in `C:\Users\User\iOS-Port`; its consolidated handoff is
 **`C:\Users\User\iOS-Port\STATUS.md`** (read it first). This repo is the build
 source + CI for it (`a10` branch, pushed to `https://github.com/Salomin297/ios-a10`).
 
-**State:** probe10 booted XNU on the A10 through CPU topology, `zone_init`, VM,
-IOKit, ATM and `Firehose configured: 16 chunks, 8 to pages`, then panicked with
-`Undefined kernel instruction: instr=f8280128 @sleh.c:952` - `ldadd x8, x8, [x9]`,
-an ARMv8.1 LSE atomic in libfirehose_kernel's
-`__firehose_buffer_tracepoint_flush`; Cortex-A53 is ARMv8.0.
+**State:** probe11 booted XNU on the A10 with **0 LSE instructions** (the
+probe10 `ldadd` panic in `__firehose_buffer_tracepoint_flush` is gone), through
+topology/VM/IOKit/ATM, and stopped after
+`SWEET FB: AppleCLCD 720x1600 stride 2880 at 0xec000000, default surface 1,
+presented as 1125x2436`. No panic, no `A10_BSD_INIT_ENTER`, and no
+`SWEET CPU`/`ml_processor_register>` lines.
 
-**Fix (commit `9edb905`, CI run `42471068574`, green):** build libfirehose as
-plain arm64 with `-ffreestanding -mcpu=cortex-a53+crypto`; scan the built kernel
-for LSE (`tools/check-arm64-lse.py`); CI passes an empty `KDKROOT` because
-`SWEET` never links the KDK support lib (only T6000/T8101/VMAPPLE do) and
-GitHub's release CDN was serving a 504 HTML page for the 628 MB KDK asset.
-Probe10 kernel had 13 LSE instructions, probe11 has 0; the firehose atomic is
-now an `ldxr/stxr` retry loop.
+**Root cause found:** the `SweetCPU` personality matches
+`IONameMatch='qcom,kryo470'`, but the A10 ADT CPU node is
+`compatible="arm,cortex-a53","ARM,v8"`, so the driver never started, no CPU was
+registered, and `ml_set_max_cpus()` was never called. KPERF is enabled
+(`config/MASTER`), so `kperf_init_early()` blocks forever in
+`ml_wait_max_cpus()` before `bsd_init()` - exactly the observed silent stop.
 
-**Next action:** flash `C:\Users\User\iOS-Port\dist\a10_probe11.zip` via TWRP
-(microSD only; USB data lines are broken) and photograph the screen. Probe11
-boot image sha256 `F8022014...AB4B1DE`, ZIP `AE0BA9A6...4C0E38EE`. Rollback:
-`dist/a10_restore_boot.zip` (now also searches probe9/10/11 backups).
+**Probe12 fix (commit `c50f528`, patch `0093`, CI run `42482851815`, green):**
+* second `SweetCPU` personality for `arm,cortex-a53` (qcom entry kept);
+* `SweetCPU::start()` logs node/logical/reg/num_cpus/boot and every early
+  return, then `matched logical=... phys=...` after `ml_processor_register`;
+* `startAll()` now requires only `boot_cpu->cpu_id == 0` (A10 boot MPIDR is
+  `0x100`, not 0), logs boot CPU and each `processor_start`;
+* `SWEETTRACE` around `PE_lockdown_iokit`/`StartIOKitMatching`, after
+  `vm_set_restrictions` and after `kperf_init_early`;
+* `SWEETTRACE: IOSTART <class> node=... [-> ok|failed]` around every
+  `IOService::startCandidate()` start call.
+CI verifies the 0093 markers so a silently-skipped patch fails the job.
+
+**Next action:** flash `C:\Users\User\iOS-Port\dist\a10_probe12.zip` via TWRP
+(microSD only; USB data lines are broken) and photograph the screen. Probe12
+kernel `0DF910C5...BF566464`, boot image `462C267A...3236C5A6`, ZIP
+`A0BA8717...FE49CA16`. Expected: `SWEET CPU: start node=cpu0 ...`,
+`ml_processor_register>` lines, `... came alive; SGI1 OK`,
+`A10_IOKIT_MATCHING_RETURNED`, `A10_VM_RESTRICTIONS_DONE`, `A10_KPERF_DONE`,
+then `A10_BSD_INIT_ENTER`. Rollback: `dist/a10_restore_boot.zip` (searches
+probe6/7/8/9/10/11/12 backups; sha256 `232C4EFC...D6087CB9`).
 
 ## Agent handoff / active work (2026-10-15, latest)
 
