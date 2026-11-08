@@ -149,6 +149,8 @@ jobs:
           need dxb/xnu/iokit/KernelConfigTables.cpp 'arm,cortex-a53' present '0093 A10 CPU personality'
           need dxb/xnu/iokit/Kernel/arm/SweetCPU.cpp 'SWEET CPU: start node=' present '0093 CPU match logging'
           need dxb/xnu/pexpert/arm/pe_init.c 'A10_IOKIT_MATCHING_RETURNED' present '0093 IOKit matching trace'
+          need dxb/xnu/pexpert/pexpert/arm64/SWEET.h 'GICD_SGIR_FILTER_SELF.*(2U << 24)' present '0094 GICv2 self-SGI filter'
+          need dxb/xnu/iokit/Kernel/arm/SweetCPU.cpp 'signal_enabled=%u' present '0094 CPU timeout diagnostics'
           if [ "$fail" -ne 0 ]; then
             echo "::error::A10 port patches did not apply cleanly"
             exit 1

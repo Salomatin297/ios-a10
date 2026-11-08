@@ -1,0 +1,37 @@
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index 6f04289..ca81d9c 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -193,8 +193,11 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ 		while (__atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE) == 0 ||
+ 		    !sweet_cpu_signal_is_enabled(i)) {
+ 			if (mach_absolute_time() > deadline) {
+-				IOLog("SWEET CPU: cpu=%u mpidr=0x%x NOT alive after 5s\n",
+-				    i, topology->cpus[i].phys_id);
++				IOLog("SWEET CPU: cpu=%u mpidr=0x%x NOT alive after 5s "
++				    "(initialized=%u signal_enabled=%u)\n",
++				    i, topology->cpus[i].phys_id,
++				    __atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE),
++				    sweet_cpu_signal_is_enabled(i) ? 1 : 0);
+ 				panic("SWEET CPU: cpu=%u startup timeout (reset/MMU/GIC/SGI)", i);
+ 			}
+ 			IOSleep(1);
+diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
+index aa8be35..1357102 100644
+--- a/pexpert/pexpert/arm64/SWEET.h
++++ b/pexpert/pexpert/arm64/SWEET.h
+@@ -132,7 +132,12 @@
+ #define GICD_ISENABLER                          0x100
+ #define GICD_IPRIORITYR                         0x400
+ #define GICD_SGIR                               0xF00
+-/* TargetListFilter = 0b10: interrupt the requesting CPU interface only */
+-#define GICD_SGIR_FILTER_SELF                   (2U << 8)
++/*
++ * TargetListFilter = 0b10: interrupt the requesting CPU interface only.
++ * GICD_SGIR has the SGI INTID in [3:0], CPUTargetList in [23:16] and
++ * TargetListFilter in [25:24]; the old (2U << 8) produced 0x201, which
++ * reads as filter 0b00 with an empty target list, so no SGI was sent.
++ */
++#define GICD_SGIR_FILTER_SELF                   (2U << 24)
+ 
+ #endif /* ! _PEXPERT_ARM64_SWEET_H */
