@@ -152,6 +152,10 @@ jobs:
           need dxb/xnu/pexpert/pexpert/arm64/SWEET.h 'GICD_SGIR_FILTER_SELF.*(2U << 24)' present '0094 GICv2 self-SGI filter'
           need dxb/xnu/iokit/Kernel/arm/SweetCPU.cpp 'signal_enabled=%u' present '0094 CPU timeout diagnostics'
           need dxb/xnu/osfmk/arm/pmap/pmap.c 'SWEET_EARLY_FB_VA' present '0095 early framebuffer VA reservation'
+          need dxb/xnu/bsd/dev/a10_keys.c 'A10 KEYS: polling GPA1 DAT' present '0096 A10 GPIO keys'
+          need dxb/xnu/bsd/dev/sweet_emmc.c 'a10_keys_init' present '0096 keys hook'
+          need dxb/xnu/bsd/dev/a10_battery.c 'S2MU005' present '0097 A10 fuel gauge'
+          need dxb/xnu/iokit/Kernel/arm/SweetBattery.cpp 'a10battery' present '0097 A10 battery backend'
           if [ "$fail" -ne 0 ]; then
             echo "::error::A10 port patches did not apply cleanly"
             exit 1

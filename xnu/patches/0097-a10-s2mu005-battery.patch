@@ -1,0 +1,402 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -109,3 +109,4 @@
+ bsd/dev/sweet_touch.c			standard
+ bsd/dev/a10_keys.c			standard
++bsd/dev/a10_battery.c			standard
+ bsd/dev/mem.c				standard
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -15,6 +15,10 @@
+ /* bsd/dev/sweet_spmi.c */
+ extern "C" int sweet_spmi_init(void);
+ extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++/* bsd/dev/a10_battery.c */
++extern "C" int a10_battery_init(void);
++extern "C" int a10_battery_read(unsigned *percent, unsigned *mv, int *ma,
++    bool *external, bool *charging, bool *full);
+ 
+ class SweetBattery : public IOPMPowerSource {
+ 	OSDeclareDefaultStructors(SweetBattery);
+@@ -26,7 +30,7 @@
+ private:
+ 	IOWorkLoop *fLoop;
+ 	IOTimerEventSource *fTimer;
+-	bool fTimerAdded, fRunning, fReal;
++	bool fTimerAdded, fRunning, fReal, fA10;
+ 	int fLastMode;
+ 	void putNumber(const char *key, UInt32 value);
+ 	void putBool(const char *key, bool value);
+@@ -51,7 +55,7 @@
+ 	}
+ 	fLoop = NULL;
+ 	fTimer = NULL;
+-	fTimerAdded = fRunning = fReal = false;
++	fTimerAdded = fRunning = fReal = fA10 = false;
+ 	if (dictionary) {
+ 		OSCollectionIterator *it = OSCollectionIterator::withCollection(dictionary);
+ 		if (!it) {
+@@ -206,6 +210,19 @@
+ void
+ SweetBattery::poll(void)
+ {
++	if (fA10) {
++		unsigned percent, mv;
++		int ma;
++		bool external, charging, full;
++		if (a10_battery_read(&percent, &mv, &ma, &external, &charging,
++		    &full) == 0) {
++			publish(percent, mv, ma, external, external, charging, full,
++			    true, true);
++		} else {
++			publish(100, 4200, 0, true, true, false, true, false, false);
++		}
++		return;
++	}
+ 	uint8_t type, present, usb, path, charger, error, temperature;
+ 	uint16_t rawVoltage;
+ 	bool valid = fReal &&
+@@ -263,8 +280,14 @@
+ 		return false;
+ 	}
+ 	int real = 0;
++	int a10 = 0;
+ 	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
+-	fReal = real == 1 && sweet_spmi_init() == 0;
++	(void)PE_parse_boot_argn("a10battery", &a10, sizeof(a10));
++	fA10 = a10 == 1 && a10_battery_init() == 0;
++	fReal = fA10 || (real == 1 && sweet_spmi_init() == 0);
++	if (fA10) {
++		IOLog("SWEET BATTERY: A10 S2MU005 backend enabled\n");
++	}
+ 	/* Publish a complete source BEFORE registerService wakes powerd. */
+ 	poll();
+ 	if (fReal) {
+diff --git a/bsd/dev/a10_battery.c b/bsd/dev/a10_battery.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/a10_battery.c
+@@ -0,0 +1,321 @@
++/*
++ * A10 (Exynos 7884B) S2MU005 fuel gauge and charger status.
++ *
++ * Read-only bring-up: the bootloader already initialised the PMIC and the
++ * gauge is normally running.  We only issue register reads; no charger,
++ * gauge or PMIC configuration is changed.  Percent is taken from the
++ * gauge's RSOC register when it is plausible and otherwise derived from
++ * VBAT with the same generic curve as SweetBattery.
++ *
++ * The two I2C buses are the Samsung s3c2440-style controllers.  They are
++ * polled with interrupts disabled, so this file must only be called from
++ * one thread (SweetBattery's work loop).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++
++#define A10_I2C3_PA       0x13830000u
++#define A10_I2C4_PA       0x13840000u
++#define A10_I2C_SIZE      0x100u
++
++#define A10_FG_ADDR       0x3bu
++#define A10_CHG_ADDR      0x3du
++
++#define A10_FG_RVBAT      0x04u
++#define A10_FG_RCUR_CC    0x06u
++#define A10_FG_RSOC       0x08u
++#define A10_CHG_STATUS0   0x08u
++
++#define S3C_IICCON        0x00u
++#define S3C_IICSTAT       0x04u
++#define S3C_IICDS         0x0cu
++
++#define IICCON_ACKEN      (1u << 7)
++#define IICCON_TXDIV512   (1u << 6)
++#define IICCON_IRQEN      (1u << 5)
++#define IICCON_IRQPEND    (1u << 4)
++#define IICCON_SCALEMASK  0x0fu
++
++#define IICSTAT_MASTER_RX (2u << 6)
++#define IICSTAT_MASTER_TX (3u << 6)
++#define IICSTAT_START     (1u << 5)
++#define IICSTAT_BUSY      (1u << 5)
++#define IICSTAT_TXRXEN    (1u << 4)
++#define IICSTAT_LASTBIT   (1u << 0)
++
++#define A10_I2C_TIMEOUT_MS 100
++
++static vm_offset_t a10_i2c_fg;
++static vm_offset_t a10_i2c_chg;
++static bool a10_battery_ready;
++
++static uint32_t
++a10_i2c_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++a10_i2c_wr(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static int
++a10_i2c_wait(vm_offset_t base, uint32_t off, uint32_t mask, bool set)
++{
++	for (unsigned i = 0; i < A10_I2C_TIMEOUT_MS; ++i) {
++		if (((a10_i2c_rd(base, off) & mask) != 0) == set) {
++			return 0;
++		}
++		delay(1);
++	}
++	return ETIMEDOUT;
++}
++
++static void
++a10_i2c_stop(vm_offset_t base)
++{
++	uint32_t stat = a10_i2c_rd(base, S3C_IICSTAT);
++	uint32_t con = a10_i2c_rd(base, S3C_IICCON);
++
++	a10_i2c_wr(base, S3C_IICSTAT, stat & ~IICSTAT_START);
++	a10_i2c_wr(base, S3C_IICCON, con & ~IICCON_IRQPEND);
++	(void)a10_i2c_wait(base, S3C_IICSTAT, IICSTAT_BUSY, false);
++}
++
++static int
++a10_i2c_start(vm_offset_t base, uint8_t addr, bool read, bool repeated)
++{
++	uint32_t con;
++	uint32_t stat;
++	uint8_t byte = (uint8_t)((addr << 1) | (read ? 1u : 0u));
++
++	if (!repeated && a10_i2c_wait(base, S3C_IICSTAT, IICSTAT_BUSY, false) != 0) {
++		return EBUSY;
++	}
++	con = a10_i2c_rd(base, S3C_IICCON);
++	con &= ~(IICCON_IRQEN | IICCON_IRQPEND);
++	con |= IICCON_ACKEN;
++	a10_i2c_wr(base, S3C_IICCON, con);
++
++	stat = IICSTAT_TXRXEN | (read ? IICSTAT_MASTER_RX : IICSTAT_MASTER_TX);
++	a10_i2c_wr(base, S3C_IICSTAT, stat);
++	a10_i2c_wr(base, S3C_IICDS, byte);
++	delay(1);
++	a10_i2c_wr(base, S3C_IICCON, con);
++	a10_i2c_wr(base, S3C_IICSTAT, stat | IICSTAT_START);
++
++	if (a10_i2c_wait(base, S3C_IICCON, IICCON_IRQPEND, true) != 0) {
++		a10_i2c_stop(base);
++		return ETIMEDOUT;
++	}
++	if (a10_i2c_rd(base, S3C_IICSTAT) & IICSTAT_LASTBIT) {
++		a10_i2c_stop(base);
++		return ENXIO;
++	}
++	con = a10_i2c_rd(base, S3C_IICCON);
++	a10_i2c_wr(base, S3C_IICCON, con & ~IICCON_IRQPEND);
++	return 0;
++}
++
++static int
++a10_i2c_write(vm_offset_t base, uint8_t byte)
++{
++	uint32_t con;
++
++	a10_i2c_wr(base, S3C_IICDS, byte);
++	if (a10_i2c_wait(base, S3C_IICCON, IICCON_IRQPEND, true) != 0) {
++		a10_i2c_stop(base);
++		return ETIMEDOUT;
++	}
++	if (a10_i2c_rd(base, S3C_IICSTAT) & IICSTAT_LASTBIT) {
++		a10_i2c_stop(base);
++		return ENXIO;
++	}
++	con = a10_i2c_rd(base, S3C_IICCON);
++	a10_i2c_wr(base, S3C_IICCON, con & ~IICCON_IRQPEND);
++	return 0;
++}
++
++/* SMBus-style read: START addr+W, register, repeated START addr+R, data. */
++static int
++a10_i2c_read_reg(vm_offset_t base, uint8_t addr, uint8_t reg, uint8_t *buf,
++    unsigned len)
++{
++	int error;
++
++	if (base == 0 || len == 0) {
++		return EINVAL;
++	}
++	error = a10_i2c_start(base, addr, false, false);
++	if (error != 0) {
++		return error;
++	}
++	error = a10_i2c_write(base, reg);
++	if (error != 0) {
++		return error;
++	}
++	error = a10_i2c_start(base, addr, true, true);
++	if (error != 0) {
++		return error;
++	}
++	for (unsigned i = 0; i < len; ++i) {
++		uint32_t con;
++		if (i == len - 1) {
++			con = a10_i2c_rd(base, S3C_IICCON);
++			a10_i2c_wr(base, S3C_IICCON, con & ~IICCON_ACKEN);
++		}
++		if (a10_i2c_wait(base, S3C_IICCON, IICCON_IRQPEND, true) != 0) {
++			a10_i2c_stop(base);
++			return ETIMEDOUT;
++		}
++		buf[i] = (uint8_t)a10_i2c_rd(base, S3C_IICDS);
++		con = a10_i2c_rd(base, S3C_IICCON);
++		a10_i2c_wr(base, S3C_IICCON, con & ~IICCON_IRQPEND);
++	}
++	a10_i2c_stop(base);
++	return 0;
++}
++
++static int
++a10_i2c_read_u16(vm_offset_t base, uint8_t addr, uint8_t reg, uint16_t *value)
++{
++	uint8_t data[2];
++	int error = a10_i2c_read_reg(base, addr, reg, data, sizeof(data));
++
++	if (error == 0) {
++		*value = (uint16_t)(data[0] | ((uint16_t)data[1] << 8));
++	}
++	return error;
++}
++
++static unsigned
++a10_battery_percent_from_mv(unsigned mv)
++{
++	static const unsigned volts[] = { 3400, 3500, 3600, 3700, 3800, 3900,
++	    4000, 4100, 4200, 4350 };
++	static const unsigned soc[] = { 1, 5, 10, 20, 40, 60, 75, 85, 93, 100 };
++
++	if (mv <= volts[0]) {
++		return soc[0];
++	}
++	for (unsigned i = 1; i < sizeof(volts) / sizeof(volts[0]); ++i) {
++		if (mv < volts[i]) {
++			return soc[i - 1] + (mv - volts[i - 1]) *
++			    (soc[i] - soc[i - 1]) / (volts[i] - volts[i - 1]);
++		}
++	}
++	return 100;
++}
++
++int
++a10_battery_init(void)
++{
++	if (a10_battery_ready) {
++		return 0;
++	}
++	a10_i2c_fg = ml_io_map(A10_I2C3_PA, A10_I2C_SIZE);
++	a10_i2c_chg = ml_io_map(A10_I2C4_PA, A10_I2C_SIZE);
++	if (a10_i2c_fg == 0) {
++		printf("A10 BATTERY: i2c3 MMIO mapping failed\n");
++		return ENXIO;
++	}
++	printf("A10 BATTERY: i2c3 con=%08x stat=%08x%s\n",
++	    a10_i2c_rd(a10_i2c_fg, S3C_IICCON),
++	    a10_i2c_rd(a10_i2c_fg, S3C_IICSTAT),
++	    a10_i2c_chg ? "" : " (i2c4 unavailable)");
++	/* Probe the gauge without changing any configuration. */
++	uint16_t mv;
++	if (a10_i2c_read_u16(a10_i2c_fg, A10_FG_ADDR, A10_FG_RVBAT, &mv) != 0) {
++		printf("A10 BATTERY: S2MU005 gauge did not respond\n");
++		return ENXIO;
++	}
++	a10_battery_ready = true;
++	printf("A10 BATTERY: S2MU005 gauge online, raw VBAT=%#x\n", mv);
++	return 0;
++}
++
++int
++a10_battery_read(unsigned *percent, unsigned *mv, int *ma, bool *external,
++    bool *charging, bool *full)
++{
++	uint16_t rawVoltage;
++	uint16_t rawSoc = 0;
++	uint16_t rawCurrent = 0;
++	uint8_t chgStatus = 0;
++	bool socValid = false;
++	bool currentValid = false;
++	bool chargerValid = false;
++
++	if (!a10_battery_ready || percent == NULL || mv == NULL || ma == NULL ||
++	    external == NULL || charging == NULL || full == NULL) {
++		return EIO;
++	}
++	if (a10_i2c_read_u16(a10_i2c_fg, A10_FG_ADDR, A10_FG_RVBAT,
++	    &rawVoltage) != 0) {
++		return EIO;
++	}
++	unsigned voltage = (unsigned)(((uint32_t)rawVoltage * 1000u) >> 13);
++	if (voltage < 2800 || voltage > 4600) {
++		return EIO;
++	}
++	if (a10_i2c_read_u16(a10_i2c_fg, A10_FG_ADDR, A10_FG_RSOC,
++	    &rawSoc) == 0) {
++		/* RSOC is unsigned 0..10000 (0.01%); negative values are rare. */
++		socValid = (rawSoc & 0x8000u) == 0 && rawSoc <= 10000u &&
++		    rawSoc >= 100u;
++	}
++	if (a10_i2c_read_u16(a10_i2c_fg, A10_FG_ADDR, A10_FG_RCUR_CC,
++	    &rawCurrent) == 0) {
++		currentValid = true;
++	}
++	if (a10_i2c_chg != 0 &&
++	    a10_i2c_read_reg(a10_i2c_chg, A10_CHG_ADDR, A10_CHG_STATUS0,
++	    &chgStatus, 1) == 0) {
++		chargerValid = true;
++	}
++
++	unsigned soc = socValid ? (rawSoc + 50u) / 100u :
++	    a10_battery_percent_from_mv(voltage);
++	if (soc > 100) {
++		soc = 100;
++	}
++
++	int current = 0;
++	if (currentValid) {
++		if (rawCurrent & 0x8000u) {
++			unsigned mag = ((~rawCurrent) & 0xffffu) + 1u;
++			current = (int)((mag * 1000u) >> 12);
++		} else {
++			current = -(int)(((rawCurrent & 0x7fffu) * 1000u) >> 12);
++		}
++	}
++
++	bool ext = chargerValid && (chgStatus & 0x80u);
++	unsigned state = chgStatus & 0x0fu;
++	bool chg = chargerValid && ext && state >= 2u && state <= 5u;
++	bool fullNow = chargerValid && ext && state >= 6u;
++	if (fullNow) {
++		soc = 100;
++	}
++
++	*percent = soc;
++	*mv = voltage;
++	*ma = current;
++	*external = ext;
++	*charging = chg;
++	*full = fullNow;
++	return 0;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
