@@ -8,7 +8,7 @@ on:
         default: "https://updates.cdn-apple.com/2025FallFCS/fullrestores/122-77006/1158E502-D76D-4226-AA06-ED5E30CD1111/iPhone10,3,iPhone10,6_16.7.16_20H392_Restore.ipsw"
       size:
         description: "HFS+ root image size"
-        default: "12G"
+        default: "20G"
 
 # The root image is several GiB: the download of the APFS components plus the
 # output has to fit on the runner disk, so this job runs alone.
@@ -49,16 +49,18 @@ jobs:
           echo "--- top level ---"
           ls -ln work/verify | head -30
           echo "--- key paths ---"
-          stat -f '%u:%g %Sp %N' work/verify/Applications work/verify/System \
-            work/verify/private/preboot/Cryptexes/OS/usr/lib/dyld \
+          sudo stat -f '%u:%g %Sp %N' work/verify/Applications work/verify/System \
+            work/verify/usr/lib/dyld \
             work/verify/private/var/keybags/systembag.kb
+          echo "--- dyld cache ---"
+          ls -ln work/verify/System/Library/Caches/com.apple.dyld | head -10
           echo "--- cryptexes ---"
-          du -sh work/verify/private/preboot/Cryptexes/OS work/verify/private/preboot/Cryptexes/App
+          sudo du -sh work/verify/private/preboot/Cryptexes/OS work/verify/private/preboot/Cryptexes/App
           echo "--- sizes ---"
-          du -sh work/verify
+          sudo du -sh work/verify
+          df -h work/verify
           echo "--- fallback sample ---"
-          ls -ln work/verify/private/preboot/Cryptexes/OS/usr/lib/dyld || true
-          ls -ln work/verify/usr/lib/dyld || true
+          ls -ln work/verify/private/preboot/Cryptexes/OS/usr/libexec || true
           hdiutil detach work/verify
 
       - name: Compress and split for the microSD transfer
