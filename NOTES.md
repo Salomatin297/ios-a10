@@ -6,62 +6,43 @@ The A10 bring-up lives in `C:\Users\User\iOS-Port`; its consolidated handoff is
 **`C:\Users\User\iOS-Port\STATUS.md`** (read it first). This repo is the build
 source + CI for it (`a10` branch, pushed to `https://github.com/Salomin297/ios-a10`).
 
-**State:** probe11 booted XNU on the A10 with **0 LSE instructions** (the
-probe10 `ldadd` panic in `__firehose_buffer_tracepoint_flush` is gone), through
-topology/VM/IOKit/ATM, and stopped after
-`SWEET FB: AppleCLCD 720x1600 stride 2880 at 0xec000000, default surface 1,
-presented as 1125x2436`. No panic, no `A10_BSD_INIT_ENTER`, and no
-`SWEET CPU`/`ml_processor_register>` lines.
+**State (2026-11-08 evening, probe15): the eMMC root path works.** Probe15
+selected `emmcroot0` / GPT `userdata` (`bdev=1,0`) with no `pmap_ttne` panic,
+then failed where expected:
+`hfs_validateHFSPlusVolumeHeader: unknown volume signature: 20` and
+`hfs_mountfs returned error=22` — `userdata` is not HFS+ yet. Photo:
+`C:\Users\User\iOS-Port\dist\probe15_emmcroot.jpg`.
 
-**Root cause found:** the `SweetCPU` personality matches
-`IONameMatch='qcom,kryo470'`, but the A10 ADT CPU node is
-`compatible="arm,cortex-a53","ARM,v8"`, so the driver never started, no CPU was
-registered, and `ml_set_max_cpus()` was never called. KPERF is enabled
-(`config/MASTER`), so `kperf_init_early()` blocks forever in
-`ml_wait_max_cpus()` before `bsd_init()` - exactly the observed silent stop.
+* probe15 kernel CI run `42490085753` (commit `0a5cef1`); ZIP
+  `a10_probe15.zip` sha256 `B61967E6...F41E6`, rollback
+  `a10_restore_boot.zip` sha256 `8F92F023...E827`.
+* Patch `0095` reserves 32 MiB of low-globals VA under
+  `ARM64_BOARD_CONFIG_SWEET` for the early framebuffer alias; this fixed the
+  probe14 `pmap_ttne` collision.
+* Root image: `tools/mkiosroot-staged.sh` is now macOS-native (`hdiutil`,
+  `newfs_hfs -s -J`, `rsync -aH --numeric-ids`), copies the APFS volume roots
+  directly, hardlinks the dyld cache/cryptex fallbacks, adds logd markers and
+  the keybag. `root.yml` builds a 12 GiB image on `macos-15-arm64`, verifies
+  ownership, gzips it and splits it into 2 GiB parts for the FAT32 microSD.
+* CI probes: `42490749750` measured the root (OS 4.8G + SystemOS 2.4G +
+  AppOS 4.4M ~= 7.2G, 46 GiB free on the runner); `42491853716` confirmed
+  `hdiutil attach -owners on` preserves uid/gid 0 and survives remount +
+  `fsck_hfs`.
+* Root build run: `42492282763` (commit `d136639`), artifact `ios-root`.
+  **Writing the image into `userdata` is destructive and still needs explicit
+  user confirmation.**
 
-**Probe12 fix (commit `c50f528`, patch `0093`, CI run `42482851815`, green):**
-* second `SweetCPU` personality for `arm,cortex-a53` (qcom entry kept);
-* `SweetCPU::start()` logs node/logical/reg/num_cpus/boot and every early
-  return, then `matched logical=... phys=...` after `ml_processor_register`;
-* `startAll()` now requires only `boot_cpu->cpu_id == 0` (A10 boot MPIDR is
-  `0x100`, not 0), logs boot CPU and each `processor_start`;
-* `SWEETTRACE` around `PE_lockdown_iokit`/`StartIOKitMatching`, after
-  `vm_set_restrictions` and after `kperf_init_early`;
-* `SWEETTRACE: IOSTART <class> node=... [-> ok|failed]` around every
-  `IOService::startCandidate()` start call.
-CI verifies the 0093 markers so a silently-skipped patch fails the job.
+**Next action:** wait for `42492282763`, download/verify the parts one at a
+time, put them on the microSD, then (after confirmation) run in TWRP:
+`cat ios-root.img.gz.part* | gzip -dc | dd of=/dev/block/by-name/userdata bs=4M`.
+Boot probe15 again and check for a successful HFS+ mount / launchd.
 
-**Probe12 result (2026-11-08):** XNU matched and registered the boot CPU,
-then panicked at `SweetCPU.cpp:198` (`startup timeout (reset/MMU/GIC/SGI)`,
-tid 131). `processor_start()` had returned and `initialized` was set, but
-`SIGPdisabled` was never cleared: the GICv2 self-SGI was not delivered.
-Root cause: `GICD_SGIR_FILTER_SELF` was `(2U << 8)`, while GICv2 places
-`TargetListFilter` in bits `[25:24]`; the write `0x201` decoded as filter
-`0b00` with an empty target list.
-
-**Probe13 fix (patch `0094`, CI run `42484824494`, green):** correct the
-filter to `(2U << 24)` in a new patch after 0093 (do not rewrite 0084, to keep
-CI patch ordering stable) and print `initialized`/`signal_enabled` on a
-startup timeout. CI verifies both markers.
-
-**Probe13 result (2026-11-08): M2 closed.** Photo `dist/probe13_bsdinit.jpg`
-(source `Downloads/20261108_164504.jpg`) shows XNU past `startAll()` and kperf:
-Skywalk self-tests passed, `bsd_autoconf: calling kminit`, `ifnet_attach` for
-`lo0`/`gif0`/`stf0`, then `IOFindBSDRoot` waited on an `IOMedia` with
-`Apple_HFS` and logged `Failed to write boot-picker-bringup-reason to NVRAM.`
-There was no panic. Because probe13 had no `rd=` boot-arg, it searched for any
-HFS+ media and took the recovery/reboot branch.
-
-**Next action:** flash `C:\Users\User\iOS-Port\dist\a10_probe14.zip` via TWRP
-(microSD only; USB data lines are broken) and photograph the screen. Probe14
-adds `rd=emmcroot0 emmcroot=userdata emmcprobe=1`, still read-only (no
-`emmcw`). Kernel `3EF17950...B30564`, boot image `14B3BD1F...80DE7`, ZIP
-`1ECFE87A...90CA40`; rollback ZIP `0323403C...608FE5` (searches through
-`boot.before-probe14.img`). Expected: `SWEET eMMC:` init/GPT logs, then
-`IOFindBSDRoot` calls `sweet_emmc_rootdev()`. An HFS+ mount failure on a
-non-HFS+ `userdata` is expected; it separates driver problems from the
-missing root image.
+**Brief history:** probe11 fixed the ARMv8.1 LSE `ldadd` panic (0 LSE in the
+kernel) but stopped in `kperf_init_early()` because `SweetCPU` did not match
+the A10 `arm,cortex-a53` node; probe12 added that personality and then hit the
+GICv2 self-SGI filter bug; probe13 fixed it (`GICD_SGIR_FILTER_SELF` = `2<<24`)
+and closed M2 through `bsd_init`/`kminit`; probe14 reached the eMMC root and
+panicked in `pmap_ttne` (VA collision); probe15 closed that with `0095`.
 
 ## Agent handoff / active work (2026-10-15, latest)
 
