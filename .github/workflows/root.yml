@@ -18,7 +18,8 @@ concurrency:
 
 jobs:
   root:
-    runs-on: macos-15-arm64
+    # macos-15 currently maps to the arm64 runner: 320 GiB disk, ~46 GiB free.
+    runs-on: macos-15
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
@@ -68,8 +69,8 @@ jobs:
           #   cat part* | gzip -dc | dd of=<userdata block device>
           gzip -1 -c work/ios-root.img > work/ios-root.img.gz
           split -b 2G -d -a 3 work/ios-root.img.gz work/ios-root.img.gz.part
-          shasum -a 256 work/ios-root.img work/ios-root.img.gz work/ios-root.img.gz.part* \
-            > work/SHA256SUMS
+          (cd work && shasum -a 256 ios-root.img ios-root.img.gz ios-root.img.gz.part* \
+            > SHA256SUMS)
           ls -la work/ios-root.img.gz work/ios-root.img.gz.part* work/SHA256SUMS
           du -sh work/ios-root.img.gz
           df -h /
