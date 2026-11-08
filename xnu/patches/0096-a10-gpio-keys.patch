@@ -1,12 +1,12 @@
 diff --git a/bsd/conf/files b/bsd/conf/files
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -107,4 +107,5 @@
- bsd/dev/sweet_sample.c			standard
+@@ -110,4 +110,5 @@
  bsd/dev/sweet_keys.c			standard
  bsd/dev/sweet_touch.c			standard
 +bsd/dev/a10_keys.c			standard
- bsd/dev/mem.c				standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
 diff --git a/bsd/dev/sweet_emmc.c b/bsd/dev/sweet_emmc.c
 --- a/bsd/dev/sweet_emmc.c
 +++ b/bsd/dev/sweet_emmc.c

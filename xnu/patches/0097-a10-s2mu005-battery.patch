@@ -1,11 +1,11 @@
 diff --git a/bsd/conf/files b/bsd/conf/files
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -109,3 +109,4 @@
- bsd/dev/sweet_touch.c			standard
+@@ -112,3 +112,4 @@
  bsd/dev/a10_keys.c			standard
 +bsd/dev/a10_battery.c			standard
- bsd/dev/mem.c				standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
 diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
 --- a/iokit/Kernel/arm/SweetBattery.cpp
 +++ b/iokit/Kernel/arm/SweetBattery.cpp
