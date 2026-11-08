@@ -151,6 +151,7 @@ jobs:
           need dxb/xnu/pexpert/arm/pe_init.c 'A10_IOKIT_MATCHING_RETURNED' present '0093 IOKit matching trace'
           need dxb/xnu/pexpert/pexpert/arm64/SWEET.h 'GICD_SGIR_FILTER_SELF.*(2U << 24)' present '0094 GICv2 self-SGI filter'
           need dxb/xnu/iokit/Kernel/arm/SweetCPU.cpp 'signal_enabled=%u' present '0094 CPU timeout diagnostics'
+          need dxb/xnu/osfmk/arm/pmap/pmap.c 'SWEET_EARLY_FB_VA' present '0095 early framebuffer VA reservation'
           if [ "$fail" -ne 0 ]; then
             echo "::error::A10 port patches did not apply cleanly"
             exit 1

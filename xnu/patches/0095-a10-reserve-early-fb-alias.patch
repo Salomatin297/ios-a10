@@ -1,0 +1,22 @@
+diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -2534,7 +2534,18 @@
+ 		low_global_vr_size = 0x2000000;
+ 	} else {
+ 		low_global_vr_mask = 0xFFFFFFFFFF800000;
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		/*
++		 * The SWEET early framebuffer alias (SWEET_EARLY_FB_VA) maps
++		 * 20MB at LOW_GLOBAL_BASE_ADDRESS + 2MB.  The default 8MB
++		 * low-globals reservation ends at +8MB, so the kernel heap
++		 * would otherwise claim the alias VA range and pmap_enter()
++		 * would panic ("Attempt to demote L2 block").  Reserve 32MB.
++		 */
++		low_global_vr_size = 0x2000000;
++#else
+ 		low_global_vr_size = 0x800000;
++#endif
+ 	}
+ 
+ 	if (((gVirtBase & low_global_vr_mask) != LOW_GLOBAL_BASE_ADDRESS) && (region_select == 2)) {
