@@ -1,24 +1,29 @@
 #!/bin/bash
-# Build the SWEET iOS root HFS+ image from IPSW components, staging the
-# downloads so the peak disk usage stays low.
+# Build the SWEET iOS root HFS+ image from IPSW components on macOS.
+# Staging keeps the peak disk usage low: each APFS component is downloaded,
+# mounted, copied and deleted before the next one is fetched.
 #
 #   mkiosroot-staged.sh WORKDIR IPSW_URL OUT.img [SIZE]
 #
-# Upstream tools/mkiosroot.sh mounts the three APFS images at once, which
-# needs ~14 GB of free disk (downloads + output).  Here each image is
-# mounted, copied and deleted before the next one is fetched, so the peak is
-# the HFS+ output plus the largest single component (~9 GB).
+# Requires macOS hdiutil/newfs_hfs (no apfs-fuse, no hfsprogs).  The APFS
+# components and the HFS+ output are both mounted with "-owners on": without
+# it macOS mounts them as the build user and every uid/gid would be lost.
 set -euo pipefail
 
-[[ $# -ge 3 ]] || { sed -n '2,10p' "$0"; exit 2; }
-work=$(realpath -m "$1"); ipsw="$2"; out="$3"; size=${4:-12G}
+[[ $# -ge 3 ]] || { sed -n '2,13p' "$0"; exit 2; }
+
+abspath() { python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$1"; }
+work=$(abspath "$1"); ipsw="$2"; out=$(abspath "$3"); size=${4:-12G}
+size=$(printf '%s' "$size" | tr '[:upper:]' '[:lower:]')   # mkfile wants 12g
 [[ ! -e "$out" ]] || { echo "refusing to overwrite $out" >&2; exit 1; }
 
 repo_root=$(cd "$(dirname "$0")/.." && pwd)
 remotezip="$repo_root/tools/remotezip.py"
 
 need() { command -v "$1" >/dev/null 2>&1 || { echo "missing tool: $1" >&2; exit 1; }; }
-need apfs-fuse; need mkfs.hfsplus; need rsync; need python3
+need hdiutil; need newfs_hfs; need rsync; need python3
+RSYNC=$(command -v rsync)
+NEWFS_HFS=$(command -v newfs_hfs)
 
 mkdir -p "$work"
 cd "$work"
@@ -42,74 +47,95 @@ for k, alias in want.items():
     print("%s %s" % (alias, found[k]))
 PY
 cat components.txt
+OS_DMG=$(awk '$1=="os"{print $2}' components.txt)
+SYSOS_DMG=$(awk '$1=="sysos"{print $2}' components.txt)
+APPOS_DMG=$(awk '$1=="appos"{print $2}' components.txt)
 
-get_component() { # alias path
-    if [ ! -f "$work/$2" ]; then
-        echo "fetching $2 ..."
-        python3 "$remotezip" "$ipsw" "$2" "$work"
+get_component() { # dmgspec
+    if [ ! -f "$work/$1" ]; then
+        echo "fetching $1 ..."
+        python3 "$remotezip" "$ipsw" "$1" "$work"
     fi
 }
 
 # --- the HFS+ output --------------------------------------------------------
-truncate -s "$size" "$out"
-mkfs.hfsplus -s -J -v iOSRoot "$out"
-mkdir -p "$work/root"
-sudo mount -t hfsplus -o loop,force "$out" "$work/root"
+# HFSX (-s) matches iOS: the root volume is case-sensitive.
+mkfile -n "$size" "$out"
+dev=$(hdiutil attach -owners on -imagekey diskimage-class=CRawDiskImage -nomount "$out" |
+      awk 'NR==1{print $1}')
+echo "newfs_hfs on $dev"
+sudo "$NEWFS_HFS" -s -J -v iOSRoot "$dev"
+hdiutil detach "$dev"
 
-apfs_mount() { # file alias
-    ln -sf "$(realpath "$1")" "$work/$2.dmg"
-    mkdir -p "$work/$2"
-    sudo "$(command -v apfs-fuse)" "$work/$2.dmg" "$work/$2"
-}
-apfs_umount() {
-    sudo umount "$work/$1" 2>/dev/null || true
-    sudo fusermount -u "$work/$1" 2>/dev/null || true
-    rm -f "$work/$1.dmg"
-}
+mkdir -p "$work/root"
+hdiutil attach -owners on -imagekey diskimage-class=CRawDiskImage -mountpoint "$work/root" "$out"
+mount | grep -i 'hfs' || true
 
 copy_into() { # src dst
     sudo mkdir -p "$2"
-    sudo rsync -aH --numeric-ids "$1/" "$2/"
+    sudo "$RSYNC" -aH --numeric-ids "$1/" "$2/"
+}
+
+apfs_attach() { # dmg mountpoint
+    mkdir -p "$2"
+    hdiutil attach -owners on -nobrowse -readonly -mountpoint "$2" "$1" >/dev/null
+}
+apfs_detach() { # mountpoint
+    hdiutil detach "$1" >/dev/null
 }
 
 # --- 1) the OS volume -------------------------------------------------------
-get_component os "$(awk '$1=="os"{print $2}' components.txt)"
-apfs_mount "$work/$(awk '$1=="os"{print $2}' components.txt)" os
-copy_into "$work/os/root" "$work/root"
-apfs_umount os
-rm -f "$work/$(awk '$1=="os"{print $2}' components.txt)"
-sudo rm -rf "$work/os"
+get_component "$OS_DMG"
+apfs_attach "$work/$OS_DMG" "$work/mnt-os"
+echo "--- os top level ---"
+ls -la "$work/mnt-os" | head -20
+copy_into "$work/mnt-os" "$work/root"
+apfs_detach "$work/mnt-os"
+rm -f "$work/$OS_DMG"
+df -h "$work"
 
 # --- 2) the SystemOS cryptex ------------------------------------------------
-get_component sysos "$(awk '$1=="sysos"{print $2}' components.txt)"
-apfs_mount "$work/$(awk '$1=="sysos"{print $2}' components.txt)" sysos
-copy_into "$work/sysos/root" "$work/root/private/preboot/Cryptexes/OS"
-apfs_umount sysos
-rm -f "$work/$(awk '$1=="sysos"{print $2}' components.txt)"
-sudo rm -rf "$work/sysos"
+get_component "$SYSOS_DMG"
+apfs_attach "$work/$SYSOS_DMG" "$work/mnt-sysos"
+echo "--- sysos top level ---"
+ls -la "$work/mnt-sysos" | head -20
+copy_into "$work/mnt-sysos" "$work/root/private/preboot/Cryptexes/OS"
+apfs_detach "$work/mnt-sysos"
+rm -f "$work/$SYSOS_DMG"
+df -h "$work"
 
 # --- 3) the AppOS cryptex ---------------------------------------------------
-get_component appos "$(awk '$1=="appos"{print $2}' components.txt)"
-apfs_mount "$work/$(awk '$1=="appos"{print $2}' components.txt)" appos
-copy_into "$work/appos/root" "$work/root/private/preboot/Cryptexes/App"
-apfs_umount appos
-rm -f "$work/$(awk '$1=="appos"{print $2}' components.txt)"
-sudo rm -rf "$work/appos"
+get_component "$APPOS_DMG"
+apfs_attach "$work/$APPOS_DMG" "$work/mnt-appos"
+echo "--- appos top level ---"
+ls -la "$work/mnt-appos" | head -20
+copy_into "$work/mnt-appos" "$work/root/private/preboot/Cryptexes/App"
+apfs_detach "$work/mnt-appos"
+rm -f "$work/$APPOS_DMG"
+df -h "$work"
 
 # --- 4) dyld shared cache + cryptex fallbacks -------------------------------
 dsc=private/preboot/Cryptexes/OS/System/Library/Caches/com.apple.dyld
 sudo mkdir -p "$work/root/System/Library/Caches/com.apple.dyld"
 for f in "$work/root/$dsc"/*; do
-    sudo ln "$f" "$work/root/System/Library/Caches/com.apple.dyld/${f##*/}"
+    [ -f "$f" ] || continue
+    base=${f##*/}
+    [ -e "$work/root/System/Library/Caches/com.apple.dyld/$base" ] && continue
+    sudo ln "$f" "$work/root/System/Library/Caches/com.apple.dyld/$base"
 done
 for c in OS App; do
-    (cd "$work/root/private/preboot/Cryptexes/$c" && sudo find . ! -type d ! -path './System/Library/Caches/com.apple.dyld/*') |
+    (cd "$work/root/private/preboot/Cryptexes/$c" &&
+     find . ! -type d ! -path './System/Library/Caches/com.apple.dyld/*') |
     while IFS= read -r f; do
         f=${f#./}
-        if ! sudo test -e "$work/root/$f" && ! sudo test -L "$work/root/$f"; then
-            sudo mkdir -p "$work/root/$(dirname "$f")"
-            src="$work/root/private/preboot/Cryptexes/$c/$f"
-            if sudo test -L "$src"; then sudo cp -P "$src" "$work/root/$f"; else sudo ln "$src" "$work/root/$f"; fi
+        [ -e "$work/root/$f" ] && continue
+        [ -L "$work/root/$f" ] && continue
+        sudo mkdir -p "$work/root/$(dirname "$f")"
+        src="$work/root/private/preboot/Cryptexes/$c/$f"
+        if [ -L "$src" ]; then
+            sudo cp -P "$src" "$work/root/$f"
+        else
+            sudo ln "$src" "$work/root/$f"
         fi
     done
 done
@@ -122,13 +148,23 @@ for d in diagnostics uuidtext diagnostics/timesync; do
     sudo install -o 272 -g 272 -m 0644 /dev/null "$db/$d/.migrated"
 done
 sudo install -d -m 0700 -o 0 -g 0 "$work/root/private/var/keybags"
-printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' \
-    '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
-    '<plist version="1.0"><dict><key>KeyBagKeys</key><data>U1dFRVQ=</data></dict></plist>' |
-    sudo install -m 0600 -o 0 -g 0 /dev/stdin "$work/root/private/var/keybags/systembag.kb"
+cat > "$work/systembag.kb" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict><key>KeyBagKeys</key><data>U1dFRVQ=</data></dict></plist>
+EOF
+sudo install -m 0600 -o 0 -g 0 "$work/systembag.kb" "$work/root/private/var/keybags/systembag.kb"
+rm -f "$work/systembag.kb"
 
 df -h "$work/root"
-sudo umount "$work/root"
-fsck.hfsplus -f -y "$out" | grep -v 'Illegal name' || true
-fsck.hfsplus -f -n "$out"
+sudo du -sh "$work/root"
+sync
+hdiutil detach "$work/root"
+
+# --- fsck the raw image -----------------------------------------------------
+dev=$(hdiutil attach -owners on -imagekey diskimage-class=CRawDiskImage -nomount "$out" |
+      awk 'NR==1{print $1}')
+sudo fsck_hfs -f -y "$dev" || true
+sudo fsck_hfs -f -n "$dev"
+hdiutil detach "$dev"
 ls -la "$out"

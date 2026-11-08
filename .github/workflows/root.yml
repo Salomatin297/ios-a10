@@ -18,40 +18,69 @@ concurrency:
 
 jobs:
   root:
-    runs-on: macos-15
+    runs-on: macos-15-arm64
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
 
       - name: Tools
         run: |
-          brew install apfs-fuse hfsprogs rsync
-          which apfs-fuse mkfs.hfsplus rsync
-          df -h "$HOME"
+          # hdiutil/newfs_hfs are native; rsync from Homebrew handles -H and
+          # --numeric-ids more reliably than the bundled openrsync.
+          brew install rsync
+          command -v hdiutil newfs_hfs rsync python3
+          df -h /
 
       - name: Build the HFS+ root
         run: |
+          set -eux
           mkdir -p work
           bash tools/mkiosroot-staged.sh work "${{ inputs.ipsw_url }}" work/ios-root.img "${{ inputs.size }}"
           ls -la work/ios-root.img
-          shasum -a 256 work/ios-root.img | tee work/ios-root.img.sha256
 
-      - name: Split into chunks for the microSD transfer
+      - name: Verify ownership and content
         run: |
-          # the phone is flashed through TWRP from a FAT32 card, so a single
-          # >4 GiB file cannot be copied there; split it into 2 GiB parts
-          mkdir -p work/parts
-          split -b 2G -d -a 3 work/ios-root.img work/parts/ios-root.img.part
-          ls -la work/parts
-          (cd work/parts && shasum -a 256 * > SHA256SUMS)
+          set -eux
+          mkdir -p work/verify
+          hdiutil attach -owners on -imagekey diskimage-class=CRawDiskImage \
+            -mountpoint work/verify work/ios-root.img
+          mount | grep -i hfs
+          echo "--- top level ---"
+          ls -ln work/verify | head -30
+          echo "--- key paths ---"
+          stat -f '%u:%g %Sp %N' work/verify/Applications work/verify/System \
+            work/verify/private/preboot/Cryptexes/OS/usr/lib/dyld \
+            work/verify/private/var/keybags/systembag.kb
+          echo "--- cryptexes ---"
+          du -sh work/verify/private/preboot/Cryptexes/OS work/verify/private/preboot/Cryptexes/App
+          echo "--- sizes ---"
+          du -sh work/verify
+          echo "--- fallback sample ---"
+          ls -ln work/verify/private/preboot/Cryptexes/OS/usr/lib/dyld || true
+          ls -ln work/verify/usr/lib/dyld || true
+          hdiutil detach work/verify
+
+      - name: Compress and split for the microSD transfer
+        run: |
+          set -eux
+          # FAT32 on the microSD cannot hold a >4 GiB file; the gzip stream is
+          # split into 2 GiB parts and reassembled on the phone with
+          #   cat part* | gzip -dc | dd of=<userdata block device>
+          gzip -1 -c work/ios-root.img > work/ios-root.img.gz
+          split -b 2G -d -a 3 work/ios-root.img.gz work/ios-root.img.gz.part
+          shasum -a 256 work/ios-root.img work/ios-root.img.gz work/ios-root.img.gz.part* \
+            > work/SHA256SUMS
+          ls -la work/ios-root.img.gz work/ios-root.img.gz.part* work/SHA256SUMS
+          du -sh work/ios-root.img.gz
+          df -h /
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: ios-root
           path: |
-            work/ios-root.img
-            work/ios-root.img.sha256
-            work/parts/
-          retention-days: 7
+            work/ios-root.img.gz.part*
+            work/SHA256SUMS
+          retention-days: 14
           if-no-files-found: warn
+          compression-level: 0
