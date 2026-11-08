@@ -78,7 +78,7 @@ diff --git a/bsd/dev/a10_battery.c b/bsd/dev/a10_battery.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/a10_battery.c
-@@ -0,0 +1,321 @@
+@@ -0,0 +1,324 @@
 +/*
 + * A10 (Exynos 7884B) S2MU005 fuel gauge and charger status.
 + *
@@ -96,6 +96,7 @@ new file mode 100644
 +#include <sys/param.h>
 +#include <sys/systm.h>
 +#include <sys/errno.h>
++#include <kern/clock.h>
 +#include <machine/machine_routines.h>
 +#include <pexpert/pexpert.h>
 +
@@ -353,8 +354,8 @@ new file mode 100644
 +	}
 +	if (a10_i2c_read_u16(a10_i2c_fg, A10_FG_ADDR, A10_FG_RSOC,
 +	    &rawSoc) == 0) {
-+		/* RSOC is unsigned 0..10000 (0.01%); negative values are rare. */
-+		socValid = (rawSoc & 0x8000u) == 0 && rawSoc <= 10000u &&
++		/* RSOC is unsigned 0..16384 (100%); negative means invalid. */
++		socValid = (rawSoc & 0x8000u) == 0 && rawSoc <= 16384u &&
 +		    rawSoc >= 100u;
 +	}
 +	if (a10_i2c_read_u16(a10_i2c_fg, A10_FG_ADDR, A10_FG_RCUR_CC,
@@ -367,7 +368,9 @@ new file mode 100644
 +		chargerValid = true;
 +	}
 +
-+	unsigned soc = socValid ? (rawSoc + 50u) / 100u :
++	/* raw RSOC is 0..16384; convert to whole percent with rounding. */
++	unsigned soc = socValid ?
++	    (((uint32_t)rawSoc * 100u) + 8192u) / 16384u :
 +	    a10_battery_percent_from_mv(voltage);
 +	if (soc > 100) {
 +		soc = 100;
