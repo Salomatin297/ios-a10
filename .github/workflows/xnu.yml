@@ -146,6 +146,9 @@ jobs:
           need dxb/xnu/bsd/kern/bsd_init.c 'SWEET root selection' present '0091 root diagnostics'
           need dxb/xnu/bsd/vfs/vfs_subr.c 'SWEET root mount: bdev' present '0091 mount diagnostics'
           need dxb/xnu/iokit/bsddev/IOKitBSDInit.cpp 'sweet_emmc_rootdev' present '0092 eMMC root hook'
+          need dxb/xnu/iokit/KernelConfigTables.cpp 'arm,cortex-a53' present '0093 A10 CPU personality'
+          need dxb/xnu/iokit/Kernel/arm/SweetCPU.cpp 'SWEET CPU: start node=' present '0093 CPU match logging'
+          need dxb/xnu/pexpert/arm/pe_init.c 'A10_IOKIT_MATCHING_RETURNED' present '0093 IOKit matching trace'
           if [ "$fail" -ne 0 ]; then
             echo "::error::A10 port patches did not apply cleanly"
             exit 1
