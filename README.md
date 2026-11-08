@@ -4,8 +4,8 @@
 
 This is the Galaxy A10 branch of the ios-sweet work. It ports Apple's open-source XNU kernel (xnu-8796.141.3, the iOS 16 generation) to the Exynos 7884B, with the stock iOS 16.7.16 (20H392) iPhone X userland as the target. The original ios-sweet sources are the starting point; the platform layer here is Exynos-specific.
 
-> **Status: 2026-11-08, milestone M2 in progress.**
-> The A10 boots XNU to the IOKit platform expert, registers the CPU driver and initializes the AppleCLCD framebuffer. Probe12 then stopped in the GICv2 self-SGI bring-up; probe13 fixes the SGIR encoding and is waiting for a device test. No iOS userland, `launchd` or GUI runs on the phone yet.
+> **Status: 2026-11-08, milestone M2 complete — M3 in progress.**
+> The A10 boots XNU through the IOKit platform expert, CPU bring-up and `bsd_init`; probe13 reached `bsd_autoconf`/`kminit` and brought up the loopback and tunnel interfaces. Probe14 now points the BSD root at the internal eMMC (`rd=emmcroot0`, partition `userdata`, read-only) to validate the DW-MMC driver and GPT before an HFS+ root image is written. No iOS userland, `launchd` or GUI runs on the phone yet.
 
 ## Device
 
@@ -28,8 +28,8 @@ The device is an experimental bring-up target. Android is already erased; the st
 | --- | --- |
 | **M0** — EL1, live FDT, GICv2, framebuffer | ✅ confirmed on device (probe #1/#2) |
 | **M1** — eMMC read-only, 64-bit FIFO | ✅ confirmed on device (probe #8, 2026-11-07) |
-| **M2** — XNU boots on the A10 to the console | 🔄 XNU reaches IOKit and AppleCLCD; CPU startup fix is in probe13 |
-| **M3** — HFS+ root + `launchd` | ⏳ blocked on a stable M2 |
+| **M2** — XNU boots on the A10 to the console | ✅ confirmed on device (probe #13, 2026-11-08): XNU reaches `bsd_init`/`kminit` |
+| **M3** — HFS+ root + `launchd` | 🔄 probe14 validates the eMMC root path (`userdata`, read-only) |
 | **M4** — iOS GUI (SpringBoard, touch, buttons) | ⏳ blocked on M3 |
 
 ### What works today
@@ -38,14 +38,14 @@ The device is an experimental bring-up target. Android is already erased; the st
 - XNU starts on the A10 with 4K pages, GICv2 interrupts, the generic timer and a framebuffer console at 720×1600.
 - The kernel reaches the IOKit platform expert; `AppleCLCD` publishes the display and the boot log is visible on the panel.
 - The `SweetCPU` personality matches the A10 CPU node, `ml_processor_register()` succeeds and the boot CPU enters `initCPU()`.
+- XNU completes CPU startup, `bsd_init` and `kminit`; `bsd_autoconf` configures `lo0`, `gif0` and `stf0` (probe #13).
 - The DW-MMC eMMC path reads CID, EXT_CSD, MBR (`0xAA55`) and the GPT header (`EFI PART`) using 64-bit FIFO elements.
 - The kernel contains no ARMv8.1 LSE instructions; CI scans for them.
 
 ### What does not work yet
 
-- **CPU startup:** probe12 panicked at `SweetCPU.cpp:198` because the GICv2 self-SGI was never delivered. The `GICD_SGIR` target filter was encoded in the wrong bit range; patch `0094` corrects it. Probe13 must verify this on the phone.
 - **SMP:** the A10 firmware accepts `PSCI CPU_ON` but secondary cores do not acknowledge it. Bring-up is single-CPU for now.
-- **iOS root:** HFS+ mounting from `userdata` and `launchd` are M3 work.
+- **iOS root:** there is no HFS+ volume yet, so `IOFindBSDRoot` finds nothing to mount. Probe14 tests the eMMC root path read-only; mounting `userdata` and starting `launchd` are M3 work.
 - **GUI:** no SpringBoard, touch, buttons, battery, Wi-Fi, Bluetooth, cellular, audio, camera or GPU.
 - **USB:** no data connection; logs are read by photographing the screen or from the TWRP/ZIP log on the microSD card.
 

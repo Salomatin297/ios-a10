@@ -45,14 +45,23 @@ filter to `(2U << 24)` in a new patch after 0093 (do not rewrite 0084, to keep
 CI patch ordering stable) and print `initialized`/`signal_enabled` on a
 startup timeout. CI verifies both markers.
 
-**Next action:** flash `C:\Users\User\iOS-Port\dist\a10_probe13.zip` via TWRP
-(microSD only; USB data lines are broken) and photograph the screen. Probe13
-kernel `3EF17950...B30564`, boot image `300939BB...01FF86`, ZIP
-`2AABDAB3...21C89B`; rollback ZIP `B739C26B...4FB10F60` (searches through
-`boot.before-probe13.img`). Expected: `... came alive; SGI1 OK`,
-`A10_KPERF_DONE`, then `A10_BSD_INIT_ENTER`. If it times out again, the new
-line distinguishes `initialized=1 signal_enabled=0` (SGI still not delivered)
-from `initialized=0` (reset/MMU path did not reach `initCPU()`).
+**Probe13 result (2026-11-08): M2 closed.** Photo `dist/probe13_bsdinit.jpg`
+(source `Downloads/20261108_164504.jpg`) shows XNU past `startAll()` and kperf:
+Skywalk self-tests passed, `bsd_autoconf: calling kminit`, `ifnet_attach` for
+`lo0`/`gif0`/`stf0`, then `IOFindBSDRoot` waited on an `IOMedia` with
+`Apple_HFS` and logged `Failed to write boot-picker-bringup-reason to NVRAM.`
+There was no panic. Because probe13 had no `rd=` boot-arg, it searched for any
+HFS+ media and took the recovery/reboot branch.
+
+**Next action:** flash `C:\Users\User\iOS-Port\dist\a10_probe14.zip` via TWRP
+(microSD only; USB data lines are broken) and photograph the screen. Probe14
+adds `rd=emmcroot0 emmcroot=userdata emmcprobe=1`, still read-only (no
+`emmcw`). Kernel `3EF17950...B30564`, boot image `14B3BD1F...80DE7`, ZIP
+`1ECFE87A...90CA40`; rollback ZIP `0323403C...608FE5` (searches through
+`boot.before-probe14.img`). Expected: `SWEET eMMC:` init/GPT logs, then
+`IOFindBSDRoot` calls `sweet_emmc_rootdev()`. An HFS+ mount failure on a
+non-HFS+ `userdata` is expected; it separates driver problems from the
+missing root image.
 
 ## Agent handoff / active work (2026-10-15, latest)
 
