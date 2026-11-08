@@ -1,0 +1,92 @@
+name: root-probe
+
+on:
+  workflow_dispatch:
+
+env:
+  IPSW: "https://updates.cdn-apple.com/2025FallFCS/fullrestores/122-77006/1158E502-D76D-4226-AA06-ED5E30CD1111/iPhone10,3,iPhone10,6_16.7.16_20H392_Restore.ipsw"
+
+jobs:
+  probe:
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Host tools and disk
+        run: |
+          set -eux
+          sw_vers
+          df -h /
+          for t in hdiutil newfs_hfs diskutil rsync python3 curl; do
+            command -v "$t"
+          done
+          newfs_hfs -h 2>&1 | head -30 || true
+
+      - name: Component sizes
+        run: |
+          set -euo pipefail
+          mkdir -p work
+          python3 tools/remotezip.py "$IPSW" BuildManifest.plist work
+          python3 - work/BuildManifest.plist > work/components.txt <<'PY'
+          import plistlib, sys
+          m = plistlib.load(open(sys.argv[1], "rb"))
+          want = {"OS": "os", "Cryptex1,SystemOS": "sysos", "Cryptex1,AppOS": "appos"}
+          found = {}
+          for data in m.get("BuildIdentities", []):
+              for k, v in data.get("Manifest", {}).items():
+                  if k in want and k not in found:
+                      path = v.get("Info", {}).get("Path", "")
+                      if path.endswith(".dmg"):
+                          found[k] = path
+          for k, alias in want.items():
+              if k not in found:
+                  raise SystemExit("component not found: %s" % k)
+              print("%s %s" % (alias, found[k]))
+          PY
+          cat work/components.txt
+
+      - name: Mount each component and measure
+        run: |
+          set -euo pipefail
+          while read -r alias file; do
+            echo "=== $alias $file ==="
+            df -h /
+            python3 tools/remotezip.py "$IPSW" "$file" work
+            mkdir -p "work/mnt-$alias"
+            hdiutil attach -nobrowse -readonly -mountpoint "work/mnt-$alias" "work/$file"
+            echo "--- top level ---"
+            ls -la "work/mnt-$alias" || true
+            echo "--- du mount ---"
+            du -sh "work/mnt-$alias" || true
+            echo "--- du root ---"
+            du -sh "work/mnt-$alias/root" 2>/dev/null || true
+            echo "--- root top level ---"
+            ls -la "work/mnt-$alias/root" 2>/dev/null | head -40 || true
+            hdiutil detach "work/mnt-$alias"
+            rm -f "work/$file"
+            df -h /
+          done < work/components.txt
+
+      - name: HFS+ write test
+        run: |
+          set -euo pipefail
+          mkfile -n 1g work/test.img
+          dev=$(hdiutil attach -imagekey diskimage-class=CRawDiskImage -nomount work/test.img | awk 'NR==1{print $1}')
+          echo "dev=$dev"
+          sudo "$(command -v newfs_hfs)" -s -J -v iOSTest "$dev"
+          hdiutil detach "$dev"
+          mkdir -p work/hfsmnt
+          hdiutil attach -imagekey diskimage-class=CRawDiskImage -mountpoint work/hfsmnt work/test.img
+          mount | grep -i hfs || true
+          echo hello > work/hello.txt
+          sudo cp work/hello.txt work/hfsmnt/hello.txt
+          sudo mkdir -p work/hfsmnt/private/var/keybags
+          sudo chown 0:0 work/hfsmnt/hello.txt
+          sudo ls -la work/hfsmnt
+          sudo cat work/hfsmnt/hello.txt
+          hdiutil detach work/hfsmnt
+          dev=$(hdiutil attach -imagekey diskimage-class=CRawDiskImage -nomount work/test.img | awk 'NR==1{print $1}')
+          sudo "$(command -v fsck_hfs)" -f -n "$dev" || true
+          hdiutil detach "$dev"
+          df -h /
