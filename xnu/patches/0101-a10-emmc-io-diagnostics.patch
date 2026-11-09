@@ -1,0 +1,164 @@
+diff --git a/bsd/dev/sweet_emmc.c b/bsd/dev/sweet_emmc.c
+--- a/bsd/dev/sweet_emmc.c
++++ b/bsd/dev/sweet_emmc.c
+@@ -195,6 +195,27 @@
+ 	return mach_absolute_time() + ticks;
+ }
+ 
++/*
++ * Bring-up diagnostics: the first transfer failures are printed with the
++ * parameters that the block layer asked for, so a launchd exec ETIMEDOUT can
++ * be attributed to a specific LBA/size instead of guessing.
++ */
++static int sweet_emmc_error_logs;
++
++static void
++sweet_emmc_log_error(const char *what, uint64_t lba, uint32_t blocks,
++    int write, int error)
++{
++	if (sweet_emmc_error_logs >= 16) {
++		return;
++	}
++	if (sweet_emmc_error_logs++ == 0) {
++		printf("SWEET eMMC: logging the first I/O failures\n");
++	}
++	printf("SWEET eMMC: %s lba=0x%llx blocks=%u %s -> %d\n", what,
++	    lba, blocks, write ? "write" : "read", error);
++}
++
+ static int
+ emmc_wait_clear(uint32_t off, uint32_t mask, uint64_t deadline)
+ {
+@@ -262,17 +283,31 @@
+ 	emmc_wr(0x028, argument);
+ 	emmc_wr(REG_CMD, CMD_START | flags | (index & 0x3fu));
+ 	if ((error = emmc_wait_clear(REG_CMD, CMD_START, deadline)) != 0) {
++		if (sweet_emmc_error_logs < 16) {
++			printf("SWEET eMMC: cmd %u start timeout, arg=%08x rintsts=%08x status=%08x\n",
++			    index, argument, emmc_rd(REG_RINTSTS),
++			    emmc_rd(REG_STATUS));
++		}
+ 		return error;
+ 	}
+ 	for (;;) {
+ 		status = emmc_rd(REG_RINTSTS);
+ 		if (status & INT_ERRORS) {
++			if (sweet_emmc_error_logs < 16) {
++				printf("SWEET eMMC: cmd %u error, arg=%08x rintsts=%08x\n",
++				    index, argument, status);
++			}
+ 			return EIO;
+ 		}
+ 		if (status & INT_CMD_DONE) {
+ 			break;
+ 		}
+ 		if (mach_absolute_time() >= deadline) {
++			if (sweet_emmc_error_logs < 16) {
++				printf("SWEET eMMC: cmd %u timeout, arg=%08x rintsts=%08x status=%08x\n",
++				    index, argument, emmc_rd(REG_RINTSTS),
++				    emmc_rd(REG_STATUS));
++			}
+ 			return ETIMEDOUT;
+ 		}
+ 	}
+@@ -315,6 +350,10 @@
+ 	while (done < bytes) {
+ 		status = emmc_rd(REG_RINTSTS);
+ 		if (status & INT_ERRORS) {
++			if (sweet_emmc_error_logs < 16) {
++				printf("SWEET eMMC: cmd %u error, lba=0x%x blocks=%u done=%u rintsts=%08x\n",
++				    index, argument, blocks, done, status);
++			}
+ 			return EIO;
+ 		}
+ 		status = emmc_rd(REG_STATUS);
+@@ -341,6 +380,11 @@
+ 			}
+ 		}
+ 		if (mach_absolute_time() >= deadline) {
++			if (sweet_emmc_error_logs < 16) {
++				printf("SWEET eMMC: cmd %u data timeout, lba=0x%x blocks=%u done=%u/%u rintsts=%08x status=%08x\n",
++				    index, argument, blocks, done, bytes,
++				    emmc_rd(REG_RINTSTS), emmc_rd(REG_STATUS));
++			}
+ 			return ETIMEDOUT;
+ 		}
+ 	}
+@@ -348,12 +392,21 @@
+ 	for (;;) {
+ 		status = emmc_rd(REG_RINTSTS);
+ 		if (status & INT_ERRORS) {
++			if (sweet_emmc_error_logs < 16) {
++				printf("SWEET eMMC: cmd %u end error, lba=0x%x blocks=%u rintsts=%08x\n",
++				    index, argument, blocks, status);
++			}
+ 			return EIO;
+ 		}
+ 		if (status & INT_DATA_OVER) {
+ 			break;
+ 		}
+ 		if (mach_absolute_time() >= deadline) {
++			if (sweet_emmc_error_logs < 16) {
++				printf("SWEET eMMC: cmd %u data-over timeout, lba=0x%x blocks=%u rintsts=%08x status=%08x\n",
++				    index, argument, blocks, emmc_rd(REG_RINTSTS),
++				    emmc_rd(REG_STATUS));
++			}
+ 			return ETIMEDOUT;
+ 		}
+ 	}
+@@ -386,15 +439,22 @@
+ 	argument = (uint32_t)lba;
+ 	error = emmc_data_command(blocks > 1 ? (write ? 25 : 18) :
+ 	    (write ? 24 : 17), argument, write, blocks, buffer);
++	if (error != 0) {
++		sweet_emmc_log_error("data", lba, blocks, write, error);
++	}
+ 	if (error == 0 && write) {
+ 		uint64_t deadline = emmc_deadline(EMMC_READY_NS);
+ 		uint32_t response = 0;
+ 		do {
+ 			error = emmc_cmd(13, 1u << 16, RSP_R1, &response);
+ 			if (error != 0) {
++				sweet_emmc_log_error("status", lba, blocks, write,
++				    error);
+ 				return error;
+ 			}
+ 			if (response & R1_ERROR_MASK) {
++				sweet_emmc_log_error("status-r1", lba, blocks,
++				    write, EIO);
+ 				return EIO;
+ 			}
+ 			if ((response & (1u << 8)) &&
+@@ -402,6 +462,10 @@
+ 				break;
+ 			}
+ 			if (mach_absolute_time() >= deadline) {
++				if (sweet_emmc_error_logs < 16) {
++					printf("SWEET eMMC: write ready timeout, lba=0x%llx blocks=%u r1=%08x\n",
++					    lba, blocks, response);
++				}
+ 				return ETIMEDOUT;
+ 			}
+ 		} while (true);
+@@ -444,6 +508,10 @@
+ 			return 0;
+ 		}
+ 	} while (mach_absolute_time() < deadline);
++	if (sweet_emmc_error_logs < 16) {
++		printf("SWEET eMMC: card never ready, r1=%08x rintsts=%08x status=%08x\n",
++		    response, emmc_rd(REG_RINTSTS), emmc_rd(REG_STATUS));
++	}
+ 	return ETIMEDOUT;
+ }
+ 
+@@ -776,6 +844,10 @@
+ 	buf_unmap(bp);
+ finish:
+ 	if (error) {
++		if (sweet_emmc_error_logs < 16) {
++			printf("SWEET eMMC: block I/O offset=0x%llx count=%u %s -> %d\n",
++			    offset, count, read ? "read" : "write", error);
++		}
+ 		buf_seterror(bp, error);
+ 	}
+ 	buf_biodone(bp);
