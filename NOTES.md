@@ -1,17 +1,19 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
-## >>> A10 PORT (Samsung Galaxy A10, SM-A105F) - active work 2026-11-08 <<<
+## >>> A10 PORT (Samsung Galaxy A10, SM-A105F) - active work 2026-11-09 <<<
 
 The A10 bring-up lives in `C:\Users\User\iOS-Port`; its consolidated handoff is
 **`C:\Users\User\iOS-Port\STATUS.md`** (read it first). This repo is the build
 source + CI for it (`a10` branch, pushed to `https://github.com/Salomin297/ios-a10`).
 
-**State (2026-11-08 night, root image ready to write): the eMMC root path
-works.** Probe15 selected `emmcroot0` / GPT `userdata` (`bdev=1,0`) with no
-`pmap_ttne` panic, then failed where expected:
+**State (2026-11-09, root image verified, waiting for the microSD): the eMMC
+root path works.** Probe15 selected `emmcroot0` / GPT `userdata` (`bdev=1,0`)
+with no `pmap_ttne` panic, then failed where expected:
 `hfs_validateHFSPlusVolumeHeader: unknown volume signature: 20` and
 `hfs_mountfs returned error=22` — `userdata` is not HFS+ yet. Photo:
-`C:\Users\User\iOS-Port\dist\probe15_emmcroot.jpg`.
+`C:\Users\User\iOS-Port\dist\probe15_emmcroot.jpg`. The new 20 GiB HFSX image
+with data-volume tweaks is built, downloaded and SHA256-verified; writing it
+into `userdata` needs the microSD and explicit user confirmation.
 
 * probe15 kernel CI run `42490085753` (commit `0a5cef1`); ZIP
   `a10_probe15.zip` sha256 `B61967E6...F41E6`, rollback
@@ -26,13 +28,26 @@ works.** Probe15 selected `emmcroot0` / GPT `userdata` (`bdev=1,0`) with no
   ownership as root, gzips it and splits it into 2 GiB parts for the FAT32
   microSD.
 * Root build run `42495934001` (commit `01eb781`), artifact `ios-root` id
-  `13624355897` (6,021,319,162 bytes). **Downloaded and verified 2026-11-08:**
-  all three part SHA256 match `SHA256SUMS` (`5b793e...7624`, `a5df34...8bcd`,
-  `6b8cde...e113`). Local copy:
-  `C:\Users\User\AppData\Local\Temp\opencode\ios-root.zip`. The 20 GiB HFSX
-  image holds 11 GiB, fsck clean; `Applications` 0:80 and `System` 0:0 verified.
-  Parts: 2,147,483,648 + 2,147,483,648 + 1,726,350,783, gzip total
-  6,021,318,079, plus `SHA256SUMS` (431 bytes).
+  `13624355897` (6,021,319,162 bytes) was downloaded and verified, but it has
+  **no data-volume tweaks** and is superseded; the local copy was deleted.
+* **New root build `42630593621` (commit `cab3fd6`) is green** (build, verify,
+  compress/split, upload). Artifact `ios-root` id `13682161790`:
+  zip 6,021,622,129 bytes, sha256 `9CA19060...4FDA4` (matches the GitHub
+  digest); downloaded to `C:\Users\User\AppData\Local\Temp\opencode\ios-root.zip`.
+  Parts verified against `SHA256SUMS`:
+  `part000` 2,147,483,648 `ca05e1ea...a632555a`,
+  `part001` 2,147,483,648 `abde9a98...0ac61c42`,
+  `part002` 1,726,653,778 `2a91e188...a39ffd31`; gzip total 6,021,621,074,
+  `SHA256SUMS` 431 bytes.
+  Build log: the OS volume already has `/private/var/mobile` (501:501) and
+  `Library/Preferences`; `/etc/master.passwd` has `root` and `mobile`;
+  `db/dslocal` was absent and the tweak created the empty
+  `nodes/Default/{users,groups,config}` skeleton. Tweaks: launchd.plist
+  7 `_PanicOnCrash` renamed + 2 CommCenter jobs removed; migration/springboard/
+  backboardd/.GlobalPreferences/purplebuddy prefs written; `mobile` and
+  `Library/Preferences` are 501:501 0755. No `mobileactivationd` container in
+  the image, so the data ark was skipped (activation relies on the ADT
+  Hactivation branch; a container can be added later).
 * Probe16 (`dist/a10_probe16.zip`, 6,050,466 bytes) adds
   `emmcw=1 rootrw=1 ignition_level=1 ...` so the root mounts read-write and
   launchd starts after the write. Boot SHA256 `110846EB...245B946`. This is the
@@ -58,20 +73,23 @@ works.** Probe15 selected `emmcroot0` / GPT `userdata` (`bdev=1,0`) with no
 * `docs/A10_FORECAST.ru.md` records the first-boot forecast: HFSX mount 95 %,
   launchd 80 %, SpringBoard start 50 %, first GUI 35 %, touch 0 %; GPU via Mali
   is impossible and not needed for the CPU-composited GUI.
-* `dist/a10_write_root.zip` runs in TWRP, checks the three part sizes, `gzip -t`,
-  refuses parts on internal storage, streams
+* `dist/a10_write_root.zip` (1959 bytes, sha256 `55C38214...1DECE897`) runs in
+  TWRP, checks part names and that part000/part001 are exactly 2 GiB and the
+  last part is non-empty (part002 size is not hardcoded), `gzip -t`, refuses
+  parts on internal storage, streams
   `cat parts | gzip -dc > /dev/block/by-name/userdata`, then checks the HFSX
   signature `HX` at offset 1024. **Writing the image into `userdata` is
   destructive and still needs explicit user confirmation.**
 
-**Next action:** root CI build with the tweaks (commit after `f8c64f0`); when
-it is green, delete the old local `ios-root.zip` first (C: has ~4.4 GiB free),
-download the new artifact. Insert the microSD:
-`tools/stage_root_to_sd.py` now derives the part list/sizes from `SHA256SUMS`
-(no hardcoded part002) and extracts straight to `<card>\ios-root`; copy
-`a10_write_root.zip`, `a10_probe16.zip`, `a10_probe17.zip` and
-`a10_restore_boot.zip`. Writing `userdata` needs explicit user confirmation.
-After the write, boot probe16 first (known baseline), then probe17 to exercise
+**Next action:** insert the microSD (FAT32) and report its drive letter.
+`tools/stage_root_to_sd.py --zip
+C:\Users\User\AppData\Local\Temp\opencode\ios-root.zip --dest <card> --copy
+dist\a10_write_root.zip dist\a10_probe16.zip dist\a10_probe17.zip
+dist\a10_restore_boot.zip` extracts the parts straight to `<card>\ios-root`
+(part list/sizes from `SHA256SUMS`) and verifies SHA256 on the card. Then, with
+explicit user confirmation, flash `a10_write_root.zip` in TWRP (erases
+`userdata`, streams 20 GiB, checks `HX`), then `a10_probe16.zip` (baseline) and
+photograph the screen. Afterwards flash `a10_probe17.zip` to exercise
 keys/battery.
 
 **Brief history:** probe11 fixed the ARMv8.1 LSE `ldadd` panic (0 LSE in the
