@@ -73,6 +73,12 @@ into `userdata` needs the microSD and explicit user confirmation.
 * `docs/A10_FORECAST.ru.md` records the first-boot forecast: HFSX mount 95 %,
   launchd 80 %, SpringBoard start 50 %, first GUI 35 %, touch 0 %; GPU via Mali
   is impossible and not needed for the CPU-composited GUI.
+* Open display issue: mkadt-a10 sets `/chosen/display-scale=2`, while
+  SweetFramebuffer presents 1125x2436 and center-crops the real 720x1600 panel
+  (36 % of the width lost; logical size becomes 562x1218 pt instead of
+  iPhone-X 375x812). After SpringBoard starts, either test
+  `sweetfb_native=1` (720x1600 @2x, possible compatibility bar) or add a
+  downscale 1125x2436 -> 720x1559 (fit width, ~20 px bars top/bottom).
 * `dist/a10_write_root.zip` (1959 bytes, sha256 `55C38214...1DECE897`) runs in
   TWRP, checks part names and that part000/part001 are exactly 2 GiB and the
   last part is non-empty (part002 size is not hardcoded), `gzip -t`, refuses
