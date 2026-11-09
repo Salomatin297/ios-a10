@@ -1,0 +1,400 @@
+diff --git a/bsd/dev/sweet_emmc.c b/bsd/dev/sweet_emmc.c
+--- a/bsd/dev/sweet_emmc.c
++++ b/bsd/dev/sweet_emmc.c
+@@ -41,6 +41,7 @@
+ #define EMMC_MAX_BLOCKS         128u
+ #define EMMC_BLOCK_SIZE         512u
+ #define EMMC_MAX_XFER           (EMMC_MAX_BLOCKS * EMMC_BLOCK_SIZE)
++#define EMMC_FIFO_DEPTH         64u
+ #define EMMC_TIMEOUT_NS         (2ull * NSEC_PER_SEC)
+ #define EMMC_READY_NS           (5ull * NSEC_PER_SEC)
+ 
+@@ -66,6 +67,7 @@
+ #define CTRL_FIFO_RESET         (1u << 1)
+ #define CTRL_DMA_RESET          (1u << 2)
+ #define CMD_START               (1u << 31)
++#define CMD_USE_HOLD_REG        (1u << 29)
+ #define CMD_INIT                (1u << 15)
+ #define CMD_STOP_ABORT          (1u << 14)
+ #define CMD_WAIT_PRVDATA        (1u << 13)
+@@ -202,6 +204,24 @@
+  */
+ static int sweet_emmc_error_logs;
+ 
++/*
++ * Optional write self-test telemetry.  The test runs before the log writer
++ * starts and reports a single failed stage instead of a screenful of prose.
++ */
++static int sweet_emmc_test_trace;
++static int sweet_emmc_test_failed;
++static int sweet_emmc_test_stage;
++static uint32_t sweet_emmc_test_fail_step;
++static uint32_t sweet_emmc_test_fail_blocks;
++static int sweet_emmc_test_fail_error;
++static uint32_t sweet_emmc_test_status;
++static uint32_t sweet_emmc_test_rintsts;
++static uint32_t sweet_emmc_test_r1;
++static uint32_t sweet_emmc_test_fcnt;
++static uint32_t sweet_emmc_test_done;
++static uint32_t sweet_emmc_test_tcbcnt;
++static uint32_t sweet_emmc_test_tbbcnt;
++
+ static void
+ sweet_emmc_log_error(const char *what, uint64_t lba, uint32_t blocks,
+     int write, int error)
+@@ -216,6 +236,22 @@
+ 	    lba, blocks, write ? "write" : "read", error);
+ }
+ 
++static void
++sweet_emmc_test_snapshot(int stage, uint32_t done)
++{
++	if (!sweet_emmc_test_trace) {
++		return;
++	}
++	sweet_emmc_test_stage = stage;
++	sweet_emmc_test_status = emmc_rd(REG_STATUS);
++	sweet_emmc_test_rintsts = emmc_rd(REG_RINTSTS);
++	sweet_emmc_test_r1 = emmc_rd(0x030);
++	sweet_emmc_test_fcnt = STATUS_FIFO_COUNT(sweet_emmc_test_status);
++	sweet_emmc_test_done = done;
++	sweet_emmc_test_tcbcnt = emmc_rd(0x05c);
++	sweet_emmc_test_tbbcnt = emmc_rd(0x060);
++}
++
+ static int
+ emmc_wait_clear(uint32_t off, uint32_t mask, uint64_t deadline)
+ {
+@@ -281,7 +317,8 @@
+ 
+ 	emmc_wr(REG_RINTSTS, 0xffffffffu);
+ 	emmc_wr(0x028, argument);
+-	emmc_wr(REG_CMD, CMD_START | flags | (index & 0x3fu));
++	emmc_wr(REG_CMD, CMD_START | CMD_USE_HOLD_REG | flags |
++	    (index & 0x3fu));
+ 	if ((error = emmc_wait_clear(REG_CMD, CMD_START, deadline)) != 0) {
+ 		if (sweet_emmc_error_logs < 16) {
+ 			printf("SWEET eMMC: cmd %u start timeout, arg=%08x rintsts=%08x status=%08x\n",
+@@ -317,34 +354,82 @@
+ 	return 0;
+ }
+ 
++/*
++ * A timed-out write leaves the card waiting for the rest of the block stream
++ * and the controller owning a FIFO.  Stop the transfer and put both back in a
++ * state where the next request can be tried, otherwise one failure wedges the
++ * eMMC for the rest of the boot.
++ */
++static void
++emmc_abort_data(void)
++{
++	(void)emmc_cmd(12, 0, CMD_STOP_ABORT | RSP_R1B, NULL);
++	(void)emmc_reset_fifo();
++	(void)emmc_wait_not_busy(emmc_deadline(EMMC_READY_NS));
++}
++
+ static int
+ emmc_data_command(uint32_t index, uint32_t argument, bool write,
+     uint32_t blocks, void *buffer)
+ {
+ 	uint32_t bytes = blocks * EMMC_BLOCK_SIZE;
+ 	uint32_t entry = 1u << se.fifo_shift;
+-	uint32_t command, status, done = 0;
++	uint32_t command, status, done = 0, response = 0;
+ 	uint8_t *p = buffer;
+-	uint64_t deadline = emmc_deadline(EMMC_TIMEOUT_NS);
++	uint64_t deadline;
+ 	int error;
+ 
+ 	if (blocks == 0 || blocks > EMMC_MAX_BLOCKS) {
+ 		return EINVAL;
+ 	}
++	/*
++	 * The card may still be programming the previous block when the log
++	 * writer queues its next request.  Linux's dw_mmc waits for DAT0 to
++	 * go high before every data command; without that wait CMD25 is sent
++	 * into a busy card and the controller sits until the host deadline.
++	 */
++	emmc_wr(REG_TMOUT, 0xffffffffu);
+ 	emmc_wr(REG_BLKSIZ, EMMC_BLOCK_SIZE);
+ 	emmc_wr(REG_BYTCNT, bytes);
+ 	if ((error = emmc_reset_fifo()) != 0) {
+-		return error;
++		sweet_emmc_test_snapshot(1, 0);
++		return error;
++	}
++	if (emmc_wait_not_busy(emmc_deadline(EMMC_READY_NS)) != 0) {
++		/*
++		 * Linux's dw_mmc warns and sends the command anyway after
++		 * its busy timeout; do the same instead of failing a read
++		 * just because DAT0 was sampled late.
++		 */
++		if (sweet_emmc_error_logs < 16) {
++			printf("SWEET eMMC: DAT0 busy before cmd %u, continuing\n",
++			    index);
++		}
++		sweet_emmc_test_snapshot(2, 0);
+ 	}
+ 	emmc_wr(REG_RINTSTS, 0xffffffffu);
+-	command = CMD_START | CMD_WAIT_PRVDATA | CMD_DATA_EXPECT | RSP_R1 | index;
++	command = CMD_START | CMD_WAIT_PRVDATA | CMD_DATA_EXPECT | RSP_R1 |
++	    CMD_USE_HOLD_REG | index;
+ 	if (write) {
+ 		command |= CMD_WRITE;
+ 	}
+ 	emmc_wr(0x028, argument);
+ 	emmc_wr(REG_CMD, command);
++	deadline = emmc_deadline(EMMC_TIMEOUT_NS);
+ 	if ((error = emmc_wait_clear(REG_CMD, CMD_START, deadline)) != 0) {
+-		return error;
++		sweet_emmc_test_snapshot(3, 0);
++		emmc_abort_data();
++		return error;
++	}
++	response = emmc_rd(0x030);
++	if (response & R1_ERROR_MASK) {
++		if (sweet_emmc_error_logs < 16) {
++			printf("SWEET eMMC: cmd %u r1 error, lba=0x%x blocks=%u r1=%08x\n",
++			    index, argument, blocks, response);
++		}
++		sweet_emmc_test_snapshot(4, 0);
++		emmc_abort_data();
++		return EIO;
+ 	}
+ 
+ 	while (done < bytes) {
+@@ -354,11 +439,23 @@
+ 				printf("SWEET eMMC: cmd %u error, lba=0x%x blocks=%u done=%u rintsts=%08x\n",
+ 				    index, argument, blocks, done, status);
+ 			}
++			sweet_emmc_test_snapshot(5, done);
++			emmc_abort_data();
+ 			return EIO;
+ 		}
+ 		status = emmc_rd(REG_STATUS);
+ 		if (write) {
+-			if (!(status & STATUS_FIFO_FULL)) {
++			/*
++			 * FCNT is valid in both directions (Linux computes
++			 * the free space as fifo_depth - FCNT).  The
++			 * controller's FIFO_FULL status bit is not present
++			 * on this IP version, so never key the write loop
++			 * off it.
++			 */
++			uint32_t fcnt = STATUS_FIFO_COUNT(status);
++			uint32_t space = fcnt < EMMC_FIFO_DEPTH ?
++			    EMMC_FIFO_DEPTH - fcnt : 0;
++			while (space-- != 0 && done < bytes) {
+ 				uint64_t value = 0;
+ 				uint32_t n = MIN(bytes - done, entry);
+ 				memcpy(&value, p + done, n);
+@@ -385,6 +482,8 @@
+ 				    index, argument, blocks, done, bytes,
+ 				    emmc_rd(REG_RINTSTS), emmc_rd(REG_STATUS));
+ 			}
++			sweet_emmc_test_snapshot(6, done);
++			emmc_abort_data();
+ 			return ETIMEDOUT;
+ 		}
+ 	}
+@@ -396,6 +495,8 @@
+ 				printf("SWEET eMMC: cmd %u end error, lba=0x%x blocks=%u rintsts=%08x\n",
+ 				    index, argument, blocks, status);
+ 			}
++			sweet_emmc_test_snapshot(7, done);
++			emmc_abort_data();
+ 			return EIO;
+ 		}
+ 		if (status & INT_DATA_OVER) {
+@@ -407,6 +508,8 @@
+ 				    index, argument, blocks, emmc_rd(REG_RINTSTS),
+ 				    emmc_rd(REG_STATUS));
+ 			}
++			sweet_emmc_test_snapshot(8, done);
++			emmc_abort_data();
+ 			return ETIMEDOUT;
+ 		}
+ 	}
+@@ -414,10 +517,24 @@
+ 	if (blocks > 1) {
+ 		error = emmc_cmd(12, 0, CMD_STOP_ABORT | RSP_R1B, NULL);
+ 		if (error != 0) {
++			sweet_emmc_test_snapshot(9, done);
++			emmc_abort_data();
+ 			return error;
+ 		}
+ 	}
+-	return emmc_wait_not_busy(deadline);
++	/*
++	 * Programming the last block can take longer than the data transfer
++	 * itself.  Give the card its full ready budget instead of the data
++	 * deadline that has already been running.
++	 */
++	error = emmc_wait_not_busy(emmc_deadline(EMMC_READY_NS));
++	if (error != 0) {
++		sweet_emmc_test_snapshot(10, done);
++		emmc_abort_data();
++		return error;
++	}
++	sweet_emmc_test_snapshot(11, done);
++	return 0;
+ }
+ 
+ static int
+@@ -769,6 +886,121 @@
+ 	return emmc_reset_fifo();
+ }
+ 
++/*
++ * Write-path self-test (emmcwtest=1).  The area right after the 20 GiB HFS
++ * image is not used by the payload, so writing there is safe.  The test
++ * exercises single-block, 18-block (the log flush size) and 128-block
++ * transfers, reads every transfer back, and leaves the card at the last
++ * configuration that passed.
++ */
++static uint8_t
++sweet_emmc_test_byte(uint32_t offset, uint32_t salt)
++{
++	return (uint8_t)(salt ^ (offset * 37u) ^ (offset >> 8));
++}
++
++static int
++sweet_emmc_test_run(uint64_t lba, uint32_t *failed_step, uint32_t *failed_blocks)
++{
++	static const uint32_t counts[] = { 1, 18, 128 };
++	uint32_t step = 1;
++
++	for (unsigned t = 0; t < sizeof(counts) / sizeof(counts[0]); t++) {
++		uint32_t blocks = counts[t];
++		uint32_t bytes = blocks * EMMC_BLOCK_SIZE;
++		uint32_t salt = 0x5a5a0000u ^ (blocks * 0x101u);
++		int error;
++
++		for (uint32_t i = 0; i < bytes; i++) {
++			emmc_bounce[i] = sweet_emmc_test_byte(i, salt);
++		}
++		error = emmc_transfer(lba, blocks, emmc_bounce, true);
++		if (error == 0) {
++			error = emmc_flush_cache();
++		}
++		if (error != 0) {
++			*failed_step = step;
++			*failed_blocks = blocks;
++			return error;
++		}
++		step++;
++
++		bzero(emmc_bounce, bytes);
++		error = emmc_transfer(lba, blocks, emmc_bounce, false);
++		if (error == 0) {
++			for (uint32_t i = 0; i < bytes; i++) {
++				if (emmc_bounce[i] !=
++				    sweet_emmc_test_byte(i, salt)) {
++					printf("SWEET eMMC: selftest mismatch block=%u byte=%u got=%02x want=%02x\n",
++					    blocks, i, emmc_bounce[i],
++					    sweet_emmc_test_byte(i, salt));
++					error = EIO;
++					break;
++				}
++			}
++		}
++		if (error != 0) {
++			*failed_step = step;
++			*failed_blocks = blocks;
++			return error;
++		}
++		printf("SWEET eMMC: selftest %u blocks ok\n", blocks);
++		step++;
++	}
++	return 0;
++}
++
++static void
++sweet_emmc_write_selftest(void)
++{
++	uint64_t lba = se.first_sector + 0x2800200ull;
++	uint32_t failed_step = 0, failed_blocks = 0;
++	int error;
++
++	if (!se.writable) {
++		return;
++	}
++	if (lba + EMMC_MAX_BLOCKS > se.first_sector + se.partition_sectors) {
++		printf("SWEET eMMC: selftest skipped, partition too small\n");
++		return;
++	}
++	sweet_emmc_test_trace = 1;
++	printf("SWEET eMMC: write selftest at LBA 0x%llx, %u-bit, div=%u\n",
++	    lba, se.bus_width, emmc_rd(REG_CLKDIV) & 0xffu);
++	error = sweet_emmc_test_run(lba, &failed_step, &failed_blocks);
++	if (error != 0 && se.bus_width == 8) {
++		printf("SWEET eMMC: selftest 8-bit failed (%d), retrying 1-bit\n",
++		    error);
++		if (emmc_force_one_bit() == 0) {
++			error = sweet_emmc_test_run(lba, &failed_step,
++			    &failed_blocks);
++		} else {
++			printf("SWEET eMMC: selftest 1-bit switch failed\n");
++		}
++	}
++	if (error != 0) {
++		sweet_emmc_test_fail_step = failed_step;
++		sweet_emmc_test_fail_blocks = failed_blocks;
++		sweet_emmc_test_fail_error = error;
++		sweet_emmc_test_failed = 1;
++		printf("SWEET eMMC: SELFTEST FAILED step=%u blocks=%u err=%d stage=%d\n",
++		    failed_step, failed_blocks, error, sweet_emmc_test_stage);
++		printf("SWEET eMMC: SELFTEST st=%08x ri=%08x r1=%08x fcnt=%u done=%u tcb=%08x tbb=%08x\n",
++		    sweet_emmc_test_status, sweet_emmc_test_rintsts,
++		    sweet_emmc_test_r1, sweet_emmc_test_fcnt,
++		    sweet_emmc_test_done, sweet_emmc_test_tcbcnt,
++		    sweet_emmc_test_tbbcnt);
++		panic("SWEET eMMC selftest st=%08x ri=%08x r1=%08x fcnt=%u done=%u tcb=%08x tbb=%08x step=%u blocks=%u err=%d stage=%d",
++		    sweet_emmc_test_status, sweet_emmc_test_rintsts,
++		    sweet_emmc_test_r1, sweet_emmc_test_fcnt,
++		    sweet_emmc_test_done, sweet_emmc_test_tcbcnt,
++		    sweet_emmc_test_tbbcnt, failed_step, failed_blocks, error,
++		    sweet_emmc_test_stage);
++	}
++	printf("SWEET eMMC: write selftest passed, %u-bit\n", se.bus_width);
++	sweet_emmc_test_trace = 0;
++}
++
+ static int
+ sweet_emmc_open(__unused dev_t dev, int flags, __unused int devtype,
+     __unused struct proc *p)
+@@ -1094,6 +1326,20 @@
+ {
+ 	int error;
+ 
++	/*
++	 * A failed self-test panics before the log writer exists; repeat the
++	 * compact report here so it lands in the panic output, which is the
++	 * only part of the console that survives on the framebuffer.
++	 */
++	if (sweet_emmc_test_failed) {
++		printf("SWEET SELFTEST: step=%u blocks=%u err=%d stage=%d st=%08x ri=%08x r1=%08x fcnt=%u done=%u tcb=%08x tbb=%08x\n",
++		    sweet_emmc_test_fail_step, sweet_emmc_test_fail_blocks,
++		    sweet_emmc_test_fail_error, sweet_emmc_test_stage,
++		    sweet_emmc_test_status, sweet_emmc_test_rintsts,
++		    sweet_emmc_test_r1, sweet_emmc_test_fcnt,
++		    sweet_emmc_test_done, sweet_emmc_test_tcbcnt,
++		    sweet_emmc_test_tbbcnt);
++	}
+ 	if (!sweet_emmc_log_enabled || !se.writable) {
+ 		return;
+ 	}
+@@ -1221,6 +1467,13 @@
+ 	    GID_OPERATOR, 0640, "remmcroot0");
+ 	/* Enable writes only after the selected partition has been bounded. */
+ 	se.writable = (rw == 1);
++	{
++		uint32_t wtest = 0;
++		PE_parse_boot_argn("emmcwtest", &wtest, sizeof(wtest));
++		if (wtest) {
++			sweet_emmc_write_selftest();
++		}
++	}
+ 	se.ready = true;
+ 	printf("SWEET eMMC: \"%s\": LBA 0x%llx, %llu MiB, %s, %u-bit PIO, fifo=%u\n",
+ 	    partition, se.first_sector,

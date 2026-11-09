@@ -158,6 +158,8 @@ jobs:
           need dxb/xnu/iokit/Kernel/arm/SweetBattery.cpp 'a10battery' present '0097 A10 battery backend'
           need dxb/xnu/bsd/dev/sweet_emmc.c 'SWEET LOG: A10 console log' present '0098 A10 persistent log'
           need dxb/xnu/osfmk/vm/vm_shared_region.c 'srtrace' present '0098 shared-region trace boot-arg'
+          need dxb/xnu/bsd/dev/sweet_emmc.c 'SWEET eMMC: write selftest at LBA' present '0102 eMMC write self-test'
+          need dxb/xnu/bsd/dev/sweet_emmc.c 'EMMC_FIFO_DEPTH - fcnt' present '0102 FCNT write flow control'
           if [ "$fail" -ne 0 ]; then
             echo "::error::A10 port patches did not apply cleanly"
             exit 1
