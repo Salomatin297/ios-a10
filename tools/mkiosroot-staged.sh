@@ -160,6 +160,13 @@ sudo install -m 0600 "$work/systembag.kb" "$work/root/private/var/keybags/system
 sudo chown 0:0 "$work/root/private/var/keybags/systembag.kb"
 rm -f "$work/systembag.kb"
 
+# --- 6) SWEET bring-up tweaks (data-volume skeleton, Setup skip, prefs) -----
+sudo python3 "$repo_root/tools/sweet-root-tweaks.py" "$work/root"
+echo "--- private/var after tweaks ---"
+sudo ls -la "$work/root/private/var" | head -30
+sudo stat -f '%u:%g %Sp %N' "$work/root/private/var/mobile" \
+    "$work/root/private/var/mobile/Library/Preferences"
+
 df -h "$work/root"
 sudo du -sh "$work/root"
 sync

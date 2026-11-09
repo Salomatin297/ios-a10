@@ -39,8 +39,22 @@ works.** Probe15 selected `emmcroot0` / GPT `userdata` (`bdev=1,0`) with no
   baseline kernel (no 0096/0097).
 * Patches `0096` (GPIO keys: GPA1.7/5/6 polled at 20 ms -> `sweet_hid_key`) and
   `0097` (`a10_battery.c`: read-only S2MU005 RVBAT/RSOC/RCUR over I2C3 plus
-  charger STATUS0 over I2C4, enabled by `a10battery=1`). Both committed in
-  `a9d273d`; CI run `42505959344` builds them.
+  charger STATUS0 over I2C4, enabled by `a10battery=1`). Final commit `f8c64f0`;
+  **CI run `42508747184` succeeded** and printed all six A10 markers OK
+  (0090/0093/0096/0097). Kernel artifact
+  `ci/xnu-kernel-42508747184/kernel.development.sweet`, SHA256
+  `28912DEC...916DB1`.
+* **Probe17 built** from that kernel with the probe16 cmdline plus
+  `a10battery=1`: `dist/a10_probe17.zip` (6,052,610 bytes) SHA256
+  `B3EFEEB8...FA8D8DA`, boot image `78A0FB87...31689F`, payload
+  `7377D1DA...C33C2`. Keys are on by default (`a10keys=0` disables).
+* Root image tweaks now run inside `tools/mkiosroot-staged.sh`: new
+  `sweet-root-tweaks.py` `data_volume()` creates the data-volume skeleton
+  (mobile home/preferences, containers roots, tmp/run/keybags) before the
+  mounted image is detached; it also sets `SBDisableAutoDim` /
+  `SBDontDimOrLockOnAC` / `SBDisableIdleSleep` and the CoreAnimation
+  `CAEnable*Compression=false` prefs, matching UniXNU's Data seed. The CI image
+  from `42495934001` did **not** contain any of these tweaks.
 * `docs/A10_FORECAST.ru.md` records the first-boot forecast: HFSX mount 95 %,
   launchd 80 %, SpringBoard start 50 %, first GUI 35 %, touch 0 %; GPU via Mali
   is impossible and not needed for the CPU-composited GUI.
@@ -50,11 +64,15 @@ works.** Probe15 selected `emmcroot0` / GPT `userdata` (`bdev=1,0`) with no
   signature `HX` at offset 1024. **Writing the image into `userdata` is
   destructive and still needs explicit user confirmation.**
 
-**Next action:** insert the microSD; `tools/stage_root_to_sd.py` extracts the
-three parts straight to `<card>\ios-root`, then copy `a10_write_root.zip`,
-`a10_probe16.zip` and (after CI) `a10_probe17.zip` (`a10battery=1`). Writing
-`userdata` needs explicit user confirmation. After the write, boot probe16
-first (known baseline), then probe17 to exercise keys/battery.
+**Next action:** root CI build with the tweaks (commit after `f8c64f0`); when
+it is green, delete the old local `ios-root.zip` first (C: has ~4.4 GiB free),
+download the new artifact. Insert the microSD:
+`tools/stage_root_to_sd.py` now derives the part list/sizes from `SHA256SUMS`
+(no hardcoded part002) and extracts straight to `<card>\ios-root`; copy
+`a10_write_root.zip`, `a10_probe16.zip`, `a10_probe17.zip` and
+`a10_restore_boot.zip`. Writing `userdata` needs explicit user confirmation.
+After the write, boot probe16 first (known baseline), then probe17 to exercise
+keys/battery.
 
 **Brief history:** probe11 fixed the ARMv8.1 LSE `ldadd` panic (0 LSE in the
 kernel) but stopped in `kperf_init_early()` because `SweetCPU` did not match

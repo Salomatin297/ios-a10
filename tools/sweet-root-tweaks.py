@@ -12,6 +12,9 @@ screen (image versions v8-v14 in NOTES.md):
   launchd.plist   _PanicOnCrash -> _PanicOnCrasX (a crashing daemon must not
                   panic the system); CommCenter jobs removed (no baseband: it
                   crash-loops and Setup blocks on its CoreTelephony XPC)
+  data volume     /private/var/mobile (501), its Library/Preferences, the
+                  containers tree and /private/var/{root,tmp}; an image built
+                  from the IPSW alone (mkiosroot-staged.sh) has none of these
   containers      /private/var/containers/{Bundle,Data/System,Shared/SystemGroup,Temp}
                   (on iOS they live on the data volume)
   migration       LastSystemVersion so DataMigration does not run for an hour
@@ -20,7 +23,9 @@ screen (image versions v8-v14 in NOTES.md):
   MediaToolbox    StartRecorderServer=false (camera filter prewarm calls a
                   NULL OpenGL function without a GPU -> mediaserverd crash loop)
   SpringBoard     BKNoWatchdogs (one slow CPU path, no scene-create watchdog
-                  kills), no cloud-configuration UI
+                  kills), no cloud-configuration UI, auto-dim/idle sleep off
+  QuartzCore      framebuffer/IOSurface compression off (software rendering,
+                  no GPU), as in UniXNU's Data seed
   Setup           skipped: SetupDone, SetupFinishedAllSteps, SetupVersion 11,
                   mini-buddy flags off
   activation      mobileactivationd data ark seeded; the actual Activated state
@@ -54,6 +59,39 @@ def merge_pref(root, name, values):
     print('pref', name, sorted(values))
 
 
+def ensure(root, rel, uid, gid, mode):
+    """Create REL under ROOT and force its ownership/mode (idempotent)."""
+    path = os.path.join(root, rel)
+    if not os.path.isdir(path):
+        os.makedirs(path)
+        print('mkdir', rel)
+    os.chown(path, uid, gid)
+    os.chmod(path, mode)
+
+
+def data_volume(root):
+    """Create the data-volume skeleton that a restore would have made.
+
+    mkiosroot.sh copies the OS volume plus the cryptexes; on a real device
+    /private/var is the data volume, so the home directory, the container
+    roots and /private/var/tmp are missing.  launchd starts mobile daemons
+    with HOME=/private/var/mobile, so it has to exist (501:501) before the
+    first boot.
+    """
+    ensure(root, 'private/var', 0, 0, 0o755)
+    ensure(root, 'private/var/mobile', MOBILE, MOBILE, 0o755)
+    for sub in ('Library', 'Library/Preferences', 'Library/Preferences/ByHost',
+                'Library/Caches', 'Library/Logs', 'Media', 'Documents',
+                'Downloads', 'Containers', 'tmp'):
+        ensure(root, 'private/var/mobile/' + sub, MOBILE, MOBILE, 0o755)
+    ensure(root, 'private/var/root', 0, 0, 0o700)
+    ensure(root, 'private/var/tmp', 0, 0, 0o1777)
+    for sub in ('run', 'Library', 'PersonaVolumes', 'preboot'):
+        ensure(root, 'private/var/' + sub, 0, 0, 0o755)
+    ensure(root, 'private/var/keybags', 0, 0, 0o700)
+    ensure(root, 'private/var/keybags/backup', 0, 0, 0o700)
+
+
 def launchd(root):
     path = os.path.join(root, 'System/Library/xpc/launchd.plist')
     st = os.stat(path)
@@ -72,14 +110,10 @@ def launchd(root):
 
 
 def containers(root):
-    base = os.path.join(root, 'private/var/containers')
-    for sub, uid in (('Bundle', 33), ('Data/System', 0), ('Shared/SystemGroup', 0), ('Temp', 0)):
-        d = os.path.join(base, sub)
-        if not os.path.isdir(d):
-            os.makedirs(d)
-            os.chown(d, uid, uid)
-            os.chmod(d, 0o755)
-            print('mkdir', d)
+    # containermanagerd creates the per-app containers on demand; it only
+    # needs these roots to exist (image v9 on sweet booted with exactly this).
+    for sub in ('Bundle', 'Data/System', 'Shared/SystemGroup', 'Temp'):
+        ensure(root, 'private/var/containers/' + sub, 0, 0, 0o755)
 
 
 def find_container(root, kind, identifier):
@@ -126,6 +160,7 @@ def main():
     if len(sys.argv) != 2 or not os.path.isdir(os.path.join(sys.argv[1], 'System/Library/xpc')):
         sys.exit(__doc__)
     root = sys.argv[1]
+    data_volume(root)
     launchd(root)
     containers(root)
     activation(root)
@@ -136,7 +171,19 @@ def main():
     merge_pref(root, 'com.apple.springboard', {
         'BKNoWatchdogs': True,
         'FBLaunchWatchdogExceptions': {'com.apple.purplebuddy': 100.0},
-        'MCForceShowCloudConfigurationUI': False})
+        'MCForceShowCloudConfigurationUI': False,
+        # No touch panel and no idle timer: keep the panel on instead of
+        # dimming and locking ~30 s after SpringBoard starts (UniXNU).
+        'SBDisableAutoDim': True,
+        'SBDontDimOrLockOnAC': True,
+        'SBDisableIdleSleep': True})
+    # Software rendering without a GPU: keep CoreAnimation off the extra
+    # framebuffer/compression paths (UniXNU's Data seed does the same).
+    for domain in ('backboardd', '.GlobalPreferences'):
+        merge_pref(root, domain, {
+            'CAEnableDeepFramebuffer': False,
+            'CAEnableFramebufferCompression': False,
+            'CAEnableIOSurfaceCompression': False})
     merge_pref(root, 'com.apple.purplebuddy', {
         'SetupDone': True, 'SetupFinishedAllSteps': True, 'SetupVersion': 11,
         'daemonizeNeedsToRun': False})
