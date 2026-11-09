@@ -90,6 +90,13 @@ def data_volume(root):
         ensure(root, 'private/var/' + sub, 0, 0, 0o755)
     ensure(root, 'private/var/keybags', 0, 0, 0o700)
     ensure(root, 'private/var/keybags/backup', 0, 0, 0o700)
+    # Empty user-management skeleton: opendirectoryd/usermanagerd create the
+    # user records and personas themselves (UniXNU's offline Data fixture).
+    for sub in ('db/dslocal', 'db/dslocal/nodes', 'db/dslocal/nodes/Default',
+                'db/dslocal/nodes/Default/users',
+                'db/dslocal/nodes/Default/groups',
+                'db/dslocal/nodes/Default/config'):
+        ensure(root, 'private/var/' + sub, 0, 0, 0o700)
 
 
 def launchd(root):

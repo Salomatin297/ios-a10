@@ -90,6 +90,12 @@ apfs_attach "$work/$OS_DMG" "$work/mnt-os"
 echo "--- os top level ---"
 ls -la "$work/mnt-os" | head -20
 copy_into "$work/mnt-os" "$work/root"
+echo "--- os private/var ---"
+sudo ls -la "$work/root/private/var" | head -40
+echo "--- os dslocal ---"
+sudo ls -la "$work/root/private/var/db/dslocal/nodes/Default" 2>/dev/null | head -20 || echo "(absent)"
+echo "--- os /etc users ---"
+sudo grep -E '^(root|mobile):' "$work/root/etc/master.passwd" 2>/dev/null || echo "(no /etc/master.passwd)"
 apfs_detach "$work/mnt-os"
 rm -f "$work/$OS_DMG"
 df -h "$work"
