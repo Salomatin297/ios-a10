@@ -143,7 +143,7 @@ diff --git a/osfmk/vm/vm_shared_region.c b/osfmk/vm/vm_shared_region.c
 index db1d613..d4fc648 100644
 --- a/osfmk/vm/vm_shared_region.c
 +++ b/osfmk/vm/vm_shared_region.c
-@@ -669,6 +669,24 @@ vm_shared_region_create(
+@@ -669,6 +669,23 @@ vm_shared_region_create(
  	mach_vm_offset_t        base_address, pmap_nesting_start;
  	mach_vm_size_t          size, pmap_nesting_size;
  
@@ -154,7 +154,6 @@ index db1d613..d4fc648 100644
 +	 * persistent console log then shows whether dyld tried to map the
 +	 * cache and, on failure, which kernel check rejected it.
 +	 */
-+	extern int PE_parse_boot_argn(const char *, void *, unsigned int);
 +	static boolean_t sweet_sr_trace_init = FALSE;
 +	if (!sweet_sr_trace_init) {
 +		uint32_t level;

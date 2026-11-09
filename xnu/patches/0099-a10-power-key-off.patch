@@ -1,0 +1,234 @@
+diff --git a/osfmk/kern/debug.c b/osfmk/kern/debug.c
+--- a/osfmk/kern/debug.c
++++ b/osfmk/kern/debug.c
+@@ -247,6 +247,10 @@
+     unsigned long panic_caller) __dead2 __printflike(1, 0);
+ static void kdp_machine_reboot_type(unsigned int type, uint64_t debugger_flags);
+ void panic_spin_forever(void) __dead2;
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/* A10: let the power key still turn the SoC off from the panic spin. */
++extern boolean_t a10_keys_panic_poll(void);
++#endif
+ extern kern_return_t do_stackshot(void);
+ extern void PE_panic_hook(const char*);
+ 
+@@ -1159,6 +1163,11 @@
+ panic_spin_forever(void)
+ {
+ 	for (;;) {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		if (a10_keys_panic_poll()) {
++			continue;
++		}
++#endif
+ #if defined(__arm__) || defined(__arm64__)
+ 		/* On arm32, which doesn't have a WFE timeout, this may not return.  But that should be OK on this path. */
+ 		__builtin_arm_wfe();
+diff --git a/bsd/dev/a10_keys.c b/bsd/dev/a10_keys.c
+--- a/bsd/dev/a10_keys.c
++++ b/bsd/dev/a10_keys.c
+@@ -8,8 +8,11 @@
+  * gpio-keys driver selects the plain input function, so do the same unless
+  * a10keys_keepmux=1 is supplied.
+  *
+- * Polling only: no interrupts, no PMIC writes, no wake configuration.
+- * Call once after the scheduler is running.  a10keys=0 disables the driver.
++ * Polling only: no interrupts and no wake configuration.  Holding power for
++ * a10keys_hold_ms (default 3000, 0 disables) powers the SoC off: PSCI
++ * SYSTEM_OFF first, then the Exynos PMU PS_HOLD pin as the stock kernel
++ * does.  Call once after the scheduler is running.  a10keys=0 disables the
++ * driver.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -32,6 +35,13 @@
+ #define A10_KEYS_POLL_MS  20
+ #define A10_KEYS_STABLE   2
+ 
++#define A10_PMU_PA         0x11c80000u
++#define A10_PMU_SIZE       0x4000u
++#define A10_PMU_PS_HOLD    0x330cu
++#define A10_PMU_PS_HOLD_EN (1u << 8)
++
++#define A10_POWER_HOLD_MS  3000
++
+ struct a10_key {
+ 	unsigned pin;
+ 	int key;
+@@ -46,9 +56,11 @@
+ };
+ 
+ static vm_offset_t a10_gpio;
++static vm_offset_t a10_pmu;
+ static bool a10_keys_started;
+ static int a10_keys_chan;
+ static int a10_keys_debug;
++static int a10_power_hold_ms = A10_POWER_HOLD_MS;
+ 
+ static uint32_t
+ a10_rd(uint32_t off)
+@@ -106,6 +118,91 @@
+ 	return ((dat >> a10_keys[i].pin) & 1u) == 0u;
+ }
+ 
++/*
++ * PSCI 0.2+ system calls.  The A10 device tree advertises the PSCI 0.1
++ * cpu_suspend/off/on IDs over SMC, so SYSTEM_OFF may be unsupported on
++ * this firmware; the PMU path below is then authoritative.
++ */
++static int32_t
++a10_psci_call(uint64_t fn)
++{
++	register uint64_t x0 __asm__("x0") = fn;
++
++	__asm__ volatile("smc #0" : "+r"(x0) : :
++	    "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10",
++	    "x11", "x12", "x13", "x14", "x15", "x16", "x17", "cc", "memory");
++	return (int32_t)x0;
++}
++
++static void
++a10_power_off(void)
++{
++	int32_t ret;
++
++	printf("A10 KEYS: power off requested, trying PSCI SYSTEM_OFF\n");
++	ret = a10_psci_call(0x84000008u);
++	printf("A10 KEYS: PSCI SYSTEM_OFF returned %d\n", ret);
++
++	/* Same sequence as the stock kernel's pm_power_off: PS_HOLD low. */
++	{
++		vm_offset_t pmu = a10_pmu;
++
++		if (pmu == 0) {
++			/* Early panic before a10_keys_init(): map on demand. */
++			pmu = ml_io_map(A10_PMU_PA, A10_PMU_SIZE);
++		}
++		if (pmu != 0) {
++			uint32_t v = *(volatile uint32_t *)(pmu + A10_PMU_PS_HOLD);
++			uint32_t next = v & ~A10_PMU_PS_HOLD_EN;
++
++			printf("A10 KEYS: PS_HOLD %08x -> %08x\n", v, next);
++			__asm__ volatile("dmb oshst" ::: "memory");
++			*(volatile uint32_t *)(pmu + A10_PMU_PS_HOLD) = next;
++			__asm__ volatile("dsb osh" ::: "memory");
++		} else {
++			printf("A10 KEYS: PMU MMIO mapping failed\n");
++		}
++	}
++
++	ret = a10_psci_call(0x84000009u);
++	printf("A10 KEYS: PSCI SYSTEM_RESET returned %d\n", ret);
++	if (ret != 0) {
++		printf("A10 KEYS: power off failed, still running\n");
++	}
++}
++
++/*
++ * Called from panic_spin_forever() on the panicking CPU, with the scheduler
++ * stopped and interrupts off.  Busy-polls the power key and powers the SoC
++ * off when it is held.  Returns TRUE if this iteration was consumed (the
++ * poll interval is included), FALSE when the caller should WFE as usual.
++ */
++boolean_t
++a10_keys_panic_poll(void)
++{
++	static unsigned hold;
++	uint32_t dat;
++
++	if (a10_gpio == 0 || a10_power_hold_ms <= 0) {
++		return FALSE;
++	}
++	dat = a10_rd(A10_GPA1_DAT);
++	if (a10_keys_pressed(dat, 0)) {
++		unsigned need = (unsigned)(a10_power_hold_ms + A10_KEYS_POLL_MS - 1) /
++		    A10_KEYS_POLL_MS;
++		if (++hold >= need) {
++			printf("A10 KEYS: panic, power held %d ms, shutting down\n",
++			    a10_power_hold_ms);
++			hold = 0;
++			a10_power_off();
++		}
++	} else {
++		hold = 0;
++	}
++	delay(A10_KEYS_POLL_MS * 1000);
++	return TRUE;
++}
++
+ static void
+ a10_keys_thread(void *arg, wait_result_t result)
+ {
+@@ -113,6 +210,10 @@
+ 	int candidate[sizeof(a10_keys) / sizeof(a10_keys[0])];
+ 	int count[sizeof(a10_keys) / sizeof(a10_keys[0])];
+ 	uint32_t dat = a10_rd(A10_GPA1_DAT);
++	unsigned hold_ticks = 0;
++	unsigned power_hold = 0;
++	bool power_armed;
++	bool power_fired = false;
+ 
+ 	(void)arg;
+ 	(void)result;
+@@ -123,6 +224,17 @@
+ 	}
+ 	printf("A10 KEYS: polling GPA1 DAT=%08x, initial power=%d volup=%d "
+ 	    "voldown=%d\n", dat, stable[0], stable[1], stable[2]);
++
++	/* A press already held at startup must not power the device off. */
++	power_armed = stable[0] == 0;
++	if (a10_power_hold_ms > 0) {
++		hold_ticks = (unsigned)(a10_power_hold_ms + A10_KEYS_POLL_MS - 1) /
++		    A10_KEYS_POLL_MS;
++		printf("A10 KEYS: hold power %d ms to shut down\n",
++		    a10_power_hold_ms);
++	} else {
++		printf("A10 KEYS: power-key shutdown disabled\n");
++	}
+ 
+ 	for (;;) {
+ 		dat = a10_rd(A10_GPA1_DAT);
+@@ -147,6 +259,20 @@
+ 				sweet_hid_key(a10_keys[i].key, now);
+ 			}
+ 		}
++		if (hold_ticks != 0) {
++			if (!stable[0]) {
++				power_hold = 0;
++				power_armed = true;
++				power_fired = false;
++			} else if (power_armed && !power_fired) {
++				if (++power_hold >= hold_ticks) {
++					power_fired = true;
++					printf("A10 KEYS: power held %d ms, "
++					    "shutting down\n", a10_power_hold_ms);
++					a10_power_off();
++				}
++			}
++		}
+ 		if (a10_keys_debug) {
+ 			static unsigned ticks;
+ 			if (++ticks >= 3000u) { /* one minute at 20 ms */
+@@ -174,6 +300,11 @@
+ 	(void)PE_parse_boot_argn("a10keys_keepmux", &keepmux, sizeof(keepmux));
+ 	(void)PE_parse_boot_argn("a10keys_debug", &a10_keys_debug,
+ 	    sizeof(a10_keys_debug));
++	(void)PE_parse_boot_argn("a10keys_hold_ms", &a10_power_hold_ms,
++	    sizeof(a10_power_hold_ms));
++	if (a10_power_hold_ms < 0) {
++		a10_power_hold_ms = 0;
++	}
+ 	if (!enabled) {
+ 		printf("A10 KEYS: disabled (a10keys=0)\n");
+ 		return;
+@@ -182,6 +313,10 @@
+ 	if (a10_gpio == 0) {
+ 		printf("A10 KEYS: pinctrl MMIO mapping failed\n");
+ 		return;
++	}
++	a10_pmu = ml_io_map(A10_PMU_PA, A10_PMU_SIZE);
++	if (a10_pmu == 0) {
++		printf("A10 KEYS: PMU MMIO mapping failed, PS_HOLD unavailable\n");
+ 	}
+ 	if (!keepmux) {
+ 		a10_keys_mux_input();
