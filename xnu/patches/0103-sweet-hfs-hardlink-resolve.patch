@@ -1,0 +1,165 @@
+diff --git a/bsd/sweet_hfs/core/hfs_link.c b/bsd/sweet_hfs/core/hfs_link.c
+--- a/bsd/sweet_hfs/core/hfs_link.c
++++ b/bsd/sweet_hfs/core/hfs_link.c
+@@ -937,6 +937,73 @@ out:
+ }
+ 
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * SWEET: find the private directory by CNID.
++ *
++ * The root volume that the CI builds is created with newfs_hfs and the
++ * "HFS+ Private Data" directory ends up with four U+0000 code units in
++ * front of its name instead of the four U+2400 ("\u2400") characters the
++ * kernel looks for (HFSPLUSMETADATAFOLDER).  The name lookup in
++ * hfs_privatedir_init() therefore fails, hfs_private_desc[].cd_cnid stays
++ * 0 and every hard link of the volume stays unresolved: the kernel then
++ * serves the link record (empty data fork) instead of the inode record,
++ * so files that are hard links - the dyld shared cache above all - look
++ * empty to user space.
++ *
++ * Fall back to a scan over the first user CNIDs and match the tail of the
++ * directory name.
++ */
++static int
++sweet_hfs_find_private_dir(struct hfsmount * hfsmp, enum privdirtype type,
++			    struct cat_attr * attrp)
++{
++	const char * tail;
++	u_int32_t taillen;
++	cnid_t cnid;
++
++	if (type == FILE_HARDLINKS) {
++		tail = "HFS+ Private Data";
++	} else {
++		tail = ".HFS+ Private Directory Data";
++	}
++	taillen = (u_int32_t)strlen(tail);
++
++	for (cnid = kHFSFirstUserCatalogNodeID;
++	     cnid < kHFSFirstUserCatalogNodeID + 128; cnid++) {
++		struct cat_desc desc;
++		struct cat_attr attr;
++		u_int32_t i;
++		int found = 0;
++		int error;
++
++		bzero(&attr, sizeof(attr));
++		error = cat_idlookup(hfsmp, cnid, 0, 0, &desc, &attr, NULL);
++		if (error != 0) {
++			continue;
++		}
++		if ((attr.ca_mode & S_IFMT) == S_IFDIR) {
++			for (i = 0; i + taillen <= desc.cd_namelen; i++) {
++				if (bcmp(desc.cd_nameptr + i, tail, taillen) == 0) {
++					found = 1;
++					break;
++				}
++			}
++		}
++		if (found) {
++			*attrp = attr;
++			printf("hfs: private dir type=%d found by CNID %u on vol=%s\n",
++			       (int)type, cnid, hfsmp->vcbVN);
++		}
++		cat_releasedesc(&desc);
++		if (found) {
++			return (0);
++		}
++	}
++	return (ENOENT);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
++
+ /*
+  * Initialize the HFS+ private system directories.
+  *
+@@ -980,6 +1047,16 @@ hfs_privatedir_init(struct hfsmount * hfsmp, enum privdirtype type)
+ 
+ 	lockflags = hfs_systemfile_lock(hfsmp, SFL_CATALOG, HFS_SHARED_LOCK);
+ 	error = cat_lookup(hfsmp, priv_descp, 0, 0, NULL, priv_attrp, NULL, NULL);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	if (error != 0) {
++		/*
++		 * The private directory may carry a mangled name; look it up
++		 * by CNID instead.  Without it no hard link of the volume
++		 * can be resolved.
++		 */
++		error = sweet_hfs_find_private_dir(hfsmp, type, priv_attrp);
++	}
++#endif
+ 	hfs_systemfile_unlock(hfsmp, lockflags);
+ 
+ 	if (error == 0) {
+diff --git a/bsd/sweet_hfs/core/hfs_catalog.c b/bsd/sweet_hfs/core/hfs_catalog.c
+--- a/bsd/sweet_hfs/core/hfs_catalog.c
++++ b/bsd/sweet_hfs/core/hfs_catalog.c
+@@ -773,6 +773,23 @@ sweet_hfs_link_note(void)
+ #define sweet_hfs_link_note() 1
+ #endif
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * SWEET: report the first few hard links that are resolved into their inode
++ * record.  A resolved link is the difference between an empty file and the
++ * real data (the dyld shared cache is a hard link), so it is worth a line in
++ * the persistent console log.
++ */
++static int
++sweet_hfs_resolve_note(void)
++{
++	static volatile SInt32 notes;
++	return OSIncrementAtomic(&notes) < 16;
++}
++#else
++#define sweet_hfs_resolve_note() 0
++#endif
++
+ /*
+  * cat_lookupbykey - lookup a catalog node using a cnode key
+  */
+@@ -3580,10 +3597,43 @@ cat_resolvelink(struct hfsmount *hfsmp, u_int32_t linkref, int isdirlink, struct
+ 	result = BTSearchRecord(VTOF(HFSTOVCB(hfsmp)->catalogRefNum), iterator,
+ 				&btdata, NULL, NULL);
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * If the private directory could not be located by name (see
++	 * hfs_privatedir_init()) the inode record cannot be looked up by
++	 * name either.  Fall back to the thread record of the inode: its
++	 * CNID is the link reference itself.
++	 */
++	if (result != 0 && parentcnid == 0 && !isdirlink) {
++		struct cat_attr iattr;
++		struct cat_desc tdesc;
++		int terr;
++
++		bzero(&iattr, sizeof(iattr));
++		terr = cat_idlookup(hfsmp, linkref, 0, 0, &tdesc, &iattr, NULL);
++		if (terr == 0) {
++			tdesc.cd_hint = 0;
++			tdesc.cd_encoding = 0;
++			(void) buildkey(hfsmp, &tdesc,
++					(HFSPlusCatalogKey *)&iterator->key, 0);
++			result = BTSearchRecord(VTOF(HFSTOVCB(hfsmp)->catalogRefNum),
++						iterator, &btdata, NULL, NULL);
++			cat_releasedesc(&tdesc);
++		}
++	}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
++
+ 	if (result == 0) {
+ 		/* Make sure there's a reference */
+ 		if (recp->hl_linkCount == 0)
+ 			recp->hl_linkCount = 2;
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		if (sweet_hfs_resolve_note()) {
++			printf("hfs: resolved hardlink %s -> %llu bytes on vol=%s\n",
++			       inodename, (unsigned long long)recp->dataFork.logicalSize,
++			       hfsmp->vcbVN);
++		}
++#endif
+ 	} else {
+ 		printf("hfs: cat_resolvelink: can't find inode=%s on vol=%s\n", inodename, hfsmp->vcbVN);
+ 	}
