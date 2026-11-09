@@ -1,8 +1,8 @@
 diff --git a/bsd/dev/sweet_emmc.c b/bsd/dev/sweet_emmc.c
-index 577228c..219cf15 100644
+index ae8b428..abdf9ec 100644
 --- a/bsd/dev/sweet_emmc.c
 +++ b/bsd/dev/sweet_emmc.c
-@@ -17,12 +17,19 @@
+@@ -21,12 +21,19 @@
  #include <miscfs/devfs/devfs.h>
  #include <kern/clock.h>
  #include <kern/locks.h>
@@ -22,7 +22,7 @@ index 577228c..219cf15 100644
  
  #define EMMC_SOC_BASE           0x01000000u
  #define EMMC_REG_SIZE           0x2000u
-@@ -794,6 +801,108 @@ emmc_map_controller(void)
+@@ -916,6 +923,108 @@ emmc_map_controller(void)
  	return se.regs == 0 ? ENXIO : 0;
  }
  
@@ -131,10 +131,10 @@ index 577228c..219cf15 100644
  static int
  sweet_emmc_init(void)
  {
-@@ -853,6 +962,7 @@ sweet_emmc_init(void)
- 	    partition, se.first_sector,
+@@ -998,6 +1107,7 @@ sweet_emmc_init(void)
  	    se.partition_sectors * EMMC_BLOCK_SIZE >> 20,
- 	    se.writable ? "read-write" : "read-only");
+ 	    se.writable ? "read-write" : "read-only", se.bus_width,
+ 	    1u << se.fifo_shift);
 +	sweet_emmc_log_start();
  	return 0;
  }
