@@ -156,6 +156,8 @@ jobs:
           need dxb/xnu/bsd/dev/sweet_emmc.c 'a10_keys_init' present '0096 keys hook'
           need dxb/xnu/bsd/dev/a10_battery.c 'S2MU005' present '0097 A10 fuel gauge'
           need dxb/xnu/iokit/Kernel/arm/SweetBattery.cpp 'a10battery' present '0097 A10 battery backend'
+          need dxb/xnu/bsd/dev/sweet_emmc.c 'SWEET LOG: A10 console log' present '0098 A10 persistent log'
+          need dxb/xnu/osfmk/vm/vm_shared_region.c 'srtrace' present '0098 shared-region trace boot-arg'
           if [ "$fail" -ne 0 ]; then
             echo "::error::A10 port patches did not apply cleanly"
             exit 1

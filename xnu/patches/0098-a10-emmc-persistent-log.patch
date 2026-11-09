@@ -1,0 +1,170 @@
+diff --git a/bsd/dev/sweet_emmc.c b/bsd/dev/sweet_emmc.c
+index 577228c..219cf15 100644
+--- a/bsd/dev/sweet_emmc.c
++++ b/bsd/dev/sweet_emmc.c
+@@ -17,12 +17,19 @@
+ #include <miscfs/devfs/devfs.h>
+ #include <kern/clock.h>
+ #include <kern/locks.h>
++#include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ #include <pexpert/device_tree.h>
+ #include <libkern/libkern.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++extern int hz;
++/* bsd/dev/sweet_ufs.c: the console ring shared by all SWEET boards. */
++extern uint32_t sweet_log_copy(uint64_t *pos, char *out, uint32_t max);
++extern uint64_t sweet_log_position(void);
+ 
+ #define EMMC_SOC_BASE           0x01000000u
+ #define EMMC_REG_SIZE           0x2000u
+@@ -794,6 +801,108 @@ emmc_map_controller(void)
+ 	return se.regs == 0 ? ENXIO : 0;
+ }
+ 
++/*
++ * A10 persistent console log ("sweetlog").
++ *
++ * The A10 has no serial console: the kernel prints to the framebuffer and a
++ * panic paints over the text, so only the final panic screen survives. Every
++ * console byte already goes into the 4 MiB ring maintained by sweet_ufs.c
++ * (sweet_log_append() from _cnputs). Once the root partition is known and
++ * writable, a thread mirrors the ring to the LAST 4 MiB + one sector of the
++ * partition (behind the 20 GiB HFS image). Sector 0 of that area is a header:
++ *   "SWEETLOG" | u32 version 1 | u32 ring size | u64 total bytes written
++ *   | u64 flush sequence
++ * and ring byte n is at sector 1 + (n % ring size) / 512. The flush interval
++ * is 10 ms during bring-up: a panic stops the thread, so only what reached
++ * the eMMC before it is available afterwards. boot-arg sweetlog=0 disables
++ * the writer. Read it in recovery with tools/a10_log_pull.py.
++ */
++#define SWEET_EMMC_LOG_SIZE       (4u << 20)
++#define SWEET_EMMC_LOG_HEADER     EMMC_BLOCK_SIZE
++#define SWEET_EMMC_LOG_SECTORS    ((SWEET_EMMC_LOG_HEADER + SWEET_EMMC_LOG_SIZE) / EMMC_BLOCK_SIZE)
++
++static int sweet_emmc_log_chan;
++
++struct sweet_emmc_log_header {
++	char magic[8];
++	uint32_t version, size;
++	uint64_t total, seq;
++};
++
++static void
++sweet_emmc_log_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	uint64_t base = se.first_sector + se.partition_sectors - SWEET_EMMC_LOG_SECTORS;
++	uint64_t flushed = 0, seq = 0;
++
++	printf("SWEET LOG: A10 console log to the last %u KiB of the partition (LBA 0x%llx)\n",
++	    (unsigned)(SWEET_EMMC_LOG_SECTORS * EMMC_BLOCK_SIZE >> 10), base);
++	for (;;) {
++		(void)tsleep(&sweet_emmc_log_chan, PZERO, "sweetlog",
++		    MAX(1, hz / 100));
++		uint64_t total = sweet_log_position();
++		if (total == flushed) {
++			continue;
++		}
++		uint64_t window = total > SWEET_EMMC_LOG_SIZE ?
++		    total - SWEET_EMMC_LOG_SIZE : 0;
++		uint64_t pos = flushed > window ? flushed : window;
++		int error = 0;
++
++		lck_mtx_lock(&sweet_emmc_lock);
++		while (pos < total && !error) {
++			uint64_t start = pos - (pos % EMMC_BLOCK_SIZE);
++			uint32_t n = (uint32_t)MIN((uint64_t)EMMC_MAX_XFER,
++			    total - start);
++			uint32_t want;
++			uint64_t copy = start;
++
++			n = (n + EMMC_BLOCK_SIZE - 1) & ~(EMMC_BLOCK_SIZE - 1);
++			want = (uint32_t)MIN((uint64_t)n, total - start);
++			bzero(emmc_bounce, n);
++			(void)sweet_log_copy(&copy, (char *)emmc_bounce, want);
++			error = emmc_transfer(base + 1 + start / EMMC_BLOCK_SIZE,
++			    n / EMMC_BLOCK_SIZE, emmc_bounce, true);
++			pos = start + n;
++		}
++		if (!error) {
++			struct sweet_emmc_log_header h = {
++				.magic = { 'S', 'W', 'E', 'E', 'T', 'L', 'O', 'G' },
++				.version = 1, .size = SWEET_EMMC_LOG_SIZE,
++				.total = total, .seq = ++seq,
++			};
++			bzero(emmc_bounce, EMMC_BLOCK_SIZE);
++			memcpy(emmc_bounce, &h, sizeof(h));
++			error = emmc_transfer(base, 1, emmc_bounce, true);
++		}
++		if (!error) {
++			error = emmc_flush_cache();
++		}
++		lck_mtx_unlock(&sweet_emmc_lock);
++		if (error) {
++			printf("SWEET LOG: eMMC write failed (%d), stopping\n", error);
++			return;
++		}
++		flushed = total;
++	}
++}
++
++static void
++sweet_emmc_log_start(void)
++{
++	uint32_t on = 1;
++	thread_t thread;
++
++	PE_parse_boot_argn("sweetlog", &on, sizeof(on));
++	if (!on || !se.writable ||
++	    se.partition_sectors < 2 * (uint64_t)SWEET_EMMC_LOG_SECTORS) {
++		return;
++	}
++	if (kernel_thread_start(sweet_emmc_log_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++
+ static int
+ sweet_emmc_init(void)
+ {
+@@ -853,6 +962,7 @@ sweet_emmc_init(void)
+ 	    partition, se.first_sector,
+ 	    se.partition_sectors * EMMC_BLOCK_SIZE >> 20,
+ 	    se.writable ? "read-write" : "read-only");
++	sweet_emmc_log_start();
+ 	return 0;
+ }
+ 
+diff --git a/osfmk/vm/vm_shared_region.c b/osfmk/vm/vm_shared_region.c
+index db1d613..d4fc648 100644
+--- a/osfmk/vm/vm_shared_region.c
++++ b/osfmk/vm/vm_shared_region.c
+@@ -669,6 +669,24 @@ vm_shared_region_create(
+ 	mach_vm_offset_t        base_address, pmap_nesting_start;
+ 	mach_vm_size_t          size, pmap_nesting_size;
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * A10 bring-up: srtrace=N raises the shared-region trace level before
++	 * the first process (launchd) asks for the dyld shared cache. The
++	 * persistent console log then shows whether dyld tried to map the
++	 * cache and, on failure, which kernel check rejected it.
++	 */
++	extern int PE_parse_boot_argn(const char *, void *, unsigned int);
++	static boolean_t sweet_sr_trace_init = FALSE;
++	if (!sweet_sr_trace_init) {
++		uint32_t level;
++		sweet_sr_trace_init = TRUE;
++		if (PE_parse_boot_argn("srtrace", &level, sizeof(level))) {
++			shared_region_trace_level = (int)level;
++		}
++	}
++#endif
++
+ 	SHARED_REGION_TRACE_INFO(
+ 		("shared_region: -> create(root=%p,cpu=<%d,%d>,64bit=%d,pgshift=%d,reslide=%d,driverkit=%d)\n",
+ 		(void *)VM_KERNEL_ADDRPERM(root_dir),
