@@ -1,0 +1,130 @@
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index ca81d9c..67de377 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -93,16 +93,19 @@ SweetCPU::start(IOService *provider)
+ 		    raw_reg, cpu->phys_id);
+ 		return false;
+ 	}
+-	/* MPIDR Aff1 = core: 0x000-0x500 A55, 0x600/0x700 A76 */
+-	if (cpu->phys_id > 0x700 || (cpu->phys_id & 0xff) != 0 ||
+-	    topology->num_cpus > SWEET_SMP_MAX_CPUS) {
++	/*
++	 * A10: MPIDR Aff1 is the cluster, Aff0 the core: 0x000/0x001 are
++	 * the two Cortex-A73s, 0x100-0x103 and 0x200/0x201 the six A53s.
++	 * Unlike the single-CPU bring-up, Aff0 need not be zero.
++	 */
++	if (cpu->phys_id > 0x201 || topology->num_cpus > SWEET_SMP_MAX_CPUS) {
+ 		panic("SWEET CPU: invalid topology cpu=%u mpidr=0x%x count=%u",
+ 		    cpu->cpu_id, cpu->phys_id, topology->num_cpus);
+ 	}
+ 	if (!IOCPU::start(provider)) {
+ 		return false;
+ 	}
+-	cpuName = OSSymbol::withCStringNoCopy("Kryo 470");
++	cpuName = OSSymbol::withCStringNoCopy("Exynos 7884");
+ 	if (cpuName == NULL) {
+ 		return false;
+ 	}
+@@ -249,6 +252,7 @@ SweetCPU::initCPU(bool boot)
+  * definition in pexpert/arm/pe_fiq.c.
+  */
+ extern "C" void pe_sweet_gic_self_sgi(uint32_t intid);
++extern "C" void pe_sweet_gic_broadcast_sgi(uint32_t intid);
+ #endif /* SWEET_GICV2 */
+ 
+ void
+@@ -256,11 +260,19 @@ SweetCPU::signalCPU(IOCPU *target)
+ {
+ #if defined(SWEET_GICV2)
+ 	/*
+-	 * GIC-400: TargetListFilter = 0b10 signals the requesting CPU
+-	 * interface itself (single-CPU bring-up, so target == self).
++	 * GIC-400 has no affinity-routed SGI in this configuration, and the
++	 * Exynos CPU-interface numbers do not follow MPIDR Aff0 across
++	 * clusters. Self-signals (initCPU) use the "self" filter; any other
++	 * target gets the "all except self" broadcast. Every receiver looks
++	 * at its own cpu_signal mask, so the extra handler entries on the
++	 * other cores are no-ops.
+ 	 */
+-	(void)target;
+-	pe_sweet_gic_self_sgi(SWEET_IPI_SGI);
++	if (target == NULL || target == this ||
++	    target->getCPUNumber() == getCPUNumber()) {
++		pe_sweet_gic_self_sgi(SWEET_IPI_SGI);
++	} else {
++		pe_sweet_gic_broadcast_sgi(SWEET_IPI_SGI);
++	}
+ 	__builtin_arm_isb(ISB_SY);
+ #else
+ 	const ml_topology_info_t *topology = ml_get_topology_info();
+@@ -288,8 +300,12 @@ kern_return_t
+ SweetCPU::startCPU(vm_offset_t start_paddr, vm_offset_t arg_paddr)
+ {
+ 	const ml_topology_cpu_t *cpu = &ml_get_topology_info()->cpus[getCPUNumber()];
+-	/* cpu_start() passes NULL,NULL: x20/x21 are set by LowResetVectorBase. */
+-	if (start_paddr != 0 || arg_paddr != 0 || cpu->phys_id == 0 ||
++	/*
++	 * cpu_start() passes NULL,NULL: x20/x21 are set by LowResetVectorBase.
++	 * The boot core is MPIDR 0x100, so phys_id 0 is a real secondary
++	 * (the first Cortex-A73) and must not be rejected here.
++	 */
++	if (start_paddr != 0 || arg_paddr != 0 ||
+ 	    __atomic_load_n(&initialized, __ATOMIC_ACQUIRE) != 0) {
+ 		panic("SWEET CPU: cpu=%u unsupported restart", getCPUNumber());
+ 	}
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index 9468d8a..4b713b7 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -54,6 +54,12 @@ const char * gIOKernelConfigTables =
+     "     'IOProbeScore'    = 10000:32;"
+     "   },"
+     "   {"
++    "     'IOClass'         = SweetCPU;"
++    "     'IOProviderClass' = IOPlatformDevice;"
++    "     'IONameMatch'     = 'arm,cortex-a73';"
++    "     'IOProbeScore'    = 10000:32;"
++    "   },"
++    "   {"
+     "     'IOClass'         = AppleKeyStore;"
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = AppleKeyStore;"
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+index 767c408..10b0310 100644
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -284,6 +284,22 @@ pe_sweet_gic_self_sgi(uint32_t intid)
+ 	__builtin_arm_isb(ISB_SY);
+ }
+ 
++/*
++ * TargetListFilter = 0b01 (all interfaces except the requesting one). Used
++ * for cross-CPU wakeups: the Exynos CPU-interface numbering does not match
++ * MPIDR Aff0 across clusters, so a CPUTargetList bit would be a guess, while
++ * the broadcast reaches every online core and each one filters the IPI by
++ * its own cpu_signal mask.
++ */
++void
++pe_sweet_gic_broadcast_sgi(uint32_t intid)
++{
++	__builtin_arm_dsb(DSB_ISHST);
++	sweet_gicd_write32(GICD_SGIR,
++	    GICD_SGIR_FILTER_OTHERS | (intid & 0xF));
++	__builtin_arm_isb(ISB_SY);
++}
++
+ void
+ pe_init_fiq()
+ {
+diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
+index 1357102..fd2b8f7 100644
+--- a/pexpert/pexpert/arm64/SWEET.h
++++ b/pexpert/pexpert/arm64/SWEET.h
+@@ -139,5 +139,6 @@
+  * reads as filter 0b00 with an empty target list, so no SGI was sent.
+  */
+ #define GICD_SGIR_FILTER_SELF                   (2U << 24)
++#define GICD_SGIR_FILTER_OTHERS                 (1U << 24)
+ 
+ #endif /* ! _PEXPERT_ARM64_SWEET_H */

@@ -168,6 +168,10 @@ jobs:
           need dxb/xnu/iokit/Kernel/arm/SweetFramebuffer.cpp 'sweetfb_fit' present '0106 sweetfb_fit scaling'
           need dxb/xnu/iokit/Kernel/arm/SweetFramebuffer.cpp 'sweet_fb_frames_logged' present '0106 frame diagnostics'
           need dxb/xnu/bsd/dev/sweet_emmc.c 'SWEET SMP: A10 sampler start' present '0107 A10 sampler start'
+          need dxb/xnu/iokit/Kernel/arm/SweetCPU.cpp 'phys_id > 0x201' present '0108 A10 CPU topology'
+          need dxb/xnu/iokit/Kernel/arm/SweetCPU.cpp 'pe_sweet_gic_broadcast_sgi' present '0108 cross-CPU SGI'
+          need dxb/xnu/pexpert/arm/pe_fiq.c 'GICD_SGIR_FILTER_OTHERS' present '0108 broadcast SGI filter'
+          need dxb/xnu/iokit/KernelConfigTables.cpp 'arm,cortex-a73' present '0108 A73 CPU personality'
           if [ "$fail" -ne 0 ]; then
             echo "::error::A10 port patches did not apply cleanly"
             exit 1
