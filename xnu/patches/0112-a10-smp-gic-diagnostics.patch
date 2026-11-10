@@ -1,0 +1,248 @@
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index dae6f87..883dc23 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -27,7 +27,12 @@ extern "C" boolean_t sweet_cpu_signal_is_enabled(unsigned int cpu);
+ /* GIC-400 helpers from pe_fiq.c; also used to retry a lost bring-up SGI. */
+ extern "C" void pe_sweet_gic_self_sgi(uint32_t intid);
+ extern "C" void pe_sweet_gic_broadcast_sgi(uint32_t intid);
++extern "C" void pe_sweet_gic_target_sgi(uint32_t intid, uint32_t targets);
++extern "C" void pe_sweet_gic_snapshot(uint32_t *typer, uint32_t *isen,
++    uint32_t *pend, uint32_t *gicc, uint32_t *hppir);
+ #endif /* SWEET_GICV2 */
++/* Bring-up fallback: clear the disable latch from the starter CPU. */
++extern "C" void sweet_cpu_signal_force_enable(unsigned int cpu);
+ 
+ class SweetCPU;
+ static SweetCPU *sweet_cpus[MAX_CPUS];
+@@ -51,6 +56,12 @@ class SweetCPU : public IOCPU {
+ 	OSDeclareDefaultStructors(SweetCPU);
+ 	const OSSymbol *cpuName = NULL;
+ 	uint32_t initialized = 0; /* release/acquire publication after initCPU sends SGI */
++	/* GIC view sampled on this CPU right after its bring-up self-SGI. */
++	uint32_t dbg_typer = 0;
++	uint32_t dbg_isen = 0;
++	uint32_t dbg_pend = 0;
++	uint32_t dbg_gicc = 0;
++	uint32_t dbg_hppir = 0;
+ 
+ public:
+ 	static void startAll(void *arg, wait_result_t result);
+@@ -208,26 +219,64 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ 		uint64_t next_nudge;
+ 		nanoseconds_to_deadline(100 * NSEC_PER_MSEC, &next_nudge);
+ 		uint32_t nudges = 0;
+-		while (__atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE) == 0 ||
+-		    !sweet_cpu_signal_is_enabled(i)) {
++		bool forced = false;
++		while (!forced &&
++		    (__atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE) == 0 ||
++		    !sweet_cpu_signal_is_enabled(i))) {
+ 			if (mach_absolute_time() > deadline) {
++				int panic_on_timeout = 0;
++				PE_parse_boot_argn("a10smp_panic", &panic_on_timeout,
++				    sizeof(panic_on_timeout));
+ 				IOLog("SWEET CPU: cpu=%u mpidr=0x%x NOT alive after 5s "
+ 				    "(initialized=%u signal_enabled=%u nudges=%u)\n",
+ 				    i, topology->cpus[i].phys_id,
+ 				    __atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE),
+ 				    sweet_cpu_signal_is_enabled(i) ? 1 : 0, nudges);
+-				panic("SWEET CPU: cpu=%u startup timeout (reset/MMU/GIC/SGI)", i);
++				IOLog("SWEET CPU: cpu=%u target gic typer=%08x isen=%08x "
++				    "pend=%08x gicc=%08x hppir=%08x\n", i,
++				    cpu->dbg_typer, cpu->dbg_isen, cpu->dbg_pend,
++				    cpu->dbg_gicc, cpu->dbg_hppir);
++				if (panic_on_timeout) {
++					panic("SWEET CPU: cpu=%u startup timeout "
++					    "(reset/MMU/GIC/SGI)", i);
++				}
++				/*
++				 * The secondary is executing code (it may even be
++				 * running this very thread), so the CPU is alive;
++				 * clear the handshake latch from here and let the
++				 * boot continue.  Later cross-CPU IPIs will show
++				 * whether SGI delivery itself is broken.
++				 */
++				sweet_cpu_signal_force_enable(i);
++				forced = true;
++				break;
+ 			}
+ #if defined(SWEET_GICV2)
+ 			if (__atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE) != 0 &&
+ 			    !sweet_cpu_signal_is_enabled(i) &&
+ 			    mach_absolute_time() > next_nudge) {
++				if (nudges == 0) {
++					IOLog("SWEET CPU: cpu=%u waiting init=%u sig=%u "
++					    "target gic typer=%08x isen=%08x pend=%08x "
++					    "gicc=%08x hppir=%08x\n", i,
++					    __atomic_load_n(&cpu->initialized,
++					    __ATOMIC_ACQUIRE),
++					    sweet_cpu_signal_is_enabled(i) ? 1 : 0,
++					    cpu->dbg_typer, cpu->dbg_isen,
++					    cpu->dbg_pend, cpu->dbg_gicc,
++					    cpu->dbg_hppir);
++				}
+ 				/*
+-				 * Re-send the bring-up IPI.  A broadcast cannot
+-				 * reach the sender, so send a self-SGI if this
+-				 * thread has already migrated to the target.
++				 * First try every CPU-interface number directly;
++				 * the Exynos GIC numbering need not match MPIDR.
++				 * Then fall back to self/broadcast retries.
+ 				 */
+-				if (cpu_number() == (int)i) {
++				if (nudges < 8) {
++					pe_sweet_gic_target_sgi(SWEET_IPI_SGI,
++					    1u << nudges);
++					IOLog("SWEET CPU: cpu=%u targeted SGI "
++					    "interface=%u\n", i, nudges);
++				} else if (cpu_number() == (int)i) {
+ 					pe_sweet_gic_self_sgi(SWEET_IPI_SGI);
+ 				} else {
+ 					pe_sweet_gic_broadcast_sgi(SWEET_IPI_SGI);
+@@ -238,12 +287,14 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ #endif /* SWEET_GICV2 */
+ 			IOSleep(1);
+ 		}
+-		if (nudges != 0) {
+-			IOLog("SWEET CPU: cpu=%u needed %u bring-up SGI retry(ies)\n",
+-			    i, nudges);
++		if (nudges != 0 || forced) {
++			IOLog("SWEET CPU: cpu=%u %s after %u bring-up SGI retry(ies)\n",
++			    i, forced ? "forced up" : "came alive", nudges);
+ 		}
+-		IOLog("SWEET CPU: cpu=%u mpidr=0x%x came alive; SGI1 OK\n",
+-		    i, topology->cpus[i].phys_id);
++		IOLog("SWEET CPU: cpu=%u mpidr=0x%x %s; SGI1 %s\n",
++		    i, topology->cpus[i].phys_id,
++		    forced ? "forced up" : "came alive",
++		    sweet_cpu_signal_is_enabled(i) ? "OK" : "disabled");
+ 	}
+ 	/* Publish exactly once, after every selected CPU has completed initCPU(). */
+ 	ml_cpu_init_completed();
+@@ -276,10 +327,21 @@ SweetCPU::initCPU(bool boot)
+ 	 * startAll waits for its delivery after the startup thread unmasks IRQs.
+ 	 * Waiting here with DAIF.I set would deadlock every secondary. */
+ 	signalCPU(this);
++#if defined(SWEET_GICV2)
++	/*
++	 * Sample the local GIC view while the self-SGI is still pending and
++	 * IRQs are masked.  ISPENDR bit 1 proves the SGIR reached the
++	 * distributor; HPPIR == SGI1 proves this CPU interface accepts it.
++	 */
++	pe_sweet_gic_snapshot(&dbg_typer, &dbg_isen, &dbg_pend,
++	    &dbg_gicc, &dbg_hppir);
++#endif
+ 	setCPUState(kIOCPUStateRunning);
+-	kprintf("SWEET CPU: cpu=%u entered initCPU mpidr=0x%llx EL%llu IRQs=%u\n",
++	kprintf("SWEET CPU: cpu=%u entered initCPU mpidr=0x%llx EL%llu IRQs=%u"
++	    " gic typer=%08x isen=%08x pend=%08x gicc=%08x hppir=%08x\n",
+ 	    getCPUNumber(), __builtin_arm_rsr64("MPIDR_EL1") & 0xffffULL,
+-	    __builtin_arm_rsr64("CurrentEL") >> 2, ml_get_interrupts_enabled());
++	    __builtin_arm_rsr64("CurrentEL") >> 2, ml_get_interrupts_enabled(),
++	    dbg_typer, dbg_isen, dbg_pend, dbg_gicc, dbg_hppir);
+ 	__atomic_store_n(&initialized, 1, __ATOMIC_RELEASE);
+ }
+ 
+diff --git a/osfmk/arm64/cpu.c b/osfmk/arm64/cpu.c
+index b082a10..2625e5e 100644
+--- a/osfmk/arm64/cpu.c
++++ b/osfmk/arm64/cpu.c
+@@ -975,6 +975,22 @@ sweet_cpu_signal_is_enabled(unsigned int cpu)
+ 	cpu_data_t *cdp = CpuDataEntries[cpu].cpu_data_vaddr;
+ 	return cdp != NULL && !(os_atomic_load(&cdp->cpu_signal, acquire) & SIGPdisabled);
+ }
++
++/*
++ * Bring-up fallback: the starting CPU may clear the latch itself once the
++ * secondary has published initialized.  Used only when the bring-up SGI is
++ * not delivered; cross-CPU IPIs then prove whether SGI delivery works.
++ */
++void
++sweet_cpu_signal_force_enable(unsigned int cpu)
++{
++	if (cpu < MAX_CPUS) {
++		cpu_data_t *cdp = CpuDataEntries[cpu].cpu_data_vaddr;
++		if (cdp != NULL) {
++			os_atomic_andnot(&cdp->cpu_signal, SIGPdisabled, relaxed);
++		}
++	}
++}
+ #endif
+ 
+ 
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+index 10b0310..323ce2d 100644
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -300,6 +300,46 @@ pe_sweet_gic_broadcast_sgi(uint32_t intid)
+ 	__builtin_arm_isb(ISB_SY);
+ }
+ 
++/*
++ * TargetListFilter = 0b00 with an explicit CPUTargetList.  The Exynos GIC
++ * CPU-interface number for Aff0/Aff1 is not documented, so bring-up diagnostics
++ * walk one interface at a time instead of trusting a mapping.
++ */
++void
++pe_sweet_gic_target_sgi(uint32_t intid, uint32_t targets)
++{
++	__builtin_arm_dsb(DSB_ISHST);
++	sweet_gicd_write32(GICD_SGIR,
++	    GICD_SGIR_FILTER_TARGETS | ((targets & 0xFF) << 16) |
++	    (intid & 0xF));
++	__builtin_arm_isb(ISB_SY);
++}
++
++/*
++ * Diagnostic view of the distributor/CPU interface from the current core.
++ * Called with IRQs masked so the pending SGI is still visible in ISPENDR.
++ */
++void
++pe_sweet_gic_snapshot(uint32_t *typer, uint32_t *isen, uint32_t *pend,
++    uint32_t *ctlr, uint32_t *hppir)
++{
++	if (typer != NULL) {
++		*typer = sweet_gicd_read32(GICD_TYPER);
++	}
++	if (isen != NULL) {
++		*isen = sweet_gicd_read32(GICD_ISENABLER);
++	}
++	if (pend != NULL) {
++		*pend = sweet_gicd_read32(GICD_ISPENDR);
++	}
++	if (ctlr != NULL) {
++		*ctlr = sweet_gicc_read32(GICC_CTLR);
++	}
++	if (hppir != NULL) {
++		*hppir = sweet_gicc_read32(GICC_HPPIR);
++	}
++}
++
+ void
+ pe_init_fiq()
+ {
+diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
+index fd2b8f7..f9b0a61 100644
+--- a/pexpert/pexpert/arm64/SWEET.h
++++ b/pexpert/pexpert/arm64/SWEET.h
+@@ -127,9 +127,12 @@
+ #define GICC_IAR                                0x0C
+ #define GICC_IAR_INTID_MASK                     0x3FF
+ #define GICC_EOIR                               0x10
++#define GICC_HPPIR                              0x18
+ 
++#define GICD_TYPER                              0x004
+ #define GICD_IGROUPR                            0x080
+ #define GICD_ISENABLER                          0x100
++#define GICD_ISPENDR                            0x200
+ #define GICD_IPRIORITYR                         0x400
+ #define GICD_SGIR                               0xF00
+ /*
+@@ -140,5 +143,6 @@
+  */
+ #define GICD_SGIR_FILTER_SELF                   (2U << 24)
+ #define GICD_SGIR_FILTER_OTHERS                 (1U << 24)
++#define GICD_SGIR_FILTER_TARGETS                (0U << 24)
+ 
+ #endif /* ! _PEXPERT_ARM64_SWEET_H */
