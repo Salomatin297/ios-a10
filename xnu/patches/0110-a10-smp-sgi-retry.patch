@@ -1,0 +1,86 @@
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -23,6 +23,11 @@
+ 
+ extern "C" void sweet_secondary_entry(void);
+ extern "C" boolean_t sweet_cpu_signal_is_enabled(unsigned int cpu);
++#if defined(SWEET_GICV2)
++/* GIC-400 helpers from pe_fiq.c; also used to retry a lost bring-up SGI. */
++extern "C" void pe_sweet_gic_self_sgi(uint32_t intid);
++extern "C" void pe_sweet_gic_broadcast_sgi(uint32_t intid);
++#endif /* SWEET_GICV2 */
+ 
+ class SweetCPU;
+ static SweetCPU *sweet_cpus[MAX_CPUS];
+@@ -191,19 +196,51 @@
+ 		if (kr != KERN_SUCCESS) {
+ 			panic("SWEET CPU: cpu=%u processor_start failed: %d", i, kr);
+ 		}
+-		/* processor_start() is asynchronous for secondaries in this XNU. */
++		/*
++		 * processor_start() is asynchronous for secondaries in this XNU.
++		 * The secondary clears SIGPdisabled by taking its own SGI after
++		 * its IRQs unmask.  On the A10 the GIC-400 CPU interface is
++		 * enabled just before that SGI is queued, and the first one is
++		 * occasionally dropped (observed on MPIDR 0x102).  Retry the
++		 * handshake while waiting instead of declaring the CPU dead.
++		 */
+ 		nanoseconds_to_deadline(5 * NSEC_PER_SEC, &deadline);
++		uint64_t next_nudge;
++		nanoseconds_to_deadline(100 * NSEC_PER_MSEC, &next_nudge);
++		uint32_t nudges = 0;
+ 		while (__atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE) == 0 ||
+ 		    !sweet_cpu_signal_is_enabled(i)) {
+ 			if (mach_absolute_time() > deadline) {
+ 				IOLog("SWEET CPU: cpu=%u mpidr=0x%x NOT alive after 5s "
+-				    "(initialized=%u signal_enabled=%u)\n",
++				    "(initialized=%u signal_enabled=%u nudges=%u)\n",
+ 				    i, topology->cpus[i].phys_id,
+ 				    __atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE),
+-				    sweet_cpu_signal_is_enabled(i) ? 1 : 0);
++				    sweet_cpu_signal_is_enabled(i) ? 1 : 0, nudges);
+ 				panic("SWEET CPU: cpu=%u startup timeout (reset/MMU/GIC/SGI)", i);
+ 			}
++#if defined(SWEET_GICV2)
++			if (__atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE) != 0 &&
++			    !sweet_cpu_signal_is_enabled(i) &&
++			    mach_absolute_time() > next_nudge) {
++				/*
++				 * Re-send the bring-up IPI.  A broadcast cannot
++				 * reach the sender, so send a self-SGI if this
++				 * thread has already migrated to the target.
++				 */
++				if (cpu_number() == (int)i) {
++					pe_sweet_gic_self_sgi(SWEET_IPI_SGI);
++				} else {
++					pe_sweet_gic_broadcast_sgi(SWEET_IPI_SGI);
++				}
++				nudges++;
++				nanoseconds_to_deadline(100 * NSEC_PER_MSEC, &next_nudge);
++			}
++#endif /* SWEET_GICV2 */
+ 			IOSleep(1);
++		}
++		if (nudges != 0) {
++			IOLog("SWEET CPU: cpu=%u needed %u bring-up SGI retry(ies)\n",
++			    i, nudges);
+ 		}
+ 		IOLog("SWEET CPU: cpu=%u mpidr=0x%x came alive; SGI1 OK\n",
+ 		    i, topology->cpus[i].phys_id);
+@@ -245,15 +282,6 @@
+ 	    __builtin_arm_rsr64("CurrentEL") >> 2, ml_get_interrupts_enabled());
+ 	__atomic_store_n(&initialized, 1, __ATOMIC_RELEASE);
+ }
+-
+-#if defined(SWEET_GICV2)
+-/*
+- * GIC-400 helper from pe_fiq.c, declared with C linkage to match its C
+- * definition in pexpert/arm/pe_fiq.c.
+- */
+-extern "C" void pe_sweet_gic_self_sgi(uint32_t intid);
+-extern "C" void pe_sweet_gic_broadcast_sgi(uint32_t intid);
+-#endif /* SWEET_GICV2 */
+ 
+ void
+ SweetCPU::signalCPU(IOCPU *target)
