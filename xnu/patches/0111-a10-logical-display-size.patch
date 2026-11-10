@@ -1,0 +1,82 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -84,6 +84,20 @@
+ 
+ /* Boot-arg sweetfb_fit=1: scale a full-screen layer down to the panel. */
+ static bool sweet_fb_fit;
++/* Size the framebuffer reports to userland; HID uses the same space. */
++static uint32_t sweet_fb_logical_w;
++static uint32_t sweet_fb_logical_h;
++
++extern "C" bool
++sweet_fb_get_logical_size(uint32_t *w, uint32_t *h)
++{
++	if (sweet_fb_logical_w == 0 || sweet_fb_logical_h == 0) {
++		return false;
++	}
++	*w = sweet_fb_logical_w;
++	*h = sweet_fb_logical_h;
++	return true;
++}
+ 
+ class IOMobileFramebuffer : public IOService {
+ 	OSDeclareDefaultStructors(IOMobileFramebuffer);
+@@ -177,8 +191,23 @@
+ 		fLogicalW = SWEET_FB_LOGICAL_W;
+ 		fLogicalH = SWEET_FB_LOGICAL_H;
+ 	}
++	/*
++	 * sweetfb_w/sweetfb_h override the logical panel independently of the
++	 * physical 720x1560 framebuffer.  This lets a probe present a screen
++	 * geometry UIKit knows (e.g. 1170x2532 = 390x844 @3x) without
++	 * rebuilding the kernel; sweetfb_fit scales the UI to the panel.
++	 */
++	int lw = 0, lh = 0;
++	if (PE_parse_boot_argn("sweetfb_w", &lw, sizeof(lw)) && lw > 0) {
++		fLogicalW = (uint32_t)lw;
++	}
++	if (PE_parse_boot_argn("sweetfb_h", &lh, sizeof(lh)) && lh > 0) {
++		fLogicalH = (uint32_t)lh;
++	}
+ 	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
+ 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
++	sweet_fb_logical_w = fLogicalW;
++	sweet_fb_logical_h = fLogicalH;
+ 	fLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
+ 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -30,6 +30,8 @@
+ #include "IOHIDUsageTables.h"
+ 
+ extern "C" uint64_t mach_absolute_time(void);
++/* SweetFramebuffer's logical display size, shared with the digitizer. */
++extern "C" bool sweet_fb_get_logical_size(uint32_t *w, uint32_t *h);
+ 
+ /* One open client: the user client and its event callback. */
+ class IOHIDEventServiceClient : public OSObject {
+@@ -434,12 +436,18 @@
+ 	}
+ 	PE_Video video;
+ 	/*
+-	 * The digitizer covers the boot framebuffer, which SweetFramebuffer
+-	 * presents as the logical display: 720x1560 natively on the A10.
++	 * The digitizer reports the panel coordinates, which backboardd maps
++	 * to the logical display.  Ask SweetFramebuffer for the size it
++	 * presents (720x1560 natively, or a boot-arg override); fall back to
++	 * the boot framebuffer if the display service has not started yet.
+ 	 */
++	uint32_t logical_w = 0, logical_h = 0;
+ 	fLogicalW = 1125;
+ 	fLogicalH = 2436;
+-	if (PE_current_console(&video) == 0 && video.v_width != 0 &&
++	if (sweet_fb_get_logical_size(&logical_w, &logical_h)) {
++		fLogicalW = (int)logical_w;
++		fLogicalH = (int)logical_h;
++	} else if (PE_current_console(&video) == 0 && video.v_width != 0 &&
+ 	    video.v_height != 0) {
+ 		fLogicalW = (int)video.v_width;
+ 		fLogicalH = (int)video.v_height;
