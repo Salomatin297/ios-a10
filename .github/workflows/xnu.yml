@@ -162,6 +162,8 @@ jobs:
           need dxb/xnu/bsd/dev/sweet_emmc.c 'EMMC_FIFO_DEPTH - fcnt' present '0102 FCNT write flow control'
           need dxb/xnu/bsd/sweet_hfs/core/hfs_link.c 'sweet_hfs_find_private_dir' present '0103 HFS+ private dir lookup by CNID'
           need dxb/xnu/bsd/sweet_hfs/core/hfs_catalog.c 'resolved hardlink' present '0103 HFS+ hard link resolution'
+          need dxb/xnu/bsd/kern/bsd_init.c 'SWEET DSC: probe start' present '0104 dyld shared cache probe'
+          need dxb/xnu/bsd/kern/bsd_init.c 'sweet_dsc_probe_one' present '0104 dyld cache probe helper'
           if [ "$fail" -ne 0 ]; then
             echo "::error::A10 port patches did not apply cleanly"
             exit 1
