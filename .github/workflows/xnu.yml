@@ -165,6 +165,9 @@ jobs:
           need dxb/xnu/bsd/kern/bsd_init.c 'SWEET DSC: probe start' present '0104 dyld shared cache probe'
           need dxb/xnu/bsd/kern/bsd_init.c 'sweet_dsc_probe_one' present '0104 dyld cache probe helper'
           need dxb/xnu/bsd/kern/ubc_subr.c 'cs_blob_is_dyld_shared_cache' present '0105 16K-signed dyld cache on 4K pages'
+          need dxb/xnu/iokit/Kernel/arm/SweetFramebuffer.cpp 'sweetfb_fit' present '0106 sweetfb_fit scaling'
+          need dxb/xnu/iokit/Kernel/arm/SweetFramebuffer.cpp 'sweet_fb_frames_logged' present '0106 frame diagnostics'
+          need dxb/xnu/bsd/dev/sweet_emmc.c 'SWEET SMP: A10 sampler start' present '0107 A10 sampler start'
           if [ "$fail" -ne 0 ]; then
             echo "::error::A10 port patches did not apply cleanly"
             exit 1

@@ -1,0 +1,22 @@
+diff --git a/bsd/dev/sweet_emmc.c b/bsd/dev/sweet_emmc.c
+index 5dd3aa8..22fe297 100644
+--- a/bsd/dev/sweet_emmc.c
++++ b/bsd/dev/sweet_emmc.c
+@@ -1489,6 +1489,17 @@ sweet_emmc_init(void)
+ 	    se.writable ? "read-write" : "read-only", se.bus_width,
+ 	    1u << se.fifo_shift);
+ 	sweet_emmc_log_start();
++	/*
++	 * The A10 root path is this eMMC driver, not sweet_ufs.c (UFS), so the
++	 * process sampler has to be started here: "SMP name[pid] ..." lines
++	 * with user pc/lr/backtraces, first sample 90 s after boot.
++	 */
++	{
++		extern void sweet_sample_start(void);
++
++		printf("SWEET SMP: A10 sampler start\n");
++		sweet_sample_start();
++	}
+ 	return 0;
+ }
+ 
