@@ -1,0 +1,121 @@
+diff --git a/bsd/kern/ubc_subr.c b/bsd/kern/ubc_subr.c
+index 9b553be..de8c29f 100644
+--- a/bsd/kern/ubc_subr.c
++++ b/bsd/kern/ubc_subr.c
+@@ -347,6 +347,16 @@ hashes(
+ 	return hash;
+ }
+ 
++/*
++ * (a10 patch 0105) The iPhone X userland ships a dyld shared cache whose
++ * CodeDirectory is signed with 16K pages (pageSize == 14).  The A10
++ * (Cortex-A73/A53) has no 16K translation granule, so this kernel runs on
++ * 4K pages and PAGE_SHIFT is 12.  Accept the 16K CodeDirectory below and
++ * trust the cache's pages in cs_validate_hash(): a 16K page hash cannot be
++ * computed from the single 4K page that the pager hands us.
++ */
++static unsigned long cs_validate_codedirectory_16k_log;
++
+ /*
+  * cs_validate_codedirectory
+  *
+@@ -372,8 +382,20 @@ cs_validate_codedirectory(const CS_CodeDirectory *cd, size_t length)
+ 		return EBADEXEC;
+ 	}
+ 	if ((cd->pageSize != PAGE_SHIFT_4K) && (cd->pageSize != PAGE_SHIFT)) {
+-		printf("disallowing unsupported code signature page shift: %u\n", cd->pageSize);
+-		return EBADEXEC;
++		if (cd->pageSize == 14 && PAGE_SHIFT == PAGE_SHIFT_4K) {
++			/*
++			 * (a10 patch 0105) Apple's 16K-signed dyld shared
++			 * cache on a 4K-page kernel: the page hashes are
++			 * handled in cs_validate_hash().
++			 */
++			if (cs_validate_codedirectory_16k_log++ == 0) {
++				printf("CODE SIGNING: (a10) accepting a 16K-signed "
++				    "CodeDirectory on a 4K-page kernel\n");
++			}
++		} else {
++			printf("disallowing unsupported code signature page shift: %u\n", cd->pageSize);
++			return EBADEXEC;
++		}
+ 	}
+ 	hashtype = cs_find_md(cd->hashType);
+ 	if (hashtype == NULL) {
+@@ -5668,6 +5690,37 @@ ubc_get_cs_mtime(
+ 
+ unsigned long cs_validate_page_no_hash = 0;
+ unsigned long cs_validate_page_bad_hash = 0;
++static unsigned long cs_validate_hash_16k_trust_log = 0;
++static unsigned long cs_validate_hash_16k_reject_log = 0;
++
++/*
++ * (a10 patch 0105) True for the CodeDirectory of Apple's dyld shared cache.
++ * The main cache, every split subcache and the .symbols cache use the
++ * "com.apple.dyld.cache." identifier prefix.
++ */
++static boolean_t
++cs_blob_is_dyld_shared_cache(struct cs_blob *blob)
++{
++	static const char prefix[] = "com.apple.dyld.cache.";
++	const CS_CodeDirectory *cd = blob->csb_cd;
++	uint32_t ident_offset;
++	uint32_t cd_length;
++
++	if (cd == NULL) {
++		return FALSE;
++	}
++	ident_offset = ntohl(cd->identOffset);
++	cd_length = ntohl(cd->length);
++	if (ident_offset == 0 || ident_offset >= cd_length) {
++		return FALSE;
++	}
++	if (cd_length - ident_offset < sizeof(prefix) - 1) {
++		return FALSE;
++	}
++	return memcmp((const char *)cd + ident_offset, prefix,
++	           sizeof(prefix) - 1) == 0;
++}
++
+ static boolean_t
+ cs_validate_hash(
+ 	struct cs_blob          *blobs,
+@@ -5726,6 +5779,38 @@ cs_validate_hash(
+ 			if (hashtype->cs_digest_size > sizeof(actual_hash)) {
+ 				panic("hash size too large");
+ 			}
++			if ((uint32_t)blob->csb_hash_pageshift > (uint32_t)PAGE_SHIFT) {
++				/*
++				 * (a10 patch 0105) A blob signed with 16K pages
++				 * on a 4K-page kernel.  The CodeDirectory hash
++				 * covers a full 16K page, but only the single 4K
++				 * page being faulted is available here, so the
++				 * hash cannot be computed.  Trust the dyld shared
++				 * cache (its signature was verified offline) and
++				 * refuse every other 16K-signed blob.
++				 */
++				if (!cs_blob_is_dyld_shared_cache(blob)) {
++					if (cs_validate_hash_16k_reject_log++ < 8) {
++						printf("CODE SIGNING: (a10) refusing a "
++						    "16K-signed non-cache blob (platform %d)\n",
++						    blob->csb_platform_binary);
++					}
++					*tainted = CS_VALIDATE_TAINTED;
++					return FALSE;
++				}
++				if (cs_validate_hash_16k_trust_log++ == 0) {
++					printf("CODE SIGNING: (a10) trusting the 16K-signed "
++					    "dyld shared cache on a 4K-page kernel "
++					    "(platform %d)\n",
++					    blob->csb_platform_binary);
++				}
++				*tainted = 0;
++				*bytes_processed =
++				    (vm_size_t)(1U << blob->csb_hash_pageshift) -
++				    (vm_size_t)(offset &
++				    ((1U << blob->csb_hash_pageshift) - 1));
++				return TRUE;
++			}
+ 			if (offset & ((1U << blob->csb_hash_pageshift) - 1)) {
+ 				panic("offset not aligned to cshash boundary");
+ 			}

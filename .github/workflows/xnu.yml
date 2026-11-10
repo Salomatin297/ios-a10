@@ -164,6 +164,7 @@ jobs:
           need dxb/xnu/bsd/sweet_hfs/core/hfs_catalog.c 'resolved hardlink' present '0103 HFS+ hard link resolution'
           need dxb/xnu/bsd/kern/bsd_init.c 'SWEET DSC: probe start' present '0104 dyld shared cache probe'
           need dxb/xnu/bsd/kern/bsd_init.c 'sweet_dsc_probe_one' present '0104 dyld cache probe helper'
+          need dxb/xnu/bsd/kern/ubc_subr.c 'cs_blob_is_dyld_shared_cache' present '0105 16K-signed dyld cache on 4K pages'
           if [ "$fail" -ne 0 ]; then
             echo "::error::A10 port patches did not apply cleanly"
             exit 1
