@@ -172,6 +172,9 @@ jobs:
           need dxb/xnu/iokit/Kernel/arm/SweetCPU.cpp 'pe_sweet_gic_broadcast_sgi' present '0108 cross-CPU SGI'
           need dxb/xnu/pexpert/arm/pe_fiq.c 'GICD_SGIR_FILTER_OTHERS' present '0108 broadcast SGI filter'
           need dxb/xnu/iokit/KernelConfigTables.cpp 'arm,cortex-a73' present '0108 A73 CPU personality'
+          need dxb/xnu/bsd/dev/a10_touch.c 'A10 TOUCH: polling GPC2-2/3' present '0109 A10 touch driver'
+          need dxb/xnu/bsd/dev/sweet_emmc.c 'a10_touch_init' present '0109 touch hook'
+          need dxb/xnu/iokit/Kernel/arm/hid/SweetHID.cpp 'SWEET HID: touch display' present '0109 digitizer display size'
           if [ "$fail" -ne 0 ]; then
             echo "::error::A10 port patches did not apply cleanly"
             exit 1

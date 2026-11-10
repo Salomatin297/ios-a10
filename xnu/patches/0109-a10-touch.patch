@@ -1,0 +1,647 @@
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -432,12 +432,21 @@
+ 	if (!fLock || !IOHIDEventService::start(provider)) {
+ 		return false;
+ 	}
+-	int native = 0;
+-	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+-	fLogicalW = native ? 1080 : 1125;
+-	fLogicalH = native ? 2400 : 2436;
+-	fOffX = (fLogicalW - 1080) / 2;
+-	fOffY = (fLogicalH - 2400) / 2;
++	PE_Video video;
++	/*
++	 * The digitizer covers the boot framebuffer, which SweetFramebuffer
++	 * presents as the logical display: 720x1560 natively on the A10.
++	 */
++	fLogicalW = 1125;
++	fLogicalH = 2436;
++	if (PE_current_console(&video) == 0 && video.v_width != 0 &&
++	    video.v_height != 0) {
++		fLogicalW = (int)video.v_width;
++		fLogicalH = (int)video.v_height;
++	}
++	fOffX = 0;
++	fOffY = 0;
++	IOLog("SWEET HID: touch display %dx%d\n", fLogicalW, fLogicalH);
+ 	/* The digitizer covers the main display (backboardd maps it 1:1). */
+ 	setProperty("DisplayIntegrated", kOSBooleanTrue);
+ 	setProperty("SurfaceWidth", (unsigned long long)(68 << 16), 32);	/* mm, 16.16 */
+@@ -458,8 +467,8 @@
+ 	if (finger < 0 || finger >= SWEET_TOUCH_FINGERS) {
+ 		return;
+ 	}
+-	x = x < 0 ? 0 : (x > 1079 ? 1079 : x);
+-	y = y < 0 ? 0 : (y > 2399 ? 2399 : y);
++	x = x < 0 ? 0 : (x > fLogicalW - 1 ? fLogicalW - 1 : x);
++	y = y < 0 ? 0 : (y > fLogicalH - 1 ? fLogicalH - 1 : y);
+ 
+ 	IOLockLock(fLock);
+ 	bool was = fDown[finger];
+@@ -472,8 +481,8 @@
+ 		return;
+ 	}
+ 	if (!was && down) {
+-		fEdge[finger] = x < SWEET_TOUCH_EDGE_PX || x > 1079 - SWEET_TOUCH_EDGE_PX ||
+-		    y < SWEET_TOUCH_EDGE_PX || y > 2399 - SWEET_TOUCH_EDGE_PX;
++		fEdge[finger] = x < SWEET_TOUCH_EDGE_PX || x > fLogicalW - SWEET_TOUCH_EDGE_PX ||
++		    y < SWEET_TOUCH_EDGE_PX || y > fLogicalH - SWEET_TOUCH_EDGE_PX;
+ 	}
+ 
+ 	collection = IOHIDEvent::digitizerEvent(now, 0, kIOHIDDigitizerTransducerTypeHand, false, 0, 0, 0);
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -111,6 +111,7 @@
+ bsd/dev/sweet_touch.c			standard
+ bsd/dev/a10_keys.c			standard
+ bsd/dev/a10_battery.c			standard
++bsd/dev/a10_touch.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+diff --git a/bsd/dev/sweet_emmc.c b/bsd/dev/sweet_emmc.c
+--- a/bsd/dev/sweet_emmc.c
++++ b/bsd/dev/sweet_emmc.c
+@@ -1507,8 +1507,10 @@
+ sweet_emmc_rootdev(dev_t *dev)
+ {
+ 	extern void a10_keys_init(void);
++	extern void a10_touch_init(void);
+ 
+ 	a10_keys_init();
++	a10_touch_init();
+ 	if (!se.ready) {
+ 		int error = sweet_emmc_init();
+ 		if (error != 0) {
+diff --git a/bsd/dev/a10_touch.c b/bsd/dev/a10_touch.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/a10_touch.c
+@@ -0,0 +1,564 @@
++/*
++ * A10 (Exynos 7884B) SEC touchscreen (s6d7at0b01) over bit-banged I2C.
++ *
++ * The panel's touch controller sits on hsi2c@13930000 (I2C address 0x48)
++ * with SDA on GPC2-2 and SCL on GPC2-3.  The HSI2C block needs the CMU
++ * gate and USI mode programming, and shares its pin bank with the display
++ * pipeline; a plain open-drain bit-bang on the GPIO function of those two
++ * pins needs neither and is fast enough for polled touch (one 8-byte
++ * event read is about 1 ms at 100 kHz).
++ *
++ * The protocol is the stock Samsung sec_ts one: read register 0x60 for
++ * one 8-byte event, byte 0 == 0 means the queue is empty, byte 7 bits
++ * 5:0 hold the number of further events which are read in one 0x61
++ * burst.  Coordinates are 12-bit x/y split across bytes 1..3; finger id
++ * is (byte0 >> 2) & 0xf, action (byte0 >> 6) & 3 (1 press, 2 move,
++ * 3 release).
++ *
++ * Everything is polled; the controller's EINT line is not used.  Boot
++ * arguments: a10touch=0 disables, a10touch_debug=1 logs events and a
++ * heartbeat, a10touch_ms=N poll interval (default 15), a10touch_reset=1
++ * forces a software reset at bring-up.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern void sweet_hid_touch(int finger, int down, int x, int y);
++void a10_touch_init(void);
++
++#define A10_TOUCH_GPIO_PA   0x139b0000u
++#define A10_TOUCH_GPIO_SIZE 0x1000u
++#define A10_GPC2_OFF        0x200u
++#define A10_GPC2_CON        0x000u
++#define A10_GPC2_DAT        0x004u
++#define A10_GPC2_PUD        0x008u
++
++#define A10_TOUCH_SDA_PIN   2u
++#define A10_TOUCH_SCL_PIN   3u
++
++#define A10_TOUCH_ADDR      0x48u
++#define A10_TOUCH_MAX_X     720
++#define A10_TOUCH_MAX_Y     1520
++#define A10_TOUCH_FINGERS   10
++
++/* sec_ts registers */
++#define SEC_TS_READ_ID             0x52
++#define SEC_TS_READ_BOOT_STATUS    0x55
++#define SEC_TS_READ_TS_STATUS      0xaf
++#define SEC_TS_READ_ONE_EVENT      0x60
++#define SEC_TS_READ_ALL_EVENT      0x61
++#define SEC_TS_CMD_CLEAR_EVENT     0x62
++#define SEC_TS_CMD_SENSE_ON        0x10
++#define SEC_TS_CMD_SW_RESET        0x42
++
++#define A10_TOUCH_EVENT_SIZE       8
++#define A10_TOUCH_MAX_EVENTS       32
++#define A10_TOUCH_HALF_US          5
++
++static vm_offset_t a10_touch_gpio;
++static int a10_touch_ms = 15;
++static int a10_touch_debug;
++static int a10_touch_reset;
++static bool a10_touch_started;
++static int a10_touch_chan;
++static bool a10_touch_down[A10_TOUCH_FINGERS];
++
++static uint32_t
++a10_touch_rd(uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(a10_touch_gpio + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++a10_touch_wr(uint32_t off, uint32_t val)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(a10_touch_gpio + off) = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static void
++a10_touch_wait_ms(unsigned ms)
++{
++	uint64_t deadline;
++
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&a10_touch_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++/* ---- open-drain bit-bang on GPC2-2 / GPC2-3 ---------------------------- */
++
++static void
++a10_touch_delay(void)
++{
++	delay(A10_TOUCH_HALF_US);
++}
++
++static void
++a10_touch_func(unsigned pin, uint32_t func)
++{
++	uint32_t off = A10_GPC2_OFF + A10_GPC2_CON;
++	uint32_t v = a10_touch_rd(off);
++	unsigned shift = pin * 4u;
++
++	v = (v & ~(0xfu << shift)) | ((func & 0xfu) << shift);
++	a10_touch_wr(off, v);
++}
++
++static void
++a10_touch_pud(unsigned pin, uint32_t pud)
++{
++	uint32_t off = A10_GPC2_OFF + A10_GPC2_PUD;
++	uint32_t v = a10_touch_rd(off);
++	unsigned shift = pin * 2u;
++
++	v = (v & ~(0x3u << shift)) | ((pud & 0x3u) << shift);
++	a10_touch_wr(off, v);
++}
++
++/* High-Z with the pull-up holding the line high. */
++static void
++a10_touch_release(unsigned pin)
++{
++	a10_touch_func(pin, 0); /* function 0 = input */
++}
++
++/* Drive low (open drain: never drive high). */
++static void
++a10_touch_low(unsigned pin)
++{
++	uint32_t off = A10_GPC2_OFF + A10_GPC2_DAT;
++	uint32_t v = a10_touch_rd(off) & ~(1u << pin);
++
++	a10_touch_wr(off, v);
++	a10_touch_func(pin, 1); /* function 1 = output */
++}
++
++static int
++a10_touch_sda(void)
++{
++	return (int)((a10_touch_rd(A10_GPC2_OFF + A10_GPC2_DAT) >>
++	    A10_TOUCH_SDA_PIN) & 1u);
++}
++
++static void
++a10_touch_stop(void)
++{
++	a10_touch_low(A10_TOUCH_SDA_PIN);
++	a10_touch_delay();
++	a10_touch_release(A10_TOUCH_SCL_PIN);
++	a10_touch_delay();
++	a10_touch_release(A10_TOUCH_SDA_PIN);
++	a10_touch_delay();
++}
++
++/* Clock a stuck slave free, then emit a stop condition. */
++static void
++a10_touch_recover(void)
++{
++	a10_touch_release(A10_TOUCH_SDA_PIN);
++	for (int i = 0; i < 9; i++) {
++		a10_touch_low(A10_TOUCH_SCL_PIN);
++		a10_touch_delay();
++		a10_touch_release(A10_TOUCH_SCL_PIN);
++		a10_touch_delay();
++	}
++	a10_touch_stop();
++}
++
++static bool
++a10_touch_start(void)
++{
++	a10_touch_release(A10_TOUCH_SDA_PIN);
++	a10_touch_release(A10_TOUCH_SCL_PIN);
++	a10_touch_delay();
++	if (a10_touch_sda() == 0) {
++		/* SDA held low: a slave is mid-transfer or the bus is stuck. */
++		a10_touch_recover();
++		return false;
++	}
++	a10_touch_low(A10_TOUCH_SDA_PIN);
++	a10_touch_delay();
++	a10_touch_low(A10_TOUCH_SCL_PIN);
++	a10_touch_delay();
++	return true;
++}
++
++static void
++a10_touch_restart(void)
++{
++	a10_touch_release(A10_TOUCH_SDA_PIN);
++	a10_touch_delay();
++	a10_touch_release(A10_TOUCH_SCL_PIN);
++	a10_touch_delay();
++	a10_touch_low(A10_TOUCH_SDA_PIN);
++	a10_touch_delay();
++	a10_touch_low(A10_TOUCH_SCL_PIN);
++	a10_touch_delay();
++}
++
++static bool
++a10_touch_write_byte(uint8_t byte)
++{
++	bool ack;
++
++	for (int i = 7; i >= 0; i--) {
++		if (byte & (1u << i)) {
++			a10_touch_release(A10_TOUCH_SDA_PIN);
++		} else {
++			a10_touch_low(A10_TOUCH_SDA_PIN);
++		}
++		a10_touch_delay();
++		a10_touch_release(A10_TOUCH_SCL_PIN);
++		a10_touch_delay();
++		a10_touch_low(A10_TOUCH_SCL_PIN);
++		a10_touch_delay();
++	}
++	/* ACK clock: release SDA, let the slave pull it low. */
++	a10_touch_release(A10_TOUCH_SDA_PIN);
++	a10_touch_delay();
++	a10_touch_release(A10_TOUCH_SCL_PIN);
++	a10_touch_delay();
++	ack = a10_touch_sda() == 0;
++	a10_touch_low(A10_TOUCH_SCL_PIN);
++	a10_touch_delay();
++	return ack;
++}
++
++static uint8_t
++a10_touch_read_byte(bool ack)
++{
++	uint8_t v = 0;
++
++	a10_touch_release(A10_TOUCH_SDA_PIN);
++	for (int i = 0; i < 8; i++) {
++		a10_touch_delay();
++		a10_touch_release(A10_TOUCH_SCL_PIN);
++		a10_touch_delay();
++		v = (uint8_t)((v << 1) | (a10_touch_sda() ? 1u : 0u));
++		a10_touch_low(A10_TOUCH_SCL_PIN);
++		a10_touch_delay();
++	}
++	if (ack) {
++		a10_touch_low(A10_TOUCH_SDA_PIN);
++	} else {
++		a10_touch_release(A10_TOUCH_SDA_PIN);
++	}
++	a10_touch_delay();
++	a10_touch_release(A10_TOUCH_SCL_PIN);
++	a10_touch_delay();
++	a10_touch_low(A10_TOUCH_SCL_PIN);
++	a10_touch_delay();
++	return v;
++}
++
++static bool
++a10_i2c_write(uint8_t addr, const uint8_t *buf, int len)
++{
++	bool ok;
++
++	if (!a10_touch_start()) {
++		return false;
++	}
++	ok = a10_touch_write_byte((uint8_t)(addr << 1));
++	for (int i = 0; ok && i < len; i++) {
++		ok = a10_touch_write_byte(buf[i]);
++	}
++	a10_touch_stop();
++	return ok;
++}
++
++static bool
++a10_i2c_read(uint8_t addr, uint8_t reg, uint8_t *buf, int len)
++{
++	bool ok;
++
++	if (!a10_touch_start()) {
++		return false;
++	}
++	ok = a10_touch_write_byte((uint8_t)(addr << 1));
++	if (ok) {
++		ok = a10_touch_write_byte(reg);
++	}
++	if (ok) {
++		a10_touch_restart();
++		ok = a10_touch_write_byte((uint8_t)((addr << 1) | 1u));
++	}
++	for (int i = 0; ok && i < len; i++) {
++		buf[i] = a10_touch_read_byte(i != len - 1);
++	}
++	a10_touch_stop();
++	return ok;
++}
++
++/* ---- sec_ts protocol --------------------------------------------------- */
++
++static bool
++sec_ts_read(uint8_t reg, uint8_t *buf, int len)
++{
++	return a10_i2c_read(A10_TOUCH_ADDR, reg, buf, len);
++}
++
++static bool
++sec_ts_write(uint8_t reg, const uint8_t *data, int len)
++{
++	uint8_t buf[4];
++
++	if (len > (int)sizeof(buf)) {
++		return false;
++	}
++	buf[0] = reg;
++	for (int i = 0; i < len; i++) {
++		buf[i + 1] = data[i];
++	}
++	return a10_i2c_write(A10_TOUCH_ADDR, buf, len + 1);
++}
++
++static bool
++a10_touch_bringup(void)
++{
++	uint8_t id[5] = { 0, 0, 0, 0, 0 };
++	uint8_t boot = 0;
++	uint8_t ts[4] = { 0, 0, 0, 0 };
++	bool ok;
++
++	ok = sec_ts_read(SEC_TS_READ_ID, id, sizeof(id));
++	if (a10_touch_reset) {
++		printf("A10 TOUCH: forcing SW_RESET\n");
++		sec_ts_write(SEC_TS_CMD_SW_RESET, NULL, 0);
++		delay(150 * 1000);
++		ok = sec_ts_read(SEC_TS_READ_ID, id, sizeof(id));
++	}
++	if (!ok && !a10_touch_reset) {
++		printf("A10 TOUCH: no ACK at 0x%02x, sending SW_RESET\n",
++		    A10_TOUCH_ADDR);
++		sec_ts_write(SEC_TS_CMD_SW_RESET, NULL, 0);
++		delay(150 * 1000);
++		for (int i = 0; i < 10 && !ok; i++) {
++			ok = sec_ts_read(SEC_TS_READ_ID, id, sizeof(id));
++			if (!ok) {
++				delay(50 * 1000);
++			}
++		}
++	}
++	if (!ok) {
++		printf("A10 TOUCH: IC does not respond\n");
++		return false;
++	}
++	printf("A10 TOUCH: ID %02x %02x %02x %02x %02x\n",
++	    id[0], id[1], id[2], id[3], id[4]);
++	/* A reset or a lost byte drops any contact that was held. */
++	for (int i = 0; i < A10_TOUCH_FINGERS; i++) {
++		if (a10_touch_down[i]) {
++			a10_touch_down[i] = false;
++			sweet_hid_touch(i, 0, 0, 0);
++		}
++	}
++	if (sec_ts_read(SEC_TS_READ_BOOT_STATUS, &boot, 1)) {
++		printf("A10 TOUCH: boot status %02x\n", boot);
++	}
++	if (sec_ts_read(SEC_TS_READ_TS_STATUS, ts, sizeof(ts))) {
++		printf("A10 TOUCH: ts status %02x %02x %02x %02x\n",
++		    ts[0], ts[1], ts[2], ts[3]);
++	}
++	/* Drop anything stale and turn the sense channel on. */
++	sec_ts_write(SEC_TS_CMD_CLEAR_EVENT, NULL, 0);
++	sec_ts_write(SEC_TS_CMD_SENSE_ON, NULL, 0);
++	delay(30 * 1000);
++	sec_ts_write(SEC_TS_CMD_CLEAR_EVENT, NULL, 0);
++	return true;
++}
++
++static void
++a10_touch_coord(const uint8_t *e, int *x, int *y, int *tid, int *action)
++{
++	*tid = (e[0] >> 2) & 0xfu;
++	*action = (e[0] >> 6) & 0x3u;
++	*x = (e[1] << 4) | (e[3] >> 4);
++	*y = (e[2] << 4) | (e[3] & 0xfu);
++}
++
++static void
++a10_touch_event(const uint8_t *e, unsigned *events)
++{
++	int eid = e[0] & 0x3;
++	int tid, action, x, y;
++
++	(*events)++;
++	if (a10_touch_debug) {
++		printf("A10 TOUCH: ev %02x %02x %02x %02x %02x %02x %02x %02x\n",
++		    e[0], e[1], e[2], e[3], e[4], e[5], e[6], e[7]);
++	}
++	if (eid == 0) { /* coordinate event */
++		a10_touch_coord(e, &x, &y, &tid, &action);
++		if (tid < 1 || tid > A10_TOUCH_FINGERS) {
++			return;
++		}
++		int finger = tid - 1;
++		if (action == 1 || action == 2) {
++			if (x >= A10_TOUCH_MAX_X) {
++				x = A10_TOUCH_MAX_X - 1;
++			}
++			if (y >= A10_TOUCH_MAX_Y) {
++				y = A10_TOUCH_MAX_Y - 1;
++			}
++			a10_touch_down[finger] = true;
++			sweet_hid_touch(finger, 1, x, y);
++		} else if (action == 3) {
++			if (!a10_touch_down[finger]) {
++				return;
++			}
++			a10_touch_down[finger] = false;
++			sweet_hid_touch(finger, 0, x, y);
++		}
++		return;
++	}
++	/* Status events: only the interesting ones, and only when debugging. */
++	if (eid == 1 && a10_touch_debug && e[1] != 0) {
++		printf("A10 TOUCH: status %02x %02x %02x %02x %02x %02x\n",
++		    e[1], e[2], e[3], e[4], e[5], e[6]);
++	}
++}
++
++/*
++ * Read and dispatch one batch.  Returns false when the bus did not ACK.
++ */
++static bool
++a10_touch_poll(unsigned *events, unsigned *errors)
++{
++	uint8_t e[A10_TOUCH_EVENT_SIZE];
++	uint8_t more[A10_TOUCH_MAX_EVENTS * A10_TOUCH_EVENT_SIZE];
++	int left;
++
++	if (!sec_ts_read(SEC_TS_READ_ONE_EVENT, e, sizeof(e))) {
++		(*errors)++;
++		return false;
++	}
++	*errors = 0;
++	if (e[0] == 0) {
++		return true; /* queue empty */
++	}
++	left = e[7] & 0x3fu;
++	if (left > A10_TOUCH_MAX_EVENTS - 1) {
++		printf("A10 TOUCH: event queue overflow (%d)\n", left);
++		sec_ts_write(SEC_TS_CMD_CLEAR_EVENT, NULL, 0);
++		for (int i = 0; i < A10_TOUCH_FINGERS; i++) {
++			if (a10_touch_down[i]) {
++				a10_touch_down[i] = false;
++				sweet_hid_touch(i, 0, 0, 0);
++			}
++		}
++		return true;
++	}
++	a10_touch_event(e, events);
++	if (left > 0) {
++		if (!sec_ts_read(SEC_TS_READ_ALL_EVENT, more,
++		    left * A10_TOUCH_EVENT_SIZE)) {
++			(*errors)++;
++			return false;
++		}
++		for (int i = 0; i < left; i++) {
++			a10_touch_event(more + i * A10_TOUCH_EVENT_SIZE, events);
++		}
++	}
++	return true;
++}
++
++static void
++a10_touch_thread(void *arg, wait_result_t result)
++{
++	bool up = false;
++	unsigned events = 0;
++	unsigned errors = 0;
++	unsigned ticks = 0;
++
++	(void)arg;
++	(void)result;
++	printf("A10 TOUCH: polling GPC2-2/3 at 0x%02x every %d ms\n",
++	    A10_TOUCH_ADDR, a10_touch_ms);
++	for (;;) {
++		if (!up) {
++			up = a10_touch_bringup();
++			if (!up) {
++				a10_touch_wait_ms(500);
++				continue;
++			}
++			printf("A10 TOUCH: ready\n");
++		}
++		if (!a10_touch_poll(&events, &errors)) {
++			if (errors == 1) {
++				printf("A10 TOUCH: I2C error, re-initialising\n");
++			}
++			if (errors >= 5) {
++				up = false;
++				errors = 0;
++			}
++			a10_touch_wait_ms(50);
++			continue;
++		}
++		if (a10_touch_debug && ++ticks >= 300u) {
++			ticks = 0;
++			printf("A10 TOUCH: heartbeat events=%u\n", events);
++		}
++		a10_touch_wait_ms((unsigned)a10_touch_ms);
++	}
++}
++
++void
++a10_touch_init(void)
++{
++	int enabled = 1;
++	thread_t thread;
++	kern_return_t kr;
++
++	if (a10_touch_started) {
++		return;
++	}
++	a10_touch_started = true;
++	(void)PE_parse_boot_argn("a10touch", &enabled, sizeof(enabled));
++	(void)PE_parse_boot_argn("a10touch_ms", &a10_touch_ms,
++	    sizeof(a10_touch_ms));
++	(void)PE_parse_boot_argn("a10touch_debug", &a10_touch_debug,
++	    sizeof(a10_touch_debug));
++	(void)PE_parse_boot_argn("a10touch_reset", &a10_touch_reset,
++	    sizeof(a10_touch_reset));
++	if (!enabled) {
++		printf("A10 TOUCH: disabled (a10touch=0)\n");
++		return;
++	}
++	if (a10_touch_ms < 5 || a10_touch_ms > 1000) {
++		a10_touch_ms = 15;
++	}
++	a10_touch_gpio = ml_io_map(A10_TOUCH_GPIO_PA, A10_TOUCH_GPIO_SIZE);
++	if (a10_touch_gpio == 0) {
++		printf("A10 TOUCH: pinctrl MMIO mapping failed\n");
++		return;
++	}
++	/* Idle-high open drain with internal pull-ups; the board has its own. */
++	a10_touch_release(A10_TOUCH_SDA_PIN);
++	a10_touch_release(A10_TOUCH_SCL_PIN);
++	a10_touch_pud(A10_TOUCH_SDA_PIN, 2);
++	a10_touch_pud(A10_TOUCH_SCL_PIN, 2);
++	a10_touch_recover();
++	printf("A10 TOUCH: GPC2 CON=%08x DAT=%08x\n",
++	    a10_touch_rd(A10_GPC2_OFF + A10_GPC2_CON),
++	    a10_touch_rd(A10_GPC2_OFF + A10_GPC2_DAT));
++
++	kr = kernel_thread_start(a10_touch_thread, NULL, &thread);
++	if (kr == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("A10 TOUCH: kernel_thread_start failed %d\n", kr);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
