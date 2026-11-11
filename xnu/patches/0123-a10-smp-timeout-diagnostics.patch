@@ -1,0 +1,46 @@
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index b6afb3d..e3d7fdf 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -52,6 +52,9 @@ class SweetCPU : public IOCPU {
+ 	OSDeclareDefaultStructors(SweetCPU);
+ 	const OSSymbol *cpuName = NULL;
+ 	uint32_t initialized = 0; /* release/acquire publication after initCPU sends SGI */
++	/* First and most recent PSCI CPU_ON result, for the timeout report. */
++	int32_t first_psci_rc = 0x7fffffff;
++	int32_t last_psci_rc = 0x7fffffff;
+ 
+ public:
+ 	static void startAll(void *arg, wait_result_t result);
+@@ -244,7 +247,14 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ 				    __atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE),
+ 				    sweet_cpu_signal_is_enabled(i) ? 1 : 0, nudges,
+ 				    on_retries, cpu_number());
+-				panic("SWEET CPU: cpu=%u startup timeout (reset/MMU/GIC/SGI)", i);
++				panic("SWEET CPU: cpu=%u startup timeout\n"
++				    "mpidr=0x%x init=%u sgi=%u nudges=%u on=%u "
++				    "rc0=%d rc=%d thread_cpu=%d",
++				    i, topology->cpus[i].phys_id,
++				    __atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE),
++				    sweet_cpu_signal_is_enabled(i) ? 1 : 0,
++				    nudges, on_retries, cpu->first_psci_rc,
++				    cpu->last_psci_rc, cpu_number());
+ 			}
+ 			if (i != topology->boot_cpu->cpu_id &&
+ 			    __atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE) == 0 &&
+@@ -257,6 +267,7 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ 				 */
+ 				int32_t rc = sweet_psci_cpu_on(
+ 				    topology->cpus[i].phys_id, entry, i);
++				cpu->last_psci_rc = rc;
+ 				on_retries++;
+ 				IOLog("SWEET CPU: cpu=%u CPU_ON retry %u rc=%d "
+ 				    "from cpu=%d\n", i, on_retries, rc, cpu_number());
+@@ -395,6 +406,7 @@ SweetCPU::startCPU(vm_offset_t start_paddr, vm_offset_t arg_paddr)
+ 	    getCPUNumber(), cpu->phys_id, (uint64_t)entry, getCPUNumber());
+ 	__builtin_arm_dsb(DSB_SY);
+ 	int32_t rc = sweet_psci_cpu_on(cpu->phys_id, entry, getCPUNumber());
++	first_psci_rc = last_psci_rc = rc;
+ 	IOLog("SWEET CPU: cpu=%u PSCI CPU_ON rc=%d\n", getCPUNumber(), rc);
+ 	/* cpu_start() discards PE_cpu_start's return; do not silently carry on. */
+ 	if (rc != 0) {
