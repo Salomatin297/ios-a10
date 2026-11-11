@@ -179,6 +179,8 @@ jobs:
           need dxb/xnu/bsd/dev/a10_battery.c 'A10 BATTERY: LM3632 initialised' present '0113 LM3632 backlight'
           need dxb/xnu/iokit/Kernel/arm/SweetFramebuffer.cpp 'a10_backlight_set' present '0113 display power backlight'
           need dxb/xnu/iokit/Kernel/arm/hid/SweetHID.cpp 'sweet_hid_touch_abs' present '0113 normalised touch coordinates'
+          need dxb/xnu/bsd/dev/a10_battery.c 'A10 BATTERY: backlight mode' present '0114 a10bl backlight mode'
+          need dxb/xnu/iokit/Kernel/arm/SweetFramebuffer.cpp 'SWEET FB: test pattern' present '0114 framebuffer test pattern'
           if [ "$fail" -ne 0 ]; then
             echo "::error::A10 port patches did not apply cleanly"
             exit 1

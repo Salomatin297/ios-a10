@@ -1,0 +1,131 @@
+diff --git a/bsd/dev/a10_battery.c b/bsd/dev/a10_battery.c
+index 84fc67e..4bccf76 100644
+--- a/bsd/dev/a10_battery.c
++++ b/bsd/dev/a10_battery.c
+@@ -103,6 +103,28 @@ static bool a10_gauge_ok;
+ static bool a10_charger_ok;
+ static bool a10_backlight_ready;
+ static bool a10_backlight_on = true;
++static int a10_backlight_mode = -1;	/* a10bl: 0 off, 1 full init, 2 enable only */
++
++static int
++a10_backlight_get_mode(void)
++{
++	int mode = 1;
++
++	if (a10_backlight_mode >= 0) {
++		return a10_backlight_mode;
++	}
++	if (!PE_parse_boot_argn("a10bl", &mode, sizeof(mode))) {
++		mode = 1;
++	}
++	if (mode < 0 || mode > 2) {
++		mode = 1;
++	}
++	a10_backlight_mode = mode;
++	printf("A10 BATTERY: backlight mode %d%s\n", mode,
++	    mode == 0 ? " (LM3632 untouched)" :
++	    mode == 2 ? " (enable registers only)" : "");
++	return mode;
++}
+ 
+ static uint32_t
+ a10_i2c_rd(vm_offset_t base, uint32_t off)
+@@ -512,21 +534,35 @@ int
+ a10_backlight_init(void)
+ {
+ 	uint8_t value;
++	int mode = a10_backlight_get_mode();
+ 
+ 	if (a10_backlight_ready) {
+ 		return 0;
+ 	}
++	if (mode == 0) {
++		/* The bootloader's panel state is left untouched on purpose. */
++		return ENXIO;
++	}
+ 	if (!a10_backlight_bus_init()) {
+ 		return ENXIO;
+ 	}
+-	for (unsigned i = 0; i < sizeof(a10_lm3632_init); i += 2) {
+-		value = a10_lm3632_init[i + 1];
+-		(void)a10_i2c_write_reg(a10_i2c_bl, A10_BL_ADDR,
+-		    a10_lm3632_init[i], &value, 1);
++	if (mode == 2) {
++		/* Only the enable/brightness registers; keep the bias setup
++		 * the bootloader programmed. */
++		value = 0x07;
++		(void)a10_i2c_write_reg(a10_i2c_bl, A10_BL_ADDR, 0x04, &value, 1);
++		value = 0xff;
++		(void)a10_i2c_write_reg(a10_i2c_bl, A10_BL_ADDR, 0x05, &value, 1);
++	} else {
++		for (unsigned i = 0; i < sizeof(a10_lm3632_init); i += 2) {
++			value = a10_lm3632_init[i + 1];
++			(void)a10_i2c_write_reg(a10_i2c_bl, A10_BL_ADDR,
++			    a10_lm3632_init[i], &value, 1);
++		}
+ 	}
+ 	a10_backlight_ready = true;
+ 	a10_backlight_on = true;
+-	printf("A10 BATTERY: LM3632 initialised\n");
++	printf("A10 BATTERY: LM3632 initialised (mode %d)\n", mode);
+ 	return 0;
+ }
+ 
+@@ -536,6 +572,9 @@ a10_backlight_set(int on)
+ 	uint8_t value;
+ 
+ 	on = on ? 1 : 0;
++	if (a10_backlight_get_mode() == 0) {
++		return;
++	}
+ 	if (a10_backlight_ready && on == a10_backlight_on) {
+ 		return;
+ 	}
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 375ed15..ddcf145 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -85,6 +85,12 @@ enum {
+ 
+ /* Boot-arg sweetfb_fit=1: scale a full-screen layer down to the panel. */
+ static bool sweet_fb_fit;
++/*
++ * Boot-arg sweetfb_test=1: paint the panel white once and ignore every
++ * userland frame.  This separates "the panel/backlight is off" from "the
++ * compositor presents the wrong pixels" during bring-up.
++ */
++static bool sweet_fb_test;
+ /* Size the framebuffer reports to userland; HID uses the same space. */
+ static uint32_t sweet_fb_logical_w;
+ static uint32_t sweet_fb_logical_h;
+@@ -230,6 +236,19 @@ AppleCLCD::start(IOService *provider)
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+ 	int fit = 0;
+ 	sweet_fb_fit = PE_parse_boot_argn("sweetfb_fit", &fit, sizeof(fit)) && fit != 0;
++	int test = 0;
++	sweet_fb_test = PE_parse_boot_argn("sweetfb_test", &test, sizeof(test)) && test != 0;
++	if (sweet_fb_test) {
++		sweet_console_muted = 1;
++		for (uint32_t y = 0; y < fHeight; y++) {
++			volatile uint32_t *row = (volatile uint32_t *)(fPixels + (uint64_t)y * fRowBytes);
++			for (uint32_t x = 0; x < fWidth; x++) {
++				row[x] = 0xffffffff;
++			}
++		}
++		IOLog("SWEET FB: test pattern %ux%u filled, frames ignored\n",
++		    fWidth, fHeight);
++	}
+ 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+@@ -339,6 +358,9 @@ static uint32_t sweet_fb_frames_logged;
+ void
+ AppleCLCD::swap(const uint8_t *rec)
+ {
++	if (sweet_fb_test) {
++		return;
++	}
+ 	IOLockLock(fLock);
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	fDirty = true;
