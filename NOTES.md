@@ -2,6 +2,54 @@
 
 ## >>> A10 PORT (Samsung Galaxy A10, SM-A105F) - active work 2026-11-09 <<<
 
+### >>> UPDATE 2026-11-11: probe35 census, patch 0120 (native 720x1560, /product, IOCoreSurfaceRoot) <<<
+
+**probe35** (patch 0119, CI `43060901124` green, image
+`dist/boot-a10-probe35.img`) ran with `sweetfb_stats=12 sweetfb_bar=1
+a10bl=2 a10keys_hold_ms=0`; log in `work/sweetlog-probe35/`.
+* The census is unambiguous: `SWEET FB: fit 1 stats 12 bar 1`, presented as
+  `1170x2532`, then `SWEET FB: stats 3 1170x2532 nz 0/60816 sum 0 max
+  00000000 clock 00000000 ... fc 1 fr 1` up to `fc 11`.  Fit copies run, the
+  whole surface is zero: the compositor draws no pixels at all (this is not a
+  three-point sampling artifact and not a copy/fit failure).
+* `SWEET FB: swap 21 layer 0 surface 3 1170x2532 fmt 0x42475241 bpr 4864
+  a 0,0 1170x2532 b 0,0 1170x2532` shows the b-rect is the full layer, and
+  `SWEET SURF: backboardd trap 3` confirms IOSurfaceRoot is opened.
+* `IOK backboardd: path IODeviceTree:/product -> none` repeats; the ADT had no
+  `/product` at all.  Whether the green bar from `sweetfb_bar=1` was visible on
+  the panel is still unanswered.
+
+**0120** (branch `gui2`) implements the requested fixes:
+* `SweetFramebuffer`: the logical size now defaults to the native panel
+  (720x1560, 360x780 points @2x); `SWEET_FB_LOGICAL_W/H` and
+  `sweetfb_native` are gone, `sweetfb_w/sweetfb_h` remain as overrides and
+  `sweetfb_fit` still scales a full-screen layer.
+* `SweetSurface`: `IOCoreSurfaceRoot::start()` calls
+  `setName("IOCoreSurfaceRoot")` before `registerService()`; backboardd uses
+  `IOServiceNameMatching()`, which compares the entry name, not the class.
+* `tools/mkadt-a10.py`: `CANVAS_W/H = 720x1560`, `DISPLAY_SCALE = 2`; the
+  rebuilt `dist/a10.adt` contains `disp0` canvas 720x1560 and display-scale 2.
+* Real D22AP `/product`: `Firmware/all_flash/DeviceTree.d22ap.im4p` was pulled
+  from the iPhone10,3 16.7.16 IPSW via `remotezip.py`, its payload is LZFSE
+  (`bvx2`) and was unpacked with the Python `lzfse` module to
+  `tools/research/d22ap.adt` (186,084 bytes).  `d22ap_product()` copies the 63
+  real properties (product-name `iPhone X`, graphics-featureset-class
+  `APPLE4`, artwork-scale-factor 3) and drops the `syscfg/*` placeholders.
+  `dist/a10.adt` is now 12,980 bytes and has `/product`.
+* `tools/make_patch_0120.py` generates
+  `xnu/patches/0120-a10-native-canvas-surface-name.patch`; both the reverse
+  check against the tree and a forward apply to a reconstructed post-0119
+  tree pass.
+* `tools/build_probe28.ps1` default cmdline no longer passes
+  `sweetfb_w/h=1170x2532` or `sweetfb_fit`, and uses `a10bl=2`.
+* Next: CI build of 0120, then probe36 with the new ADT and cmdline, pull the
+  log from TWRP, and check the startup `presented as`, `nz`, `/product`
+  lookups and `display-scale`.  If `nz` is still 0, investigate the
+  CoreAnimation renderer selection (`IOAcceleratorES`, `CA_*` preferences);
+  sweet renders without a GPU through `CA::OGL::SWContext`, so the missing
+  accelerator is a symptom, not proof.  Adding `/product` may also require
+  clearing the MobileGestalt disk cache (keyed by build + UUID).
+
 **2026-11-11, probe27 flashed - waiting for the on-device result.** Branch
 `gui2` (commit `859a2c2`, from `gui`/`07107c0`) adds patch `0113`, which was
 missing from every earlier boot: `a10_touch.c` now power-cycles `tsp_ldo_en`

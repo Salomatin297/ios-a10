@@ -1,0 +1,66 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index eec24e2..f81a0cd 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -72,15 +72,12 @@ enum {
+ #define SWEET_FB_VSYNC_US               16667
+ #define SWEET_FB_DOT_PITCH              458     /* ppi, as the iPhone X panel */
+ /*
+- * The iOS userland only has status bar / layout data for real iPhone
+- * screens (UIKit: "No status bar visual provider for screen", the red
+- * rdar://45025538 bar for 360x800 points). The display is therefore
+- * presented as the iPhone X panel, 1125x2436 (375x812 points @3x), and the
+- * centered 1080x2400 part of it is shown on the 1080x2400 panel.
+- * Boot-arg sweetfb_native=1 presents the real panel size instead.
++ * By default the framebuffer reports the panel's native geometry, so
++ * userland lays out for the real screen (A10: 720x1560, 360x780 points at
++ * 2x).  Boot-args sweetfb_w/sweetfb_h still override the logical size
++ * (e.g. 1125x2436 for an iPhone X geometry); sweetfb_fit=1 scales a
++ * full-screen layer down to the panel.
+  */
+-#define SWEET_FB_LOGICAL_W              1125
+-#define SWEET_FB_LOGICAL_H              2436
+ #define SWEET_FB_FORMAT_BGRA            0x42475241
+ 
+ /* Boot-arg sweetfb_fit=1: scale a full-screen layer down to the panel. */
+@@ -202,19 +199,14 @@ AppleCLCD::start(IOService *provider)
+ 		IOLog("SWEET FB: no boot framebuffer\n");
+ 		return false;
+ 	}
+-	int native = 0;
+-	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+ 	fLogicalW = fWidth;
+ 	fLogicalH = fHeight;
+-	if (!native && fWidth <= SWEET_FB_LOGICAL_W && fHeight <= SWEET_FB_LOGICAL_H) {
+-		fLogicalW = SWEET_FB_LOGICAL_W;
+-		fLogicalH = SWEET_FB_LOGICAL_H;
+-	}
+ 	/*
+ 	 * sweetfb_w/sweetfb_h override the logical panel independently of the
+-	 * physical 720x1560 framebuffer.  This lets a probe present a screen
+-	 * geometry UIKit knows (e.g. 1170x2532 = 390x844 @3x) without
+-	 * rebuilding the kernel; sweetfb_fit scales the UI to the panel.
++	 * physical 720x1560 framebuffer.  The native panel size is the default;
++	 * an override lets a probe present another geometry (e.g. 1125x2436 =
++	 * 375x812 @3x) without rebuilding the kernel; sweetfb_fit scales the
++	 * UI to the panel.
+ 	 */
+ 	int lw = 0, lh = 0;
+ 	if (PE_parse_boot_argn("sweetfb_w", &lw, sizeof(lw)) && lw > 0) {
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 7f90c56..af841c6 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -394,6 +394,12 @@ IOCoreSurfaceRoot::start(IOService *provider)
+ 	}
+ 	sweet_surface_init_lock();
+ 	setProperty(kIOUserClientClassKey, "IOSurfaceRootUserClient");
++	/*
++	 * backboardd finds IOSurfaceRoot with IOServiceNameMatching(), which
++	 * compares the registry entry name, not the class.  Name the node so
++	 * the lookup succeeds; registerService() keeps it.
++	 */
++	setName("IOCoreSurfaceRoot");
+ 	registerService();
+ 	IOLog("SWEET SURF: IOCoreSurfaceRoot registered\n");
+ 	return true;
