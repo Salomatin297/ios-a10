@@ -1,0 +1,1233 @@
+diff --git a/bsd/dev/a10_touch.c b/bsd/dev/a10_touch.c
+index 79f6fca..924b661 100644
+--- a/bsd/dev/a10_touch.c
++++ b/bsd/dev/a10_touch.c
+@@ -8,6 +8,10 @@
+  * pins needs neither and is fast enough for polled touch (one 8-byte
+  * event read is about 1 ms at 100 kHz).
+  *
++ * The controller is powered by tsp_ldo_en on GPG2-1 (3.3 V, active high,
++ * regulator-boot-on in the stock DTS).  The bootloader may have turned it
++ * off, so bring-up power-cycles it and waits for the IC to boot.
++ *
+  * The protocol is the stock Samsung sec_ts one: read register 0x60 for
+  * one 8-byte event, byte 0 == 0 means the queue is empty, byte 7 bits
+  * 5:0 hold the number of further events which are read in one 0x61
+@@ -30,18 +34,29 @@
+ #include <pexpert/pexpert.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+-extern void sweet_hid_touch(int finger, int down, int x, int y);
++/*
++ * Normalised absolute digitizer coordinates: 0..65535 over the panel,
++ * independent of the logical display size chosen by SweetFramebuffer.
++ */
++extern void sweet_hid_touch_abs(int finger, int down, uint32_t nx,
++    uint32_t ny);
+ void a10_touch_init(void);
+ 
+ #define A10_TOUCH_GPIO_PA   0x139b0000u
+ #define A10_TOUCH_GPIO_SIZE 0x1000u
++
++/* Register offsets inside an Exynos pin bank (4-bit CON, 2-bit PUD per pin). */
++#define A10_PIN_CON         0x000u
++#define A10_PIN_DAT         0x004u
++#define A10_PIN_PUD         0x008u
++
++/* Bank offsets inside pinctrl@139B0000 (exynos7885_pin_banks3). */
++#define A10_GPG2_OFF        0x160u
+ #define A10_GPC2_OFF        0x200u
+-#define A10_GPC2_CON        0x000u
+-#define A10_GPC2_DAT        0x004u
+-#define A10_GPC2_PUD        0x008u
+ 
+ #define A10_TOUCH_SDA_PIN   2u
+ #define A10_TOUCH_SCL_PIN   3u
++#define A10_TOUCH_LDO_PIN   1u	/* tsp_ldo_en on GPG2-1, active high, 3.3 V */
+ 
+ #define A10_TOUCH_ADDR      0x48u
+ #define A10_TOUCH_MAX_X     720
+@@ -66,9 +81,13 @@ static vm_offset_t a10_touch_gpio;
+ static int a10_touch_ms = 15;
+ static int a10_touch_debug;
+ static int a10_touch_reset;
++static int a10_touch_half_us = A10_TOUCH_HALF_US;
+ static bool a10_touch_started;
++static bool a10_touch_powered;
+ static int a10_touch_chan;
+ static bool a10_touch_down[A10_TOUCH_FINGERS];
++static int a10_touch_last_x[A10_TOUCH_FINGERS];
++static int a10_touch_last_y[A10_TOUCH_FINGERS];
+ 
+ static uint32_t
+ a10_touch_rd(uint32_t off)
+@@ -101,13 +120,13 @@ a10_touch_wait_ms(unsigned ms)
+ static void
+ a10_touch_delay(void)
+ {
+-	delay(A10_TOUCH_HALF_US);
++	delay((unsigned)a10_touch_half_us);
+ }
+ 
+ static void
+-a10_touch_func(unsigned pin, uint32_t func)
++a10_pin_func(uint32_t bank, unsigned pin, uint32_t func)
+ {
+-	uint32_t off = A10_GPC2_OFF + A10_GPC2_CON;
++	uint32_t off = bank + A10_PIN_CON;
+ 	uint32_t v = a10_touch_rd(off);
+ 	unsigned shift = pin * 4u;
+ 
+@@ -116,9 +135,9 @@ a10_touch_func(unsigned pin, uint32_t func)
+ }
+ 
+ static void
+-a10_touch_pud(unsigned pin, uint32_t pud)
++a10_pin_pud(uint32_t bank, unsigned pin, uint32_t pud)
+ {
+-	uint32_t off = A10_GPC2_OFF + A10_GPC2_PUD;
++	uint32_t off = bank + A10_PIN_PUD;
+ 	uint32_t v = a10_touch_rd(off);
+ 	unsigned shift = pin * 2u;
+ 
+@@ -126,29 +145,74 @@ a10_touch_pud(unsigned pin, uint32_t pud)
+ 	a10_touch_wr(off, v);
+ }
+ 
++/* Drive low (open drain: never drive high). */
++static void
++a10_pin_low(uint32_t bank, unsigned pin)
++{
++	uint32_t off = bank + A10_PIN_DAT;
++	uint32_t v = a10_touch_rd(off) & ~(1u << pin);
++
++	a10_touch_wr(off, v);
++	a10_pin_func(bank, pin, 1); /* function 1 = output */
++}
++
++static uint32_t
++a10_pin_dat(uint32_t bank)
++{
++	return a10_touch_rd(bank + A10_PIN_DAT);
++}
++
+ /* High-Z with the pull-up holding the line high. */
+ static void
+ a10_touch_release(unsigned pin)
+ {
+-	a10_touch_func(pin, 0); /* function 0 = input */
++	a10_pin_func(A10_GPC2_OFF, pin, 0); /* function 0 = input */
+ }
+ 
+ /* Drive low (open drain: never drive high). */
+ static void
+ a10_touch_low(unsigned pin)
+ {
+-	uint32_t off = A10_GPC2_OFF + A10_GPC2_DAT;
+-	uint32_t v = a10_touch_rd(off) & ~(1u << pin);
+-
+-	a10_touch_wr(off, v);
+-	a10_touch_func(pin, 1); /* function 1 = output */
++	a10_pin_low(A10_GPC2_OFF, pin);
+ }
+ 
+ static int
+ a10_touch_sda(void)
+ {
+-	return (int)((a10_touch_rd(A10_GPC2_OFF + A10_GPC2_DAT) >>
+-	    A10_TOUCH_SDA_PIN) & 1u);
++	return (int)((a10_pin_dat(A10_GPC2_OFF) >> A10_TOUCH_SDA_PIN) & 1u);
++}
++
++/* ---- tsp_ldo_en on GPG2-1 ---------------------------------------------- */
++
++static void
++a10_touch_ldo(int on)
++{
++	uint32_t dat = A10_GPG2_OFF + A10_PIN_DAT;
++	uint32_t v = a10_touch_rd(dat);
++	unsigned shift = A10_TOUCH_LDO_PIN;
++
++	/* Set the level while the pin is still an input, then drive it. */
++	if (on) {
++		v |= 1u << shift;
++	} else {
++		v &= ~(1u << shift);
++	}
++	a10_touch_wr(dat, v);
++	a10_pin_pud(A10_GPG2_OFF, shift, 0);
++	a10_pin_func(A10_GPG2_OFF, shift, 1);
++}
++
++static void
++a10_touch_dump_gpio(const char *tag)
++{
++	printf("A10 TOUCH: %s GPG2[CON=%08x DAT=%08x PUD=%08x] "
++	    "GPC2[CON=%08x DAT=%08x PUD=%08x]\n", tag,
++	    a10_touch_rd(A10_GPG2_OFF + A10_PIN_CON),
++	    a10_touch_rd(A10_GPG2_OFF + A10_PIN_DAT),
++	    a10_touch_rd(A10_GPG2_OFF + A10_PIN_PUD),
++	    a10_touch_rd(A10_GPC2_OFF + A10_PIN_CON),
++	    a10_touch_rd(A10_GPC2_OFF + A10_PIN_DAT),
++	    a10_touch_rd(A10_GPC2_OFF + A10_PIN_PUD));
+ }
+ 
+ static void
+@@ -324,6 +388,67 @@ sec_ts_write(uint8_t reg, const uint8_t *data, int len)
+ 	return a10_i2c_write(A10_TOUCH_ADDR, buf, len + 1);
+ }
+ 
++static bool
++a10_touch_id_valid(const uint8_t *id)
++{
++	bool zero = true, ones = true;
++
++	for (int i = 0; i < 5; i++) {
++		if (id[i] != 0x00) {
++			zero = false;
++		}
++		if (id[i] != 0xff) {
++			ones = false;
++		}
++	}
++	return !zero && !ones;
++}
++
++/*
++ * Absolute coordinates are reported as 0..65535 over the physical panel;
++ * SweetHID maps them onto whatever logical display it presents.
++ */
++static void
++a10_touch_report(int finger, int down, int x, int y)
++{
++	uint32_t nx, ny;
++
++	if (down) {
++		a10_touch_last_x[finger] = x;
++		a10_touch_last_y[finger] = y;
++	} else {
++		/* Release events often carry zero; keep the contact point. */
++		x = a10_touch_last_x[finger];
++		y = a10_touch_last_y[finger];
++	}
++	if (x < 0) {
++		x = 0;
++	}
++	if (y < 0) {
++		y = 0;
++	}
++	if (x > A10_TOUCH_MAX_X - 1) {
++		x = A10_TOUCH_MAX_X - 1;
++	}
++	if (y > A10_TOUCH_MAX_Y - 1) {
++		y = A10_TOUCH_MAX_Y - 1;
++	}
++	nx = (uint32_t)(((uint64_t)x * 65535u) / (A10_TOUCH_MAX_X - 1));
++	ny = (uint32_t)(((uint64_t)y * 65535u) / (A10_TOUCH_MAX_Y - 1));
++	sweet_hid_touch_abs(finger, down, nx, ny);
++}
++
++static void
++a10_touch_drop_all(void)
++{
++	for (int i = 0; i < A10_TOUCH_FINGERS; i++) {
++		if (a10_touch_down[i]) {
++			a10_touch_down[i] = false;
++			a10_touch_report(i, 0, 0, 0);
++		}
++	}
++}
++
+ static bool
+ a10_touch_bringup(void)
+ {
+@@ -332,23 +457,37 @@ a10_touch_bringup(void)
+ 	uint8_t ts[4] = { 0, 0, 0, 0 };
+ 	bool ok;
+ 
++	if (!a10_touch_powered) {
++		printf("A10 TOUCH: power-cycling tsp_ldo_en (GPG2-1)\n");
++		a10_touch_ldo(0);
++		a10_touch_wait_ms(30);
++		a10_touch_ldo(1);
++		a10_touch_wait_ms(150);
++		a10_touch_powered = true;
++		a10_touch_dump_gpio("power-on");
++	}
+ 	ok = sec_ts_read(SEC_TS_READ_ID, id, sizeof(id));
++	if (ok && !a10_touch_id_valid(id)) {
++		printf("A10 TOUCH: blank ID %02x %02x %02x %02x %02x\n",
++		    id[0], id[1], id[2], id[3], id[4]);
++		ok = false;
++	}
+ 	if (a10_touch_reset) {
+ 		printf("A10 TOUCH: forcing SW_RESET\n");
+ 		sec_ts_write(SEC_TS_CMD_SW_RESET, NULL, 0);
+-		delay(150 * 1000);
+-		ok = sec_ts_read(SEC_TS_READ_ID, id, sizeof(id));
+-	}
+-	if (!ok && !a10_touch_reset) {
+-		printf("A10 TOUCH: no ACK at 0x%02x, sending SW_RESET\n",
++		a10_touch_wait_ms(150);
++		ok = false;
++	} else if (!ok) {
++		printf("A10 TOUCH: no valid ID at 0x%02x, sending SW_RESET\n",
+ 		    A10_TOUCH_ADDR);
+ 		sec_ts_write(SEC_TS_CMD_SW_RESET, NULL, 0);
+-		delay(150 * 1000);
+-		for (int i = 0; i < 10 && !ok; i++) {
+-			ok = sec_ts_read(SEC_TS_READ_ID, id, sizeof(id));
+-			if (!ok) {
+-				delay(50 * 1000);
+-			}
++		a10_touch_wait_ms(150);
++	}
++	for (int i = 0; i < 20 && !ok; i++) {
++		ok = sec_ts_read(SEC_TS_READ_ID, id, sizeof(id)) &&
++		    a10_touch_id_valid(id);
++		if (!ok) {
++			a10_touch_wait_ms(50);
+ 		}
+ 	}
+ 	if (!ok) {
+@@ -358,12 +497,7 @@ a10_touch_bringup(void)
+ 	printf("A10 TOUCH: ID %02x %02x %02x %02x %02x\n",
+ 	    id[0], id[1], id[2], id[3], id[4]);
+ 	/* A reset or a lost byte drops any contact that was held. */
+-	for (int i = 0; i < A10_TOUCH_FINGERS; i++) {
+-		if (a10_touch_down[i]) {
+-			a10_touch_down[i] = false;
+-			sweet_hid_touch(i, 0, 0, 0);
+-		}
+-	}
++	a10_touch_drop_all();
+ 	if (sec_ts_read(SEC_TS_READ_BOOT_STATUS, &boot, 1)) {
+ 		printf("A10 TOUCH: boot status %02x\n", boot);
+ 	}
+@@ -372,9 +506,13 @@ a10_touch_bringup(void)
+ 		    ts[0], ts[1], ts[2], ts[3]);
+ 	}
+ 	/* Drop anything stale and turn the sense channel on. */
+-	sec_ts_write(SEC_TS_CMD_CLEAR_EVENT, NULL, 0);
+-	sec_ts_write(SEC_TS_CMD_SENSE_ON, NULL, 0);
+-	delay(30 * 1000);
++	if (!sec_ts_write(SEC_TS_CMD_CLEAR_EVENT, NULL, 0)) {
++		printf("A10 TOUCH: clear-event NAK\n");
++	}
++	if (!sec_ts_write(SEC_TS_CMD_SENSE_ON, NULL, 0)) {
++		printf("A10 TOUCH: sense-on NAK\n");
++	}
++	a10_touch_wait_ms(30);
+ 	sec_ts_write(SEC_TS_CMD_CLEAR_EVENT, NULL, 0);
+ 	return true;
+ }
+@@ -406,20 +544,14 @@ a10_touch_event(const uint8_t *e, unsigned *events)
+ 		}
+ 		int finger = tid - 1;
+ 		if (action == 1 || action == 2) {
+-			if (x >= A10_TOUCH_MAX_X) {
+-				x = A10_TOUCH_MAX_X - 1;
+-			}
+-			if (y >= A10_TOUCH_MAX_Y) {
+-				y = A10_TOUCH_MAX_Y - 1;
+-			}
+ 			a10_touch_down[finger] = true;
+-			sweet_hid_touch(finger, 1, x, y);
++			a10_touch_report(finger, 1, x, y);
+ 		} else if (action == 3) {
+ 			if (!a10_touch_down[finger]) {
+ 				return;
+ 			}
+ 			a10_touch_down[finger] = false;
+-			sweet_hid_touch(finger, 0, x, y);
++			a10_touch_report(finger, 0, x, y);
+ 		}
+ 		return;
+ 	}
+@@ -452,12 +584,7 @@ a10_touch_poll(unsigned *events, unsigned *errors)
+ 	if (left > A10_TOUCH_MAX_EVENTS - 1) {
+ 		printf("A10 TOUCH: event queue overflow (%d)\n", left);
+ 		sec_ts_write(SEC_TS_CMD_CLEAR_EVENT, NULL, 0);
+-		for (int i = 0; i < A10_TOUCH_FINGERS; i++) {
+-			if (a10_touch_down[i]) {
+-				a10_touch_down[i] = false;
+-				sweet_hid_touch(i, 0, 0, 0);
+-			}
+-		}
++		a10_touch_drop_all();
+ 		return true;
+ 	}
+ 	a10_touch_event(e, events);
+@@ -484,8 +611,8 @@ a10_touch_thread(void *arg, wait_result_t result)
+ 
+ 	(void)arg;
+ 	(void)result;
+-	printf("A10 TOUCH: polling GPC2-2/3 at 0x%02x every %d ms\n",
+-	    A10_TOUCH_ADDR, a10_touch_ms);
++	printf("A10 TOUCH: polling GPC2-2/3 at 0x%02x every %d ms, half-us %d\n",
++	    A10_TOUCH_ADDR, a10_touch_ms, a10_touch_half_us);
+ 	for (;;) {
+ 		if (!up) {
+ 			up = a10_touch_bringup();
+@@ -532,6 +659,8 @@ a10_touch_init(void)
+ 	    sizeof(a10_touch_debug));
+ 	(void)PE_parse_boot_argn("a10touch_reset", &a10_touch_reset,
+ 	    sizeof(a10_touch_reset));
++	(void)PE_parse_boot_argn("a10touch_half_us", &a10_touch_half_us,
++	    sizeof(a10_touch_half_us));
+ 	if (!enabled) {
+ 		printf("A10 TOUCH: disabled (a10touch=0)\n");
+ 		return;
+@@ -539,6 +668,9 @@ a10_touch_init(void)
+ 	if (a10_touch_ms < 5 || a10_touch_ms > 1000) {
+ 		a10_touch_ms = 15;
+ 	}
++	if (a10_touch_half_us < 1 || a10_touch_half_us > 200) {
++		a10_touch_half_us = A10_TOUCH_HALF_US;
++	}
+ 	a10_touch_gpio = ml_io_map(A10_TOUCH_GPIO_PA, A10_TOUCH_GPIO_SIZE);
+ 	if (a10_touch_gpio == 0) {
+ 		printf("A10 TOUCH: pinctrl MMIO mapping failed\n");
+@@ -547,12 +679,10 @@ a10_touch_init(void)
+ 	/* Idle-high open drain with internal pull-ups; the board has its own. */
+ 	a10_touch_release(A10_TOUCH_SDA_PIN);
+ 	a10_touch_release(A10_TOUCH_SCL_PIN);
+-	a10_touch_pud(A10_TOUCH_SDA_PIN, 2);
+-	a10_touch_pud(A10_TOUCH_SCL_PIN, 2);
++	a10_pin_pud(A10_GPC2_OFF, A10_TOUCH_SDA_PIN, 3);
++	a10_pin_pud(A10_GPC2_OFF, A10_TOUCH_SCL_PIN, 3);
+ 	a10_touch_recover();
+-	printf("A10 TOUCH: GPC2 CON=%08x DAT=%08x\n",
+-	    a10_touch_rd(A10_GPC2_OFF + A10_GPC2_CON),
+-	    a10_touch_rd(A10_GPC2_OFF + A10_GPC2_DAT));
++	a10_touch_dump_gpio("init");
+ 
+ 	kr = kernel_thread_start(a10_touch_thread, NULL, &thread);
+ 	if (kr == KERN_SUCCESS) {
+diff --git a/bsd/dev/a10_battery.c b/bsd/dev/a10_battery.c
+index 01096e8..84fc67e 100644
+--- a/bsd/dev/a10_battery.c
++++ b/bsd/dev/a10_battery.c
+@@ -1,15 +1,18 @@
+ /*
+- * A10 (Exynos 7884B) S2MU005 fuel gauge and charger status.
++ * A10 (Exynos 7884B): S2MU005 fuel gauge, S2MU005 charger status and
++ * LM3632 backlight.
+  *
+- * Read-only bring-up: the bootloader already initialised the PMIC and the
+- * gauge is normally running.  We only issue register reads; no charger,
+- * gauge or PMIC configuration is changed.  Percent is taken from the
+- * gauge's RSOC register when it is plausible and otherwise derived from
+- * VBAT with the same generic curve as SweetBattery.
++ * The bootloader initialises the PMIC, but a warm reboot into XNU leaves
++ * the three S3C I2C blocks gated and at their reset divider, and it may
++ * leave the touch/backlight rails off.  This driver therefore brings the
++ * blocks up itself: it opens the PERI Q-channel gates, muxes gpp1/gpp4 to
++ * I2C, probes the divider that the actual I2C clock needs and then talks
++ * to the devices with the same byte sequence Linux uses (interrupt
++ * pending flag held across a repeated START, released after arming it).
+  *
+- * The two I2C buses are the Samsung s3c2440-style controllers.  They are
+- * polled with interrupts disabled, so this file must only be called from
+- * one thread (SweetBattery's work loop).
++ * The gauge is optional: the charger and the backlight still work when
++ * the gauge does not answer, and the caller gets a 4200 mV / 100% static
++ * battery instead of an error.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -21,45 +24,91 @@
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ 
+-#define A10_I2C3_PA       0x13830000u
+-#define A10_I2C4_PA       0x13840000u
+-#define A10_I2C_SIZE      0x100u
+-
+-#define A10_FG_ADDR       0x3bu
+-#define A10_CHG_ADDR      0x3du
+-
+-#define A10_FG_RVBAT      0x04u
+-#define A10_FG_RCUR_CC    0x06u
+-#define A10_FG_RSOC       0x08u
+-#define A10_CHG_STATUS0   0x08u
+-
+-#define S3C_IICCON        0x00u
+-#define S3C_IICSTAT       0x04u
+-#define S3C_IICDS         0x0cu
+-
+-#define IICCON_ACKEN      (1u << 7)
+-#define IICCON_TXDIV512   (1u << 6)
+-#define IICCON_IRQEN      (1u << 5)
+-#define IICCON_IRQPEND    (1u << 4)
+-#define IICCON_SCALEMASK  0x0fu
+-
+-#define IICSTAT_MASTER_RX (2u << 6)
+-#define IICSTAT_MASTER_TX (3u << 6)
+-#define IICSTAT_START     (1u << 5)
+-#define IICSTAT_BUSY      (1u << 5)
+-#define IICSTAT_TXRXEN    (1u << 4)
+-#define IICSTAT_LASTBIT   (1u << 0)
+-
+-#define A10_I2C_TIMEOUT_MS 100
+-
++/* PERI SFR block: CMU_PERI gate and Q-channel registers. */
++#define A10_PERI_PA         0x10010000u
++#define A10_PERI_SIZE       0x8000u
++#define A10_PERI_GATE(idx)  (0x2038u + 4u * (idx))  /* I2C PCLK gate */
++#define A10_PERI_QCH(idx)   (0x3018u + 4u * (idx))  /* Q-channel */
++#define A10_GATE_MANUAL     (1u << 20)
++#define A10_GATE_CG_VAL     (1u << 21)
++#define A10_QCH_ENABLE      (1u << 0)
++#define A10_QCH_REQ         (1u << 1)
++
++/* pinctrl@139B0000: gpp1 carries I2C0/I2C1, gpp4 carries I2C4. */
++#define A10_PCTRL_PA        0x139b0000u
++#define A10_PCTRL_SIZE      0x1000u
++#define A10_GPP1_OFF        0x040u
++#define A10_GPP4_OFF        0x0a0u
++#define A10_PIN_CON         0x000u
++#define A10_PIN_DAT         0x004u
++#define A10_PIN_PUD         0x008u
++#define A10_PIN_FUNC_I2C    2u
++#define A10_PIN_PUD_UP      3u
++
++#define A10_I2C0_PA         0x13830000u	/* gauge */
++#define A10_I2C1_PA         0x13840000u	/* S2MU005 charger */
++#define A10_I2C4_PA         0x13870000u	/* LM3632 backlight */
++#define A10_I2C_SIZE        0x100u
++
++#define A10_FG_ADDR         0x3bu
++#define A10_CHG_ADDR        0x3du
++#define A10_BL_ADDR         0x11u
++
++#define A10_FG_RVBAT        0x04u
++#define A10_FG_RCUR_CC      0x06u
++#define A10_FG_RSOC         0x08u
++#define A10_CHG_STATUS0     0x08u
++
++#define S3C_IICCON          0x00u
++#define S3C_IICSTAT         0x04u
++#define S3C_IICDS           0x0cu
++
++#define IICCON_ACKEN        (1u << 7)
++#define IICCON_TXDIV512     (1u << 6)
++#define IICCON_IRQEN        (1u << 5)
++#define IICCON_IRQPEND      (1u << 4)
++#define IICCON_SCALEMASK    0x0fu
++
++#define IICSTAT_MASTER_RX   (2u << 6)
++#define IICSTAT_MASTER_TX   (3u << 6)
++#define IICSTAT_START       (1u << 5)	/* also the busy flag */
++#define IICSTAT_TXRXEN      (1u << 4)
++#define IICSTAT_LASTBIT     (1u << 0)	/* 0 = ACK, 1 = NAK */
++
++/* One byte is < 1 ms at any divider we try; 20 ms is very conservative. */
++#define A10_I2C_TIMEOUT_MS  20
++
++/* LM3632 register/value pairs from the stock panel data. */
++static const uint8_t a10_lm3632_init[] = {
++	0x09, 0x41,
++	0x02, 0x50,
++	0x03, 0x8d,
++	0x04, 0x07,
++	0x05, 0xff,
++	0x0a, 0x19,
++	0x0d, 0x1c,
++	0x0e, 0x1e,
++	0x0f, 0x1e,
++	0x0c, 0x1f,
++	0x11, 0x0d,
++};
++
++static vm_offset_t a10_peri;
++static vm_offset_t a10_pctrl;
+ static vm_offset_t a10_i2c_fg;
+ static vm_offset_t a10_i2c_chg;
++static vm_offset_t a10_i2c_bl;
+ static bool a10_battery_ready;
++static bool a10_gauge_ok;
++static bool a10_charger_ok;
++static bool a10_backlight_ready;
++static bool a10_backlight_on = true;
+ 
+ static uint32_t
+ a10_i2c_rd(vm_offset_t base, uint32_t off)
+ {
+ 	uint32_t v = *(volatile uint32_t *)(base + off);
++
+ 	__asm__ volatile("dmb oshld" ::: "memory");
+ 	return v;
+ }
+@@ -72,60 +121,163 @@ a10_i2c_wr(vm_offset_t base, uint32_t off, uint32_t val)
+ 	__asm__ volatile("dsb osh" ::: "memory");
+ }
+ 
++static void
++a10_pin_func(vm_offset_t gpio, uint32_t bank, unsigned pin, uint32_t func)
++{
++	uint32_t off = bank + A10_PIN_CON;
++	uint32_t v = a10_i2c_rd(gpio, off);
++	unsigned shift = pin * 4u;
++
++	v = (v & ~(0xfu << shift)) | ((func & 0xfu) << shift);
++	a10_i2c_wr(gpio, off, v);
++}
++
++static void
++a10_pin_pud(vm_offset_t gpio, uint32_t bank, unsigned pin, uint32_t pud)
++{
++	uint32_t off = bank + A10_PIN_PUD;
++	uint32_t v = a10_i2c_rd(gpio, off);
++	unsigned shift = pin * 2u;
++
++	v = (v & ~(0x3u << shift)) | ((pud & 0x3u) << shift);
++	a10_i2c_wr(gpio, off, v);
++}
++
++/*
++ * Open the clock gates and mux the pins.  idx is the I2C instance number
++ * (0, 1 or 4), which is also the layout of the PERI gate/QCH registers.
++ * The manual/cg-value bits force the PCLK on; the QCH enable bit forces
++ * the automatic clock gating unit to keep the block clocked.
++ */
++static void
++a10_i2c_ungate(unsigned idx, const char *name)
++{
++	uint32_t off;
++	uint32_t before, after;
++
++	if (a10_peri != 0) {
++		off = A10_PERI_QCH(idx);
++		before = a10_i2c_rd(a10_peri, off);
++		after = before | A10_QCH_ENABLE | A10_QCH_REQ;
++		a10_i2c_wr(a10_peri, off, after);
++		printf("A10 BATTERY: i2c%u %s qch %08x -> %08x\n", idx, name,
++		    before, a10_i2c_rd(a10_peri, off));
++
++		off = A10_PERI_GATE(idx);
++		before = a10_i2c_rd(a10_peri, off);
++		after = before | A10_GATE_MANUAL | A10_GATE_CG_VAL;
++		a10_i2c_wr(a10_peri, off, after);
++		printf("A10 BATTERY: i2c%u %s gate %08x -> %08x\n", idx, name,
++		    before, a10_i2c_rd(a10_peri, off));
++	}
++
++	if (a10_pctrl != 0) {
++		if (idx == 0) {
++			a10_pin_pud(a10_pctrl, A10_GPP1_OFF, 0, A10_PIN_PUD_UP);
++			a10_pin_pud(a10_pctrl, A10_GPP1_OFF, 1, A10_PIN_PUD_UP);
++			a10_pin_func(a10_pctrl, A10_GPP1_OFF, 0, A10_PIN_FUNC_I2C);
++			a10_pin_func(a10_pctrl, A10_GPP1_OFF, 1, A10_PIN_FUNC_I2C);
++		} else if (idx == 1) {
++			a10_pin_pud(a10_pctrl, A10_GPP1_OFF, 2, A10_PIN_PUD_UP);
++			a10_pin_pud(a10_pctrl, A10_GPP1_OFF, 3, A10_PIN_PUD_UP);
++			a10_pin_func(a10_pctrl, A10_GPP1_OFF, 2, A10_PIN_FUNC_I2C);
++			a10_pin_func(a10_pctrl, A10_GPP1_OFF, 3, A10_PIN_FUNC_I2C);
++		} else if (idx == 4) {
++			a10_pin_pud(a10_pctrl, A10_GPP4_OFF, 0, A10_PIN_PUD_UP);
++			a10_pin_pud(a10_pctrl, A10_GPP4_OFF, 1, A10_PIN_PUD_UP);
++			a10_pin_func(a10_pctrl, A10_GPP4_OFF, 0, A10_PIN_FUNC_I2C);
++			a10_pin_func(a10_pctrl, A10_GPP4_OFF, 1, A10_PIN_FUNC_I2C);
++		}
++	}
++}
++
+ static int
+-a10_i2c_wait(vm_offset_t base, uint32_t off, uint32_t mask, bool set)
++a10_i2c_wait_bit(vm_offset_t base, uint32_t off, uint32_t mask, bool set,
++    unsigned timeout_ms)
+ {
+-	for (unsigned i = 0; i < A10_I2C_TIMEOUT_MS; ++i) {
++	unsigned loops = timeout_ms * 100u;	/* delay(10) is 10 us */
++
++	for (unsigned i = 0; i < loops; i++) {
+ 		if (((a10_i2c_rd(base, off) & mask) != 0) == set) {
+ 			return 0;
+ 		}
+-		delay(1);
++		delay(10);
+ 	}
+ 	return ETIMEDOUT;
+ }
+ 
++/*
++ * STOP and then park the block like s3c24xx_i2c_disable_bus(): TXRXEN,
++ * IRQEN, ACKEN and IRQPEND are cleared, the divider bits stay.
++ */
+ static void
+ a10_i2c_stop(vm_offset_t base)
+ {
+ 	uint32_t stat = a10_i2c_rd(base, S3C_IICSTAT);
+-	uint32_t con = a10_i2c_rd(base, S3C_IICCON);
++	uint32_t con;
+ 
+ 	a10_i2c_wr(base, S3C_IICSTAT, stat & ~IICSTAT_START);
++	con = a10_i2c_rd(base, S3C_IICCON);
++	a10_i2c_wr(base, S3C_IICCON, con & ~IICCON_IRQPEND);
++	(void)a10_i2c_wait_bit(base, S3C_IICSTAT, IICSTAT_START, false,
++	    A10_I2C_TIMEOUT_MS);
++
++	stat = a10_i2c_rd(base, S3C_IICSTAT);
++	a10_i2c_wr(base, S3C_IICSTAT, stat & ~IICSTAT_TXRXEN);
++	con = a10_i2c_rd(base, S3C_IICCON);
++	a10_i2c_wr(base, S3C_IICCON,
++	    con & ~(IICCON_IRQEN | IICCON_IRQPEND | IICCON_ACKEN));
++}
++
++static void
++a10_i2c_clear_pending(vm_offset_t base)
++{
++	uint32_t con = a10_i2c_rd(base, S3C_IICCON);
++
+ 	a10_i2c_wr(base, S3C_IICCON, con & ~IICCON_IRQPEND);
+-	(void)a10_i2c_wait(base, S3C_IICSTAT, IICSTAT_BUSY, false);
+ }
+ 
++static void
++a10_i2c_disable_ack(vm_offset_t base)
++{
++	uint32_t con = a10_i2c_rd(base, S3C_IICCON);
++
++	a10_i2c_wr(base, S3C_IICCON, con & ~IICCON_ACKEN);
++}
++
++/*
++ * START or repeated START.  On a repeated START the pending flag is held
++ * until the START bit is armed; releasing it before that would make the
++ * controller emit a STOP instead.
++ */
+ static int
+ a10_i2c_start(vm_offset_t base, uint8_t addr, bool read, bool repeated)
+ {
+-	uint32_t con;
+-	uint32_t stat;
++	uint32_t con = a10_i2c_rd(base, S3C_IICCON);
++	uint32_t stat = IICSTAT_TXRXEN |
++	    (read ? IICSTAT_MASTER_RX : IICSTAT_MASTER_TX);
+ 	uint8_t byte = (uint8_t)((addr << 1) | (read ? 1u : 0u));
+ 
+-	if (!repeated && a10_i2c_wait(base, S3C_IICSTAT, IICSTAT_BUSY, false) != 0) {
+-		return EBUSY;
+-	}
+-	con = a10_i2c_rd(base, S3C_IICCON);
+-	con &= ~IICCON_IRQEN;
+ 	if (!repeated) {
+-		/* Idle bus: drop a stale pending bit before the first START. */
++		if (a10_i2c_wait_bit(base, S3C_IICSTAT, IICSTAT_START, false,
++		    A10_I2C_TIMEOUT_MS) != 0) {
++			return EBUSY;
++		}
+ 		con &= ~IICCON_IRQPEND;
+ 	}
+-	con |= IICCON_ACKEN;
+-	a10_i2c_wr(base, S3C_IICCON, con);
++	con |= IICCON_ACKEN | IICCON_IRQEN;
+ 
+-	stat = IICSTAT_TXRXEN | (read ? IICSTAT_MASTER_RX : IICSTAT_MASTER_TX);
+ 	a10_i2c_wr(base, S3C_IICSTAT, stat);
+ 	a10_i2c_wr(base, S3C_IICDS, byte);
+-	delay(1);
++	delay(2);	/* data setup before START */
+ 	a10_i2c_wr(base, S3C_IICCON, con);
+ 	a10_i2c_wr(base, S3C_IICSTAT, stat | IICSTAT_START);
+ 	if (repeated) {
+-		/* Release the pending bit now that the START is armed. */
+ 		a10_i2c_wr(base, S3C_IICCON, con & ~IICCON_IRQPEND);
+ 	}
+ 
+-	if (a10_i2c_wait(base, S3C_IICCON, IICCON_IRQPEND, true) != 0) {
++	if (a10_i2c_wait_bit(base, S3C_IICCON, IICCON_IRQPEND, true,
++	    A10_I2C_TIMEOUT_MS) != 0) {
+ 		a10_i2c_stop(base);
+ 		return ETIMEDOUT;
+ 	}
+@@ -133,34 +285,23 @@ a10_i2c_start(vm_offset_t base, uint8_t addr, bool read, bool repeated)
+ 		a10_i2c_stop(base);
+ 		return ENXIO;
+ 	}
+-	con = a10_i2c_rd(base, S3C_IICCON);
+-	a10_i2c_wr(base, S3C_IICCON, con & ~IICCON_IRQPEND);
+ 	return 0;
+ }
+ 
+-/*
+- * keep_pending leaves the interrupt-pending bit set for the last byte of the
+- * write phase: the s3c2440 needs it held until the repeated START is armed,
+- * otherwise writing IICSTAT without START first generates a STOP.
+- */
++/* One write byte; leaves IRQPEND set for the caller's next phase. */
+ static int
+-a10_i2c_write(vm_offset_t base, uint8_t byte, bool keep_pending)
++a10_i2c_write_byte(vm_offset_t base, uint8_t byte)
+ {
+-	uint32_t con;
+-
+ 	a10_i2c_wr(base, S3C_IICDS, byte);
+-	if (a10_i2c_wait(base, S3C_IICCON, IICCON_IRQPEND, true) != 0) {
+-		a10_i2c_stop(base);
++	delay(2);
++	a10_i2c_clear_pending(base);
++	if (a10_i2c_wait_bit(base, S3C_IICCON, IICCON_IRQPEND, true,
++	    A10_I2C_TIMEOUT_MS) != 0) {
+ 		return ETIMEDOUT;
+ 	}
+ 	if (a10_i2c_rd(base, S3C_IICSTAT) & IICSTAT_LASTBIT) {
+-		a10_i2c_stop(base);
+ 		return ENXIO;
+ 	}
+-	if (!keep_pending) {
+-		con = a10_i2c_rd(base, S3C_IICCON);
+-		a10_i2c_wr(base, S3C_IICCON, con & ~IICCON_IRQPEND);
+-	}
+ 	return 0;
+ }
+ 
+@@ -178,27 +319,56 @@ a10_i2c_read_reg(vm_offset_t base, uint8_t addr, uint8_t reg, uint8_t *buf,
+ 	if (error != 0) {
+ 		return error;
+ 	}
+-	error = a10_i2c_write(base, reg, true);
++	error = a10_i2c_write_byte(base, reg);
+ 	if (error != 0) {
++		a10_i2c_stop(base);
+ 		return error;
+ 	}
+ 	error = a10_i2c_start(base, addr, true, true);
+ 	if (error != 0) {
+-		return error;
++		return error;	/* start() already stopped the bus */
+ 	}
+-	for (unsigned i = 0; i < len; ++i) {
+-		uint32_t con;
++	for (unsigned i = 0; i < len; i++) {
+ 		if (i == len - 1) {
+-			con = a10_i2c_rd(base, S3C_IICCON);
+-			a10_i2c_wr(base, S3C_IICCON, con & ~IICCON_ACKEN);
++			a10_i2c_disable_ack(base);
+ 		}
+-		if (a10_i2c_wait(base, S3C_IICCON, IICCON_IRQPEND, true) != 0) {
++		a10_i2c_clear_pending(base);
++		if (a10_i2c_wait_bit(base, S3C_IICCON, IICCON_IRQPEND, true,
++		    A10_I2C_TIMEOUT_MS) != 0) {
+ 			a10_i2c_stop(base);
+ 			return ETIMEDOUT;
+ 		}
+ 		buf[i] = (uint8_t)a10_i2c_rd(base, S3C_IICDS);
+-		con = a10_i2c_rd(base, S3C_IICCON);
+-		a10_i2c_wr(base, S3C_IICCON, con & ~IICCON_IRQPEND);
++	}
++	a10_i2c_stop(base);
++	return 0;
++}
++
++/* Write a register (or a register and N bytes). */
++static int
++a10_i2c_write_reg(vm_offset_t base, uint8_t addr, uint8_t reg,
++    const uint8_t *buf, unsigned len)
++{
++	int error;
++
++	if (base == 0) {
++		return EINVAL;
++	}
++	error = a10_i2c_start(base, addr, false, false);
++	if (error != 0) {
++		return error;
++	}
++	error = a10_i2c_write_byte(base, reg);
++	if (error != 0) {
++		a10_i2c_stop(base);
++		return error;
++	}
++	for (unsigned i = 0; i < len; i++) {
++		error = a10_i2c_write_byte(base, buf[i]);
++		if (error != 0) {
++			a10_i2c_stop(base);
++			return error;
++		}
+ 	}
+ 	a10_i2c_stop(base);
+ 	return 0;
+@@ -216,6 +386,87 @@ a10_i2c_read_u16(vm_offset_t base, uint8_t addr, uint8_t reg, uint16_t *value)
+ 	return error;
+ }
+ 
++/* An address-only transfer: verifies that the slave ACKs its address. */
++static int
++a10_i2c_ping(vm_offset_t base, uint8_t addr)
++{
++	int error = a10_i2c_start(base, addr, false, false);
++
++	if (error == 0) {
++		a10_i2c_stop(base);
++	}
++	return error;
++}
++
++/*
++ * The I2C input clock comes from the PERI bus mux and is not documented
++ * here.  Try the dividers that fit the common Exynos rates (66.5, 100,
++ * 133 and 200 MHz) and, if none ACKs, sweep every divider.
++ */
++static bool
++a10_i2c_probe_config(vm_offset_t base, uint8_t addr, const char *name)
++{
++	static const uint32_t candidates[] = {
++		IICCON_ACKEN | IICCON_IRQEN | IICCON_TXDIV512 | 0x0,
++		IICCON_ACKEN | IICCON_IRQEN | 0xa,
++		IICCON_ACKEN | IICCON_IRQEN | 0xf,
++		IICCON_ACKEN | IICCON_IRQEN | IICCON_TXDIV512 | 0xf,
++	};
++	uint32_t con;
++
++	for (unsigned i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
++		a10_i2c_wr(base, S3C_IICSTAT, 0);
++		a10_i2c_wr(base, S3C_IICCON, candidates[i]);
++		delay(50);
++		if (a10_i2c_ping(base, addr) == 0) {
++			printf("A10 BATTERY: %s divider %u/%s\n", name,
++			    (candidates[i] & IICCON_SCALEMASK) + 1u,
++			    (candidates[i] & IICCON_TXDIV512) ? "512" : "16");
++			return true;
++		}
++	}
++	for (unsigned div1 = 0; div1 < 2; div1++) {
++		for (unsigned scale = 0; scale < 16; scale++) {
++			con = IICCON_ACKEN | IICCON_IRQEN | scale;
++			if (div1) {
++				con |= IICCON_TXDIV512;
++			}
++			a10_i2c_wr(base, S3C_IICSTAT, 0);
++			a10_i2c_wr(base, S3C_IICCON, con);
++			delay(50);
++			if (a10_i2c_ping(base, addr) == 0) {
++				printf("A10 BATTERY: %s divider %u/%s "
++				    "(sweep)\n", name, scale + 1u,
++				    div1 ? "512" : "16");
++				return true;
++			}
++		}
++	}
++	return false;
++}
++
++static bool
++a10_i2c_bus_init(unsigned idx, vm_offset_t base, uint8_t addr,
++    const char *name)
++{
++	bool ok;
++
++	if (base == 0) {
++		printf("A10 BATTERY: i2c%u %s MMIO mapping failed\n", idx, name);
++		return false;
++	}
++	a10_i2c_ungate(idx, name);
++	a10_i2c_wr(base, S3C_IICSTAT, 0);
++	a10_i2c_wr(base, S3C_IICCON, 0);
++	delay(100);
++
++	ok = a10_i2c_probe_config(base, addr, name);
++	printf("A10 BATTERY: i2c%u %s at 0x%02x %s, con=%08x stat=%08x\n",
++	    idx, name, addr, ok ? "acked" : "did not respond",
++	    a10_i2c_rd(base, S3C_IICCON), a10_i2c_rd(base, S3C_IICSTAT));
++	return ok;
++}
++
+ static unsigned
+ a10_battery_percent_from_mv(unsigned mv)
+ {
+@@ -235,30 +486,115 @@ a10_battery_percent_from_mv(unsigned mv)
+ 	return 100;
+ }
+ 
++/* ---- LM3632 backlight -------------------------------------------------- */
++
++static bool
++a10_backlight_bus_init(void)
++{
++	if (a10_i2c_bl == 0) {
++		a10_i2c_bl = ml_io_map(A10_I2C4_PA, A10_I2C_SIZE);
++	}
++	if (a10_i2c_bl == 0) {
++		printf("A10 BATTERY: i2c4 backlight MMIO mapping failed\n");
++		return false;
++	}
++	/* a10_backlight_set() may run before SweetBattery starts. */
++	if (a10_peri == 0) {
++		a10_peri = ml_io_map(A10_PERI_PA, A10_PERI_SIZE);
++	}
++	if (a10_pctrl == 0) {
++		a10_pctrl = ml_io_map(A10_PCTRL_PA, A10_PCTRL_SIZE);
++	}
++	return a10_i2c_bus_init(4, a10_i2c_bl, A10_BL_ADDR, "backlight");
++}
++
++int
++a10_backlight_init(void)
++{
++	uint8_t value;
++
++	if (a10_backlight_ready) {
++		return 0;
++	}
++	if (!a10_backlight_bus_init()) {
++		return ENXIO;
++	}
++	for (unsigned i = 0; i < sizeof(a10_lm3632_init); i += 2) {
++		value = a10_lm3632_init[i + 1];
++		(void)a10_i2c_write_reg(a10_i2c_bl, A10_BL_ADDR,
++		    a10_lm3632_init[i], &value, 1);
++	}
++	a10_backlight_ready = true;
++	a10_backlight_on = true;
++	printf("A10 BATTERY: LM3632 initialised\n");
++	return 0;
++}
++
++void
++a10_backlight_set(int on)
++{
++	uint8_t value;
++
++	on = on ? 1 : 0;
++	if (a10_backlight_ready && on == a10_backlight_on) {
++		return;
++	}
++	if (!a10_backlight_ready && a10_backlight_init() != 0) {
++		return;
++	}
++	if (on) {
++		value = 0x07;
++		(void)a10_i2c_write_reg(a10_i2c_bl, A10_BL_ADDR, 0x04, &value, 1);
++		value = 0xff;
++		(void)a10_i2c_write_reg(a10_i2c_bl, A10_BL_ADDR, 0x05, &value, 1);
++	} else {
++		value = 0x00;
++		(void)a10_i2c_write_reg(a10_i2c_bl, A10_BL_ADDR, 0x05, &value, 1);
++	}
++	a10_backlight_on = on;
++	printf("A10 BATTERY: backlight %s\n", on ? "on" : "off");
++}
++
++/* ---- battery ----------------------------------------------------------- */
++
+ int
+ a10_battery_init(void)
+ {
+ 	if (a10_battery_ready) {
+ 		return 0;
+ 	}
+-	a10_i2c_fg = ml_io_map(A10_I2C3_PA, A10_I2C_SIZE);
+-	a10_i2c_chg = ml_io_map(A10_I2C4_PA, A10_I2C_SIZE);
+-	if (a10_i2c_fg == 0) {
+-		printf("A10 BATTERY: i2c3 MMIO mapping failed\n");
+-		return ENXIO;
++	a10_peri = ml_io_map(A10_PERI_PA, A10_PERI_SIZE);
++	a10_pctrl = ml_io_map(A10_PCTRL_PA, A10_PCTRL_SIZE);
++	a10_i2c_fg = ml_io_map(A10_I2C0_PA, A10_I2C_SIZE);
++	a10_i2c_chg = ml_io_map(A10_I2C1_PA, A10_I2C_SIZE);
++	if (a10_peri == 0) {
++		printf("A10 BATTERY: PERI SFR mapping failed, gates untouched\n");
+ 	}
+-	printf("A10 BATTERY: i2c3 con=%08x stat=%08x%s\n",
+-	    a10_i2c_rd(a10_i2c_fg, S3C_IICCON),
+-	    a10_i2c_rd(a10_i2c_fg, S3C_IICSTAT),
+-	    a10_i2c_chg ? "" : " (i2c4 unavailable)");
+-	/* Probe the gauge without changing any configuration. */
+-	uint16_t mv;
+-	if (a10_i2c_read_u16(a10_i2c_fg, A10_FG_ADDR, A10_FG_RVBAT, &mv) != 0) {
+-		printf("A10 BATTERY: S2MU005 gauge did not respond\n");
+-		return ENXIO;
++	if (a10_pctrl == 0) {
++		printf("A10 BATTERY: pinctrl mapping failed, pins untouched\n");
+ 	}
++
++	a10_gauge_ok = a10_i2c_bus_init(0, a10_i2c_fg, A10_FG_ADDR, "gauge");
++	a10_charger_ok = a10_i2c_bus_init(1, a10_i2c_chg, A10_CHG_ADDR,
++	    "charger");
++
++	/*
++	 * The charger is enough to report external power; a missing gauge
++	 * only means the percentage is the generic 4200 mV fallback.
++	 */
+ 	a10_battery_ready = true;
+-	printf("A10 BATTERY: S2MU005 gauge online, raw VBAT=%#x\n", mv);
++	(void)a10_backlight_init();
++	printf("A10 BATTERY: gauge %s, charger %s\n",
++	    a10_gauge_ok ? "online" : "absent",
++	    a10_charger_ok ? "online" : "absent");
++	if (!a10_gauge_ok && a10_charger_ok) {
++		uint8_t st = 0;
++
++		if (a10_i2c_read_reg(a10_i2c_chg, A10_CHG_ADDR,
++		    A10_CHG_STATUS0, &st, 1) == 0) {
++			printf("A10 BATTERY: charger status0=%02x\n", st);
++		}
++	}
+ 	return 0;
+ }
+ 
+@@ -266,46 +602,54 @@ int
+ a10_battery_read(unsigned *percent, unsigned *mv, int *ma, bool *external,
+     bool *charging, bool *full)
+ {
+-	uint16_t rawVoltage;
++	uint16_t rawVoltage = 0;
+ 	uint16_t rawSoc = 0;
+ 	uint16_t rawCurrent = 0;
+ 	uint8_t chgStatus = 0;
++	bool voltageValid = false;
+ 	bool socValid = false;
+ 	bool currentValid = false;
+ 	bool chargerValid = false;
++	unsigned voltage = 4200;
++	unsigned soc;
+ 
+ 	if (!a10_battery_ready || percent == NULL || mv == NULL || ma == NULL ||
+ 	    external == NULL || charging == NULL || full == NULL) {
+ 		return EIO;
+ 	}
+-	if (a10_i2c_read_u16(a10_i2c_fg, A10_FG_ADDR, A10_FG_RVBAT,
+-	    &rawVoltage) != 0) {
+-		return EIO;
+-	}
+-	unsigned voltage = (unsigned)(((uint32_t)rawVoltage * 1000u) >> 13);
+-	if (voltage < 2800 || voltage > 4600) {
+-		return EIO;
++
++	if (a10_gauge_ok &&
++	    a10_i2c_read_u16(a10_i2c_fg, A10_FG_ADDR, A10_FG_RVBAT,
++	    &rawVoltage) == 0) {
++		unsigned v = (unsigned)(((uint32_t)rawVoltage * 1000u) >> 13);
++
++		if (v >= 2800 && v <= 4600) {
++			voltage = v;
++			voltageValid = true;
++		}
+ 	}
+-	if (a10_i2c_read_u16(a10_i2c_fg, A10_FG_ADDR, A10_FG_RSOC,
++	if (a10_gauge_ok &&
++	    a10_i2c_read_u16(a10_i2c_fg, A10_FG_ADDR, A10_FG_RSOC,
+ 	    &rawSoc) == 0) {
+-		/* RSOC is unsigned 0..16384 (100%); negative means invalid. */
++		/* RSOC is unsigned 0..16384 (100%); bit 15 means invalid. */
+ 		socValid = (rawSoc & 0x8000u) == 0 && rawSoc <= 16384u &&
+ 		    rawSoc >= 100u;
+ 	}
+-	if (a10_i2c_read_u16(a10_i2c_fg, A10_FG_ADDR, A10_FG_RCUR_CC,
++	if (a10_gauge_ok &&
++	    a10_i2c_read_u16(a10_i2c_fg, A10_FG_ADDR, A10_FG_RCUR_CC,
+ 	    &rawCurrent) == 0) {
+ 		currentValid = true;
+ 	}
+-	if (a10_i2c_chg != 0 &&
++	if (a10_charger_ok &&
+ 	    a10_i2c_read_reg(a10_i2c_chg, A10_CHG_ADDR, A10_CHG_STATUS0,
+ 	    &chgStatus, 1) == 0) {
+ 		chargerValid = true;
+ 	}
+ 
+ 	/* raw RSOC is 0..16384; convert to whole percent with rounding. */
+-	unsigned soc = socValid ?
++	soc = socValid ?
+ 	    (((uint32_t)rawSoc * 100u) + 8192u) / 16384u :
+-	    a10_battery_percent_from_mv(voltage);
++	    (voltageValid ? a10_battery_percent_from_mv(voltage) : 100u);
+ 	if (soc > 100) {
+ 		soc = 100;
+ 	}
+@@ -314,16 +658,18 @@ a10_battery_read(unsigned *percent, unsigned *mv, int *ma, bool *external,
+ 	if (currentValid) {
+ 		if (rawCurrent & 0x8000u) {
+ 			unsigned mag = ((~rawCurrent) & 0xffffu) + 1u;
++
+ 			current = (int)((mag * 1000u) >> 12);
+ 		} else {
+ 			current = -(int)(((rawCurrent & 0x7fffu) * 1000u) >> 12);
+ 		}
+ 	}
+ 
+-	bool ext = chargerValid && (chgStatus & 0x80u);
++	/* STATUS0: bit7 VBUS_OK, bit6 WCIN_OK, bit4 CHG_OK, 3:0 state. */
++	bool ext = chargerValid && (chgStatus & 0xc0u) != 0;
+ 	unsigned state = chgStatus & 0x0fu;
+-	bool chg = chargerValid && ext && state >= 2u && state <= 5u;
+-	bool fullNow = chargerValid && ext && state >= 6u;
++	bool chg = ext && state >= 2u && state <= 5u;
++	bool fullNow = ext && (state == 6u || state == 7u || state == 8u);
+ 	if (fullNow) {
+ 		soc = 100;
+ 	}
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 29903e1..375ed15 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -37,6 +37,7 @@
+ #include "SweetSurface.h"
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
++extern "C" void a10_backlight_set(int on); /* bsd/dev/a10_battery.c (LM3632) */
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+@@ -616,6 +617,9 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 				fFB->fDirty = true;     /* on: redraw the latest frame */
+ 			}
+ 			IOLockUnlock(fFB->fLock);
++			/* The s6d7at0b panel is an LCD: black pixels keep the
++			 * backlight on, so switch the LM3632 string off too. */
++			a10_backlight_set(off ? 0 : 1);
+ 			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
+ 		}
+ 		break;
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index a0726b5..011b960 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -363,6 +363,7 @@ class SweetHIDTouch : public IOHIDEventService {
+ public:
+ 	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void touch(int finger, bool down, int x, int y);
++	void touchAbs(int finger, bool down, UInt32 nx, UInt32 ny);
+ protected:
+ 	virtual UInt32 getPrimaryUsagePage() APPLE_KEXT_OVERRIDE { return kHIDPage_Digitizer; }
+ 	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return kHIDUsage_Dig_TouchScreen; }
+@@ -555,6 +556,22 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ 	collection->release();
+ }
+ 
++void
++SweetHIDTouch::touchAbs(int finger, bool down, UInt32 nx, UInt32 ny)
++{
++	/* 0..65535 across the physical panel -> presented logical pixels. */
++	int x = (int)(((UInt64)nx * (UInt32)fLogicalW) >> 16);
++	int y = (int)(((UInt64)ny * (UInt32)fLogicalH) >> 16);
++
++	if (x >= fLogicalW) {
++		x = fLogicalW - 1;
++	}
++	if (y >= fLogicalH) {
++		y = fLogicalH - 1;
++	}
++	touch(finger, down, x, y);
++}
++
+ /* key: 0 power (side button), 1 volume up, 2 volume down, 3 home */
+ extern "C" void
+ sweet_hid_key(int key, int down)
+@@ -569,6 +586,14 @@ sweet_hid_key(int key, int down)
+ 	}
+ }
+ 
++extern "C" void
++sweet_hid_touch_abs(int finger, int down, UInt32 nx, UInt32 ny)
++{
++	if (gSweetTouch) {
++		gSweetTouch->touchAbs(finger, down != 0, nx, ny);
++	}
++}
++
+ extern "C" void
+ sweet_hid_touch(int finger, int down, int x, int y)
+ {

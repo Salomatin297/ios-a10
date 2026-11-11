@@ -175,6 +175,10 @@ jobs:
           need dxb/xnu/bsd/dev/a10_touch.c 'A10 TOUCH: polling GPC2-2/3' present '0109 A10 touch driver'
           need dxb/xnu/bsd/dev/sweet_emmc.c 'a10_touch_init' present '0109 touch hook'
           need dxb/xnu/iokit/Kernel/arm/hid/SweetHID.cpp 'SWEET HID: touch display' present '0109 digitizer display size'
+          need dxb/xnu/bsd/dev/a10_touch.c 'A10 TOUCH: power-cycling tsp_ldo_en' present '0113 touch LDO power cycle'
+          need dxb/xnu/bsd/dev/a10_battery.c 'A10 BATTERY: LM3632 initialised' present '0113 LM3632 backlight'
+          need dxb/xnu/iokit/Kernel/arm/SweetFramebuffer.cpp 'a10_backlight_set' present '0113 display power backlight'
+          need dxb/xnu/iokit/Kernel/arm/hid/SweetHID.cpp 'sweet_hid_touch_abs' present '0113 normalised touch coordinates'
           if [ "$fail" -ne 0 ]; then
             echo "::error::A10 port patches did not apply cleanly"
             exit 1
