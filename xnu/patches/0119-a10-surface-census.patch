@@ -1,0 +1,107 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index fe4b6ff..3fb0eb4 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -242,6 +242,13 @@ AppleCLCD::start(IOService *provider)
+ 	sweet_fb_fit = PE_parse_boot_argn("sweetfb_fit", &fit, sizeof(fit)) && fit != 0;
+ 	int test = 0;
+ 	sweet_fb_test = PE_parse_boot_argn("sweetfb_test", &test, sizeof(test)) && test != 0;
++	int stats = 0, bar = 0;
++	if (PE_parse_boot_argn("sweetfb_stats", &stats, sizeof(stats)) && stats > 0) {
++		sweet_fb_stats = (uint32_t)stats;
++	}
++	sweet_fb_bar = PE_parse_boot_argn("sweetfb_bar", &bar, sizeof(bar)) && bar != 0;
++	IOLog("SWEET FB: fit %d stats %u bar %d\n", sweet_fb_fit, sweet_fb_stats,
++	    sweet_fb_bar);
+ 	uint32_t blink = 0;
+ 	PE_parse_boot_argn("sweetfb_blink", &blink, sizeof(blink));
+ 	sweet_fb_blink_secs = blink;
+@@ -363,6 +370,14 @@ static uint64_t sweet_fb_swap_count;
+ static uint32_t sweet_fb_frames_logged;
+ static uint32_t sweet_fb_pix_logged;
+ static uint32_t sweet_fb_fit_logged;
++/* sweetfb_stats=N: log a nonzero-pixel census of the first N surfaces.
++ * sweetfb_bar=1: paint a green bar on the panel after every copy, so the
++ * user can see whether the panel copy path itself works. */
++static uint32_t sweet_fb_stats;
++static uint32_t sweet_fb_stats_logged;
++static bool sweet_fb_bar;
++static uint32_t sweet_fb_fit_copies;
++static uint32_t sweet_fb_fit_rejects;
+ 
+ /* Copy each enabled layer's surface into the panel memory (no scaling). */
+ /*
+@@ -456,6 +471,40 @@ AppleCLCD::present(const uint8_t *rec)
+ 				memcpy(&pe, base +
+ 				    (uint64_t)(sy + sh0 - 1) * s->bytesPerRow +
+ 				    (uint64_t)(sx + sw0 - 1) * 4, 4);
++				if (sweet_fb_stats_logged < sweet_fb_stats) {
++					uint32_t nz = 0, ns = 0, maxv = 0;
++					uint64_t sum = 0;
++					uint32_t clock = 0;
++					for (uint32_t yy = 0; yy < sh0; yy += 7) {
++						const uint32_t *row = (const uint32_t *)
++						    (base + (uint64_t)(sy + yy) * s->bytesPerRow +
++						    (uint64_t)sx * 4);
++						for (uint32_t xx = 0; xx < sw0; xx += 7) {
++							uint32_t v = row[xx];
++							ns++;
++							if (v != 0) {
++								nz++;
++								sum += (uint64_t)(v & 0xff) +
++								    ((v >> 8) & 0xff) +
++								    ((v >> 16) & 0xff);
++								if (v > maxv) {
++									maxv = v;
++								}
++							}
++						}
++					}
++					if (sh0 > 360) {
++						memcpy(&clock, base +
++						    (uint64_t)(sy + sh0 / 7) * s->bytesPerRow +
++						    (uint64_t)(sx + sw0 / 2) * 4, 4);
++					}
++					sweet_fb_stats_logged++;
++					IOLog("SWEET FB: stats %u %ux%u nz %u/%u sum %llu max %08x clock %08x dx %d dy %d wh %dx%d fit %u fc %u fr %u\n",
++					    id, sw0, sh0, nz, ns,
++					    (unsigned long long)sum, maxv, clock,
++					    dx, dy, w, h, sweet_fb_fit,
++					    sweet_fb_fit_copies, sweet_fb_fit_rejects);
++				}
+ 			}
+ 			if (sweet_fb_pix_logged < 12) {
+ 				sweet_fb_pix_logged++;
+@@ -506,6 +555,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 					IOLog("SWEET FB: fit copy %dx%d px %08x -> %08x\n",
+ 					    sw, sh, p0, *(volatile uint32_t *)fPixels);
+ 				}
++				sweet_fb_fit_copies++;
+ 			} else if (sweet_fb_fit_logged < 8) {
+ 				sweet_fb_fit_logged++;
+ 				IOLog("SWEET FB: fit reject sw %d sh %d sx %d sy %d src %llu bpe %u len %llu last %llu\n",
+@@ -513,6 +563,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 				    s->memory ? (unsigned long long)s->memory->getLength() : 0ULL,
+ 				    (unsigned long long)last);
+ 			}
++			sweet_fb_fit_rejects++;
+ 			s->release();
+ 			continue;
+ 		}
+@@ -566,6 +617,16 @@ AppleCLCD::present(const uint8_t *rec)
+ 		}
+ 		s->release();
+ 	}
++	if (sweet_fb_bar && fPixels != 0) {
++		/* sweetfb_bar: 24 green rows at the top prove that the panel copy
++		 * path runs; a black UI above them means the surface is black. */
++		for (uint32_t y = 0; y < 24 && y < fHeight; y++) {
++			volatile uint32_t *row = (volatile uint32_t *)(fPixels + (uint64_t)y * fRowBytes);
++			for (uint32_t x = 0; x < fWidth; x++) {
++				row[x] = 0xff00ff00;
++			}
++		}
++	}
+ }
+ 
+ bool

@@ -36,6 +36,60 @@ initialises LM3632. `SweetFramebuffer` calls `a10_backlight_set()` on
   LM3632).
 * Note: `work/sweetlog-probe27` currently holds a byte-identical copy of the
   probe26 log, not a real probe27 run.
+* **probe27 on-device result (2026-11-11):** the kernel boots (the persistent
+  log shows backboardd/SpringBoard, touch events and the I2C/LM3632 init),
+  but the panel is black from power-on; it goes dark later and Power does not
+  wake it.  The log has no `SWEET FB: display off` and no
+  `A10 BATTERY: backlight off`, so backboardd never requested display off.
+  Frames are presented (`frame 4/7`, 2500 swaps), so the framebuffer path is
+  alive; the LM3632 init sequence is the prime suspect (the stock resume table
+  is written while the bootloader-initialised panel is already on).
+* **probe28** (branch `gui2` commit `0b4bf43`, patch `0114`, CI run
+  `43026346488`) adds `a10bl=0` (leave the LM3632 completely untouched) and
+  `sweetfb_test=1` (fill the panel white once and ignore userland frames).
+  This separates "panel/backlight hardware off" from "compositor presents
+  black pixels".  `a10bl=2` writes only 0x04/0x05 for a later minimal test.
+* **probe28/29 result (2026-11-11):** both `a10bl=0` and `a10bl=2` show the
+  white test pattern.  The stock LM3632 table blackens a working panel; the
+  enable/brightness registers 0x04=0x07 and 0x05=0xFF alone are safe.
+  `a10bl=2` therefore is the mode to keep.
+* **probe30** (CI `43031717617`, `sweetfb_test=1 sweetfb_blink=4
+  a10keys_hold_ms=0`) blinks white/dark every 4 s on the device: 0x05 really
+  controls the panel backlight.  Kernel-side blink is the reliable way to
+  test the LM3632 without iOS.
+* **probe31/32/33 result:** the normal GUI is still black although the
+  backlight is on.  probe32 (`a10bl=0`) and probe33 (native 720x1560) show the
+  same, so neither the LM3632 writes nor the 1170x2532 fit path is the cause.
+  Boot is slow: the backlight only comes on after several minutes
+  (`SWEET FB: display on` at log offset 166719 in probe31's second run).
+  After that SpringBoard presents a full-screen 1170x2532 layer
+  (`swap 27/33 layer 0 surface 3 ... bpr 4864`), but only a few frames and
+  no `SWEET FB: 2500 swaps` heartbeat: the compositor goes idle with a black
+  surface, or the surface itself is black.
+* **probe34/34b result (patch 0118, CI `43040175080` green, image
+  `dist/boot-a10-probe34.img`):** the pixels are read from the surface and the
+  three sampled points are zero: `SWEET FB: pix id 3/5 1170x2532 bpr 4864
+  off 0 len 12316672 px 00000000 00000000 00000000`.  probe34b (the same boot
+  after ~30 minutes, `work/sweetlog-probe34b/`) reaches sampler sample 22,
+  has only ~46 swaps, `SWEET FB: display on` once and no `display off` and no
+  `backlight off`.  backboardd keeps matching `IOAcceleratorES` /
+  `IOAcceleratorESLegacy` -> none and `IODeviceTree:/product` -> none;
+  SpringBoard logs only harmless CATransformLayer warnings.  So the panel copy
+  path is not the problem: the surface that SpringBoard/backboardd present
+  really contains no pixels (the compositor's renderer is producing nothing).
+* **0119** adds `sweetfb_stats=N` (nonzero-pixel census over the whole
+  presented surface, plus the layer b-rect, fit state and fit copy/reject
+  counters) and `sweetfb_bar=1` (paint 24 green rows at the top of the panel
+  after every copy).  A green bar with a black UI proves the copy works while
+  the surface is black; a visible census tells whether any of the UI was
+  rendered.
+* **probe31 first run** had `A10 BATTERY: backlight mode 2` and no
+  `backlight off`, yet the panel was dark until `display on`; the backlight
+  was switched off implicitly by the bootloader/panel state before XNU's
+  `a10_backlight_set(1)` at display-on.
+* **0117** changes the default of `a10keys_hold_ms` to 0: a long Power press
+  now reaches iOS (standard "slide to power off" sheet).  The forced SoC
+  shutdown remains available with `a10keys_hold_ms=3000`.
 
 The A10 bring-up lives in `C:\Users\User\iOS-Port`; its consolidated handoff is
 **`C:\Users\User\iOS-Port\STATUS.md`** (read it first). This repo is the build
