@@ -1,5 +1,5 @@
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index ddcf145..534014d 100644
+index ddcf145..4ecd8ad 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
 @@ -146,6 +146,7 @@ public:
@@ -24,11 +24,10 @@ index ddcf145..534014d 100644
  		IOLog("SWEET FB: test pattern %ux%u filled, frames ignored\n",
  		    fWidth, fHeight);
  	}
-@@ -355,6 +351,18 @@ static uint32_t sweet_fb_frames_logged;
+@@ -355,6 +351,17 @@ static uint32_t sweet_fb_frames_logged;
   * shows the latest frame every fFlushTicks ticks (boot-arg sweetfb_hz,
   * default 10 Hz).
   */
-+void
 +void
 +AppleCLCD::fillTestPattern()
 +{
@@ -43,7 +42,7 @@ index ddcf145..534014d 100644
  void
  AppleCLCD::swap(const uint8_t *rec)
  {
-@@ -642,6 +650,10 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+@@ -642,6 +649,10 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
  			/* The s6d7at0b panel is an LCD: black pixels keep the
  			 * backlight on, so switch the LM3632 string off too. */
  			a10_backlight_set(off ? 0 : 1);
