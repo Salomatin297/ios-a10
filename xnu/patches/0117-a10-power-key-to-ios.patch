@@ -1,0 +1,31 @@
+diff --git a/bsd/dev/a10_keys.c b/bsd/dev/a10_keys.c
+index b3f6127..814b925 100644
+--- a/bsd/dev/a10_keys.c
++++ b/bsd/dev/a10_keys.c
+@@ -8,11 +8,12 @@
+  * gpio-keys driver selects the plain input function, so do the same unless
+  * a10keys_keepmux=1 is supplied.
+  *
+- * Polling only: no interrupts and no wake configuration.  Holding power for
+- * a10keys_hold_ms (default 3000, 0 disables) powers the SoC off: PSCI
+- * SYSTEM_OFF first, then the Exynos PMU PS_HOLD pin as the stock kernel
+- * does.  Call once after the scheduler is running.  a10keys=0 disables the
+- * driver.
++ * Polling only: no interrupts and no wake configuration.  By default the
++ * power key is only reported to iOS, so a long press opens the standard
++ * "slide to power off" sheet.  a10keys_hold_ms=N (e.g. 3000) restores the
++ * forced SoC power off: PSCI SYSTEM_OFF first, then the Exynos PMU PS_HOLD
++ * pin as the stock kernel does.  Call once after the scheduler is running.
++ * a10keys=0 disables the driver.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -40,7 +41,7 @@ void a10_keys_init(void);
+ #define A10_PMU_PS_HOLD    0x330cu
+ #define A10_PMU_PS_HOLD_EN (1u << 8)
+ 
+-#define A10_POWER_HOLD_MS  3000
++#define A10_POWER_HOLD_MS  0	/* opt-in: a10keys_hold_ms=3000 */
+ 
+ struct a10_key {
+ 	unsigned pin;
