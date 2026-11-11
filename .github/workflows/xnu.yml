@@ -182,6 +182,7 @@ jobs:
           need dxb/xnu/bsd/dev/a10_battery.c 'A10 BATTERY: backlight mode' present '0114 a10bl backlight mode'
           need dxb/xnu/iokit/Kernel/arm/SweetFramebuffer.cpp 'SWEET FB: test pattern' present '0114 framebuffer test pattern'
           need dxb/xnu/iokit/Kernel/arm/SweetFramebuffer.cpp 'fillTestPattern' present '0115 test pattern repaint'
+          need dxb/xnu/iokit/Kernel/arm/SweetFramebuffer.cpp 'blink backlight' present '0116 backlight blink test'
           if [ "$fail" -ne 0 ]; then
             echo "::error::A10 port patches did not apply cleanly"
             exit 1

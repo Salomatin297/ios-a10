@@ -1,0 +1,43 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 534014d..a542c9c 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -91,6 +91,9 @@ static bool sweet_fb_fit;
+  * compositor presents the wrong pixels" during bring-up.
+  */
+ static bool sweet_fb_test;
++/* Boot-arg sweetfb_blink=N: toggle the backlight every N seconds. */
++static uint32_t sweet_fb_blink_secs;
++static bool sweet_fb_blink_on = true;
+ /* Size the framebuffer reports to userland; HID uses the same space. */
+ static uint32_t sweet_fb_logical_w;
+ static uint32_t sweet_fb_logical_h;
+@@ -239,6 +242,9 @@ AppleCLCD::start(IOService *provider)
+ 	sweet_fb_fit = PE_parse_boot_argn("sweetfb_fit", &fit, sizeof(fit)) && fit != 0;
+ 	int test = 0;
+ 	sweet_fb_test = PE_parse_boot_argn("sweetfb_test", &test, sizeof(test)) && test != 0;
++	uint32_t blink = 0;
++	PE_parse_boot_argn("sweetfb_blink", &blink, sizeof(blink));
++	sweet_fb_blink_secs = blink;
+ 	if (sweet_fb_test) {
+ 		sweet_console_muted = 1;
+ 		fillTestPattern();
+@@ -262,6 +268,18 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
+ 	uint64_t now = mach_absolute_time();
+ 	uint64_t count = ++fb->fVsyncCount;
++
++	if (sweet_fb_blink_secs != 0 &&
++	    (count % ((uint64_t)60 * sweet_fb_blink_secs)) == 0) {
++		sweet_fb_blink_on = !sweet_fb_blink_on;
++		a10_backlight_set(sweet_fb_blink_on ? 1 : 0);
++		if (sweet_fb_test && sweet_fb_blink_on) {
++			fb->fillTestPattern();
++		}
++		IOLog("SWEET FB: blink backlight %s\n",
++		    sweet_fb_blink_on ? "on" : "off");
++	}
++
+ 	uint64_t values[6] = {
+ 		(uint32_t)count, (uint32_t)(count >> 32),
+ 		(uint32_t)now, (uint32_t)(now >> 32),
