@@ -184,6 +184,7 @@ jobs:
           need dxb/xnu/iokit/Kernel/arm/SweetFramebuffer.cpp 'fillTestPattern' present '0115 test pattern repaint'
           need dxb/xnu/iokit/Kernel/arm/SweetFramebuffer.cpp 'blink backlight' present '0116 backlight blink test'
           need dxb/xnu/bsd/dev/a10_keys.c 'A10_POWER_HOLD_MS  0' present '0117 power key to iOS'
+          need dxb/xnu/iokit/Kernel/arm/SweetFramebuffer.cpp 'SWEET FB: pix id' present '0118 surface pixel log'
           if [ "$fail" -ne 0 ]; then
             echo "::error::A10 port patches did not apply cleanly"
             exit 1
