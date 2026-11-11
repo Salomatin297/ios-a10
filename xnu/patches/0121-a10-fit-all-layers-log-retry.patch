@@ -1,0 +1,145 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index f81a0cd..18a5b98 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -75,12 +75,12 @@ enum {
+  * By default the framebuffer reports the panel's native geometry, so
+  * userland lays out for the real screen (A10: 720x1560, 360x780 points at
+  * 2x).  Boot-args sweetfb_w/sweetfb_h still override the logical size
+- * (e.g. 1125x2436 for an iPhone X geometry); sweetfb_fit=1 scales a
+- * full-screen layer down to the panel.
++ * (e.g. 1125x2436 for an iPhone X geometry); sweetfb_fit=1 scales every
++ * layer from the logical canvas down to the panel.
+  */
+ #define SWEET_FB_FORMAT_BGRA            0x42475241
+ 
+-/* Boot-arg sweetfb_fit=1: scale a full-screen layer down to the panel. */
++/* Boot-arg sweetfb_fit=1: scale the logical canvas down to the panel. */
+ static bool sweet_fb_fit;
+ /*
+  * Boot-arg sweetfb_test=1: paint the panel white once and ignore every
+@@ -519,43 +519,68 @@ AppleCLCD::present(const uint8_t *rec)
+ 		uintptr_t src = s->kernelAddress();
+ 		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
+ 		/*
+-		 * sweetfb_fit: a layer that covers the whole logical screen is
+-		 * scaled down to the real panel instead of center-cropped.
+-		 * The A10 panel is 720x1560; the UI is 1125x2436 (iPhone X).
++		 * sweetfb_fit: the logical canvas is larger than the panel, so
++		 * every layer's destination rectangle has to be scaled from
++		 * canvas units to panel units.  Scaling only full-screen layers
++		 * is not enough: the dock and other overlay layers have their
++		 * own surfaces and would be placed at unscaled canvas
++		 * coordinates and cropped at the panel edge.
+ 		 */
+-		if (sweet_fb_fit && dx <= 0 && dy <= 0 && w >= fLogicalW && h >= fLogicalH) {
++		if (sweet_fb_fit && fLogicalW > 0 && fLogicalH > 0) {
+ 			int32_t sw = (int32_t)get32(a, 8);
+ 			int32_t sh = (int32_t)get32(a, 12);
++			int32_t pdx = (int32_t)((int64_t)dx * fWidth / fLogicalW);
++			int32_t pdy = (int32_t)((int64_t)dy * fHeight / fLogicalH);
++			int32_t pw = (int32_t)((int64_t)w * fWidth / fLogicalW);
++			int32_t ph = (int32_t)((int64_t)h * fHeight / fLogicalH);
+ 			uint64_t last = (uint64_t)s->offset +
+ 			    (uint64_t)(sy + sh - 1) * s->bytesPerRow +
+ 			    (uint64_t)(sx + sw) * 4;
+-			if (sw > 0 && sh > 0 && sx >= 0 && sy >= 0 &&
++			int32_t x0 = pdx < 0 ? 0 : pdx;
++			int32_t y0 = pdy < 0 ? 0 : pdy;
++			int32_t x1 = pdx + pw > (int32_t)fWidth ? (int32_t)fWidth : pdx + pw;
++			int32_t y1 = pdy + ph > (int32_t)fHeight ? (int32_t)fHeight : pdy + ph;
++			if (sw > 0 && sh > 0 && w > 0 && h > 0 && pw > 0 && ph > 0 &&
++			    sx >= 0 && sy >= 0 &&
+ 			    sw <= (int32_t)s->width - sx && sh <= (int32_t)s->height - sy &&
+ 			    src != 0 && bpe == 4 && s->memory != NULL &&
+-			    last <= s->memory->getLength()) {
+-				for (int32_t y = 0; y < (int32_t)fHeight; y++) {
+-					int32_t v = sy + (int32_t)((int64_t)y * sh / fHeight);
++			    last <= s->memory->getLength() && x1 > x0 && y1 > y0) {
++				/*
++				 * Nearest neighbour with 16.16 fixed point source
++				 * steps: one add and shift per output pixel.
++				 */
++				int64_t xstep = ((int64_t)sw << 16) / pw;
++				int64_t xacc = ((int64_t)(x0 - pdx) *
++				    ((int64_t)sw << 16)) / pw;
++				for (int32_t y = y0; y < y1; y++) {
++					int32_t v = sy + (int32_t)((int64_t)(y - pdy) * sh / ph);
+ 					uint32_t *dst = (uint32_t *)(fPixels + (uint64_t)y * fRowBytes);
+ 					const uint32_t *row = (const uint32_t *)(src + s->offset +
+-					    (uint64_t)v * s->bytesPerRow + (uint64_t)sx * 4);
+-					for (int32_t x = 0; x < (int32_t)fWidth; x++) {
+-						dst[x] = row[(int32_t)((int64_t)x * sw / fWidth)];
++					    (uint64_t)v * s->bytesPerRow);
++					int64_t acc = xacc;
++					for (int32_t x = x0; x < x1; x++) {
++						dst[x] = row[sx + (int32_t)(acc >> 16)];
++						acc += xstep;
+ 					}
+ 				}
+ 				if (sweet_fb_fit_logged < 8) {
+ 					sweet_fb_fit_logged++;
+-					IOLog("SWEET FB: fit copy %dx%d px %08x -> %08x\n",
+-					    sw, sh, p0, *(volatile uint32_t *)fPixels);
++					IOLog("SWEET FB: fit copy %dx%d at %d,%d %dx%d px %08x -> %08x\n",
++					    sw, sh, pdx, pdy, pw, ph, p0,
++					    *(volatile uint32_t *)fPixels);
+ 				}
+ 				sweet_fb_fit_copies++;
+-			} else if (sweet_fb_fit_logged < 8) {
+-				sweet_fb_fit_logged++;
+-				IOLog("SWEET FB: fit reject sw %d sh %d sx %d sy %d src %llu bpe %u len %llu last %llu\n",
+-				    sw, sh, sx, sy, (unsigned long long)src, bpe,
+-				    s->memory ? (unsigned long long)s->memory->getLength() : 0ULL,
+-				    (unsigned long long)last);
++			} else {
++				if (sweet_fb_fit_logged < 8) {
++					sweet_fb_fit_logged++;
++					IOLog("SWEET FB: fit reject sw %d sh %d sx %d sy %d d %d,%d %dx%d p %d,%d %dx%d src %llu bpe %u len %llu last %llu\n",
++					    sw, sh, sx, sy, dx, dy, w, h, pdx, pdy, pw, ph,
++					    (unsigned long long)src, bpe,
++					    s->memory ? (unsigned long long)s->memory->getLength() : 0ULL,
++					    (unsigned long long)last);
++				}
++				sweet_fb_fit_rejects++;
+ 			}
+-			sweet_fb_fit_rejects++;
+ 			s->release();
+ 			continue;
+ 		}
+diff --git a/bsd/dev/sweet_emmc.c b/bsd/dev/sweet_emmc.c
+index d7d518b..6cc1e28 100644
+--- a/bsd/dev/sweet_emmc.c
++++ b/bsd/dev/sweet_emmc.c
+@@ -1252,6 +1252,7 @@ emmc_map_controller(void)
+ static int sweet_emmc_log_chan;
+ static uint64_t sweet_emmc_log_flushed;
+ static uint64_t sweet_emmc_log_seq;
++static uint32_t sweet_emmc_log_errors;
+ static boolean_t sweet_emmc_log_enabled;
+ 
+ struct sweet_emmc_log_header {
+@@ -1388,8 +1389,21 @@ sweet_emmc_log_thread(__unused void *arg, __unused wait_result_t wr)
+ 		error = sweet_emmc_log_flush();
+ 		lck_mtx_unlock(&sweet_emmc_lock);
+ 		if (error) {
+-			printf("SWEET LOG: eMMC write failed (%d), stopping\n", error);
+-			return;
++			/*
++			 * The boot-time HFS mount occasionally resets the eMMC
++			 * host or leaves a transient R1 error; the first probe
++			 * with the 1125x2436 canvas lost the whole post-launchd
++			 * log because this thread gave up after 20 KiB.  Retry
++			 * forever instead: the persistent log is the only
++			 * observability path on this port.
++			 */
++			if (sweet_emmc_log_errors < 16) {
++				sweet_emmc_log_errors++;
++				printf("SWEET LOG: eMMC write failed (%d), retrying\n",
++				    error);
++			}
++			(void)tsleep(&sweet_emmc_log_chan, PZERO, "sweetlog",
++			    MAX(1, hz / 10));
+ 		}
+ 	}
+ }
