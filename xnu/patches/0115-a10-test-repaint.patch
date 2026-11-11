@@ -1,0 +1,56 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index ddcf145..534014d 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -146,6 +146,7 @@ public:
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+ 	void present(const uint8_t *rec);
++	void fillTestPattern();
+ };
+ 
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+@@ -240,12 +241,7 @@ AppleCLCD::start(IOService *provider)
+ 	sweet_fb_test = PE_parse_boot_argn("sweetfb_test", &test, sizeof(test)) && test != 0;
+ 	if (sweet_fb_test) {
+ 		sweet_console_muted = 1;
+-		for (uint32_t y = 0; y < fHeight; y++) {
+-			volatile uint32_t *row = (volatile uint32_t *)(fPixels + (uint64_t)y * fRowBytes);
+-			for (uint32_t x = 0; x < fWidth; x++) {
+-				row[x] = 0xffffffff;
+-			}
+-		}
++		fillTestPattern();
+ 		IOLog("SWEET FB: test pattern %ux%u filled, frames ignored\n",
+ 		    fWidth, fHeight);
+ 	}
+@@ -355,6 +351,18 @@ static uint32_t sweet_fb_frames_logged;
+  * shows the latest frame every fFlushTicks ticks (boot-arg sweetfb_hz,
+  * default 10 Hz).
+  */
++void
++void
++AppleCLCD::fillTestPattern()
++{
++	for (uint32_t y = 0; y < fHeight; y++) {
++		volatile uint32_t *row = (volatile uint32_t *)(fPixels + (uint64_t)y * fRowBytes);
++		for (uint32_t x = 0; x < fWidth; x++) {
++			row[x] = 0xffffffff;
++		}
++	}
++}
++
+ void
+ AppleCLCD::swap(const uint8_t *rec)
+ {
+@@ -642,6 +650,10 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 			/* The s6d7at0b panel is an LCD: black pixels keep the
+ 			 * backlight on, so switch the LM3632 string off too. */
+ 			a10_backlight_set(off ? 0 : 1);
++			if (sweet_fb_test && !off) {
++				/* The fade blackened the panel while off; repaint it. */
++				fFB->fillTestPattern();
++			}
+ 			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
+ 		}
+ 		break;
