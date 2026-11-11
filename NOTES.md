@@ -2,6 +2,41 @@
 
 ## >>> A10 PORT (Samsung Galaxy A10, SM-A105F) - active work 2026-11-09 <<<
 
+**2026-11-11, probe27 flashed - waiting for the on-device result.** Branch
+`gui2` (commit `859a2c2`, from `gui`/`07107c0`) adds patch `0113`, which was
+missing from every earlier boot: `a10_touch.c` now power-cycles `tsp_ldo_en`
+(GPG2-1, 30 ms off / 150 ms on), sets GPC2 pull-ups, validates the `53 45 7A
+70 00` ID, retries after SW_RESET and reports normalised 0..65535 coordinates
+through `sweet_hid_touch_abs()` (so the driver no longer depends on the
+logical display size). `a10_battery.c` is rewritten: it opens the PERI QCH
+gates and PCLK gates for I2C0/1/4, muxes gpp1/gpp4, reproduces the Linux
+`s3c24xx_i2c` byte sequence (IRQEN|ACKEN, pending held across a repeated
+START, 20 ms timeouts), probes the divider by address ACK (LM3632 may be
+write-only), keeps the charger path alive when the gauge is missing and
+initialises LM3632. `SweetFramebuffer` calls `a10_backlight_set()` on
+`RequestPowerChange`, so display off should cut the LCD backlight.
+
+* CI run `43014681779` (gui2) is **green**; the workflow now has 0113 markers
+  and printed all of them `ok`. Kernel artifact
+  `ci/xnu-kernel-43014681779/kernel.development.sweet`, SHA256
+  `E5DFD92B...6311C1B`. Probe27 boot image
+  `dist/boot-a10-probe27.img` (16,738,304 bytes), SHA256
+  `0125846B...0A0B627`; flashed to `boot` from TWRP and rebooted.
+* probe27 cmdline: `debug=0xc serial=3 cpus=2 keepsyms=1 -noprogress
+  wdt=-1 rd=emmcroot0 emmcroot=userdata emmcw=1 rootrw=0
+  wdt_test=no_user_checkin launchd_unsecure_cache=1
+  unentitled_ios_sim_launch=1 a10battery=1 ignition_level=1 sweetlog=1
+  sweetfb_noconsole=1 sweetfb_hz=30 sweetfb_w=1170 sweetfb_h=2532
+  sweetfb_fit=1 a10touch_debug=1`.
+* What probe27 must answer: touch across the whole panel, black (not red)
+  status-bar clock, wallpaper, keys including the iOS power menu, charging
+  indicator, and display off cutting the backlight. Boot back into TWRP
+  afterwards and pull the persistent log: grep `A10 TOUCH:` (LDO/ID/status,
+  heartbeat) and `A10 BATTERY:` (qch/gate, divider, acked/did not respond,
+  LM3632).
+* Note: `work/sweetlog-probe27` currently holds a byte-identical copy of the
+  probe26 log, not a real probe27 run.
+
 The A10 bring-up lives in `C:\Users\User\iOS-Port`; its consolidated handoff is
 **`C:\Users\User\iOS-Port\STATUS.md`** (read it first). This repo is the build
 source + CI for it (`a10` branch, pushed to `https://github.com/Salomin297/ios-a10`).
