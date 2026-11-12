@@ -1,0 +1,238 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index f1f0d49..a0ce61c 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -112,6 +112,7 @@ bsd/dev/sweet_touch.c			standard
+ bsd/dev/a10_keys.c			standard
+ bsd/dev/a10_battery.c			standard
+ bsd/dev/a10_touch.c			standard
++bsd/dev/a10_audio.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+diff --git a/bsd/dev/sweet_emmc.c b/bsd/dev/sweet_emmc.c
+index 584a763..b415772 100644
+--- a/bsd/dev/sweet_emmc.c
++++ b/bsd/dev/sweet_emmc.c
+@@ -1535,8 +1535,11 @@ sweet_emmc_rootdev(dev_t *dev)
+ {
+ 	extern void a10_keys_init(void);
+ 	extern void a10_touch_init(void);
++	extern int a10_audio_init(void);
+ 
+ 	a10_keys_init();
++	/* Audio block probe (SPEEDY + ABOX + codec); opt-in via a10audio=1. */
++	(void)a10_audio_init();
+ 	printf("SWEET: a10_touch_init entry\n");
+ 	a10_touch_init();
+ 	printf("SWEET: a10_touch_init done\n");
+diff --git a/bsd/dev/a10_audio.c b/bsd/dev/a10_audio.c
+new file mode 100644
+index 0000000..6c707ac
+--- /dev/null
++++ b/bsd/dev/a10_audio.c
+@@ -0,0 +1,204 @@
++/*
++ * A10 (Exynos 7884B): audio block bring-up, step 1 (diagnostics only).
++ *
++ * The A10 audio path is not an I2S plus a simple codec:
++ *
++ *   ABOX     0x14A50000  Samsung audio block with its own GIC (0x14af1000)
++ *                         and an IOMMU (sysmmu_abox, IRQ 129); it carries
++ *                         the audio stream routing and 4 MiB of reserved
++ *                         memory at 0xE9400000 for the AOP side.
++ *   SPEEDY   0x11CE0000  peripheral bus (samsung,exynos-speedy, IRQ 34) that
++ *                         carries the codec; the COD3035X sits on it as
++ *                         device 0x03.
++ *   CODEC    COD3035X    headphone/speaker codec, reached through SPEEDY.
++ *
++ * This file only probes: it opens the clock gate, maps both blocks, dumps
++ * their first registers and tries one register read on the codec.  Nothing is
++ * configured, no DMA is started and no interrupt is claimed, so it cannot
++ * disturb the running system.  The point is to learn whether the audio
++ * hardware answers at all, which decides whether the next steps (codec
++ * programming, then an "AOP audio" IOKit service for the stock
++ * AppleAOPAudioPlugin HAL) are worth building.
++ *
++ * Enabled with the boot argument a10audio=1; off by default so the SMP
++ * probes are unaffected.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++
++/* PERI SFR block: CMU_PERI gate and Q-channel registers (same layout the
++ * I2C driver of this port uses). */
++#define A10_PERI_PA         0x10010000u
++#define A10_PERI_SIZE       0x8000u
++#define A10_PERI_GATE(idx)  (0x2038u + 4u * (idx))
++#define A10_PERI_QCH(idx)   (0x3018u + 4u * (idx))
++#define A10_GATE_MANUAL     (1u << 20)
++#define A10_GATE_CG_VAL     (1u << 21)
++#define A10_QCH_ENABLE      (1u << 0)
++#define A10_QCH_REQ         (1u << 1)
++
++/* DT clock index of "gate_speedy" (clocks = <&cmus 0x133>). */
++#define A10_SPEEDY_CLOCK_IDX 0x133u
++
++#define A10_SPEEDY_PA       0x11ce0000u
++#define A10_SPEEDY_SIZE     0x2000u
++#define A10_ABOX_PA         0x14a50000u
++#define A10_ABOX_SIZE       0x10000u
++
++/* SPEEDY registers (Exynos SPEEDY, as used by the Samsung kernel). */
++#define SPEEDY_CTRL         0x00u
++#define SPEEDY_ADDR         0x04u
++#define SPEEDY_DATA         0x08u
++#define SPEEDY_STATUS       0x10u
++#define SPEEDY_INTC         0x14u
++#define SPEEDY_INTS         0x18u
++
++#define SPEEDY_CTRL_ENABLE      (1u << 0)
++#define SPEEDY_CTRL_XFER_SIZE(x) ((x) << 2)
++#define SPEEDY_CTRL_XFER_DIR_R   (1u << 12)
++#define SPEEDY_STATUS_XFER_DONE  (1u << 0)
++
++/* COD3035X on the SPEEDY bus. */
++#define A10_CODEC_DEV        0x03u
++
++static vm_offset_t a10_peri;
++static vm_offset_t a10_speedy;
++static vm_offset_t a10_abox;
++static bool a10_audio_ready;
++
++static inline uint32_t
++a10_peri_read(unsigned off)
++{
++	return *(volatile uint32_t *)(a10_peri + off);
++}
++
++static inline void
++a10_peri_write(unsigned off, uint32_t val)
++{
++	*(volatile uint32_t *)(a10_peri + off) = val;
++}
++
++static inline uint32_t
++a10_speedy_read(unsigned off)
++{
++	return *(volatile uint32_t *)(a10_speedy + off);
++}
++
++static inline void
++a10_speedy_write(unsigned off, uint32_t val)
++{
++	*(volatile uint32_t *)(a10_speedy + off) = val;
++}
++
++/*
++ * Open the clock gate of the SPEEDY block.  idx is the DT clock index; the
++ * PERI gate and Q-channel registers are indexed the same way as on the I2C
++ * side of this port (CMU_PERI_GATE/QCH).
++ */
++static void
++a10_audio_ungate(void)
++{
++	uint32_t before, after;
++
++	before = a10_peri_read(A10_PERI_QCH(A10_SPEEDY_CLOCK_IDX));
++	after = before | A10_QCH_ENABLE | A10_QCH_REQ;
++	a10_peri_write(A10_PERI_QCH(A10_SPEEDY_CLOCK_IDX), after);
++	printf("A10 AUDIO: speedy qch %08x -> %08x\n", before, after);
++
++	before = a10_peri_read(A10_PERI_GATE(A10_SPEEDY_CLOCK_IDX));
++	after = before | A10_GATE_MANUAL | A10_GATE_CG_VAL;
++	a10_peri_write(A10_PERI_GATE(A10_SPEEDY_CLOCK_IDX), after);
++	printf("A10 AUDIO: speedy gate %08x -> %08x\n", before, after);
++}
++
++/*
++ * One register read on a SPEEDY device.  The transfer is bounded: if the
++ * device does not answer, the loop gives up instead of hanging the boot.
++ */
++static uint32_t
++a10_speedy_read_reg(uint8_t dev, uint8_t reg, bool *ok)
++{
++	uint32_t ctrl = SPEEDY_CTRL_ENABLE | SPEEDY_CTRL_XFER_SIZE(1) |
++	    SPEEDY_CTRL_XFER_DIR_R;
++	int i;
++
++	*ok = false;
++	a10_speedy_write(SPEEDY_ADDR, ((uint32_t)dev << 8) | reg);
++	a10_speedy_write(SPEEDY_CTRL, ctrl);
++	for (i = 0; i < 10000; i++) {
++		if (a10_speedy_read(SPEEDY_STATUS) & SPEEDY_STATUS_XFER_DONE) {
++			break;
++		}
++	}
++	if (i == 10000) {
++		return 0;
++	}
++	*ok = true;
++	return a10_speedy_read(SPEEDY_DATA);
++}
++
++int
++a10_audio_init(void)
++{
++	int enabled = 0;
++	uint32_t v;
++	bool ok;
++	unsigned i;
++
++	if (!PE_parse_boot_argn("a10audio", &enabled, sizeof(enabled)) ||
++	    enabled != 1) {
++		return ENXIO;
++	}
++	if (a10_audio_ready) {
++		return 0;
++	}
++
++	a10_peri = ml_io_map(A10_PERI_PA, A10_PERI_SIZE);
++	if (a10_peri == 0) {
++		printf("A10 AUDIO: cannot map PERI\n");
++		return ENXIO;
++	}
++	a10_audio_ungate();
++
++	a10_speedy = ml_io_map(A10_SPEEDY_PA, A10_SPEEDY_SIZE);
++	if (a10_speedy == 0) {
++		printf("A10 AUDIO: cannot map SPEEDY\n");
++		return ENXIO;
++	}
++	printf("A10 AUDIO: SPEEDY ctrl=%08x addr=%08x data=%08x status=%08x "
++	    "ints=%08x/%08x\n",
++	    a10_speedy_read(SPEEDY_CTRL), a10_speedy_read(SPEEDY_ADDR),
++	    a10_speedy_read(SPEEDY_DATA), a10_speedy_read(SPEEDY_STATUS),
++	    a10_speedy_read(SPEEDY_INTC), a10_speedy_read(SPEEDY_INTS));
++
++	a10_abox = ml_io_map(A10_ABOX_PA, A10_ABOX_SIZE);
++	if (a10_abox == 0) {
++		printf("A10 AUDIO: cannot map ABOX\n");
++		return ENXIO;
++	}
++	printf("A10 AUDIO: ABOX first registers:");
++	for (i = 0; i < 16; i++) {
++		v = *(volatile uint32_t *)(a10_abox + 4 * i);
++		printf(" %08x", v);
++	}
++	printf("\n");
++
++	/* The codec id lives in the first register of the device. */
++	for (i = 0; i < 4; i++) {
++		v = a10_speedy_read_reg(A10_CODEC_DEV, (uint8_t)i, &ok);
++		printf("A10 AUDIO: codec reg %u = 0x%08x (%s)\n", i, v,
++		    ok ? "ok" : "timeout");
++	}
++
++	a10_audio_ready = true;
++	printf("A10 AUDIO: probe done (SPEEDY + ABOX mapped, codec probed)\n");
++	return 0;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */

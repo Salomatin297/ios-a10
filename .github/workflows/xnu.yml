@@ -192,6 +192,8 @@ jobs:
           need dxb/xnu/osfmk/arm64/machine_routines.c 'One logical cluster: the three physical clusters are collapsed' present '0128 single SMP cluster'
           need dxb/xnu/iokit/Kernel/arm/SweetCPU.cpp 'Report the progress of every secondary' present '0128 SMP bring-up diagnostics'
           need dxb/xnu/bsd/dev/a10_battery.c 'A10 BATTERY: backlight level %d/255' present '0129 backlight level boot-arg'
+          need dxb/xnu/bsd/dev/a10_audio.c 'A10 AUDIO: probe done' present '0130 audio block probe'
+          need dxb/xnu/bsd/conf/files 'bsd/dev/a10_audio.c' present '0130 audio driver in the build'
           if [ "$fail" -ne 0 ]; then
             echo "::error::A10 port patches did not apply cleanly"
             exit 1
