@@ -2,6 +2,69 @@
 
 ## >>> A10 PORT (Samsung Galaxy A10, SM-A105F) - active work 2026-11-09 <<<
 
+### >>> UPDATE 2026-11-12: eight-core SMP (0126), migration diagnosis, IconState reset <<<
+
+**probe40 on the phone** (CI `43251466118`, kernel 16,633,048 bytes): native
+`1125x2436@3`, `cpus=4`, 4/4 CPUs online, GUI runs.  Persistent log in
+`work/sweetlog-probe40b/`.  `dist/boot-a10-probe40.img` is the fallback image.
+
+**0126 (eight cores)** is committed as `ac68e14` on `gui2` and pushed to the
+`a10` `main`; CI run `43287480172` was still in progress at the time of this
+note.  The patch (7,612 bytes) passes the generator's reverse check and the
+0125+0126 chain apply on `work/patchgen-0125/b`.  What it does:
+* `SweetCPU::startAll` brings up one secondary at a time (the Samsung secure
+  monitor drops concurrent `CPU_ON`), 10 s deadline, re-issues `CPU_ON` only
+  while `mark[0]==0`, clean+invalidates the marker row before polling;
+* `start.s` invalidates the marker cache line before polling and, on SWEET,
+  branches straight to `EXT(start_cpu)` instead of trusting the generic
+  `cpu_reset_handler` paddr/VA comparison (that spin produced the probe40
+  `cpu=3 timeout ... mark=1/2/3/0/0/0` panic);
+* `MAX_CPU_CLUSTERS=2`; `tools/mkadt-a10.py` now emits `cluster-type` `'E'`
+  for the A53 nodes and `'P'` for the two A73 nodes, `cluster-id`/`l2-cache-id`
+  0 for E and 1 for P, all eight `cpu-id`s 0-7, boot core 0x100 first.
+  `dist/a10.adt` was regenerated with `A10_CANVAS_W=1125 A10_CANVAS_H=2436
+  A10_DISPLAY_SCALE=3 A10_ARTWORK_SCALE=3` (12,980 bytes).
+* probe43 = CI kernel + this ADT, `cpus=8`, native canvas.  Expected failure
+  mode to watch for: an E/P topology assertion in `ml_parse_cpu_topology` /
+  `pset_create`; the boot log prints each CPU as it registers.
+
+**Migration experiment (patched `com.apple.migration.plist` 20H392 -> 20H391)
+ran but hung.**  The volume is writable at runtime: the first boot with the
+patched plist spawned `datamigrator` and the serial
+`com.apple.migrationpluginwrapper` jobs, and it **deleted the stale staged
+apps**: `/private/var/staged_system_apps` went from 5,576 folders / 3,840
+files to 1 / 0 (catalog diff of `work/a10-catalog-before-migration.bin` vs
+`work/a10-catalog-after.bin`).  The hang is not ours: the spindump
+`stacks+com.apple.datamigrator-1969-12-31-161548.0004.ips` says
+`PRECAUTIONARY stackshot - migration might be hung or deadlocked. Plugin:
+com.apple.locationd.migrator (CoreLocationMigrator.migrator) (10 minutes)
+(upgrade) (prev build 20H391)`.  `locationd` (pid 62) is running but its WiFi
+and CommCenter XPC lookups fail; the CoreLocation migrator never returns.
+The migration block was restored to the original bytes (md5
+`0b4c192f3a67edf71063817f9a559cd7`, `work/migration-block.bin`) so the phone
+boots again; re-patch only after skipping CoreLocation.
+
+**Icons:** `/Applications` holds all 141 app bundles, the csstore has 140
+`/Applications/*.app` paths, and `lsd`, `installd`, `installcoordinationd`,
+`containermanagerd` are all running.  The sparse home screen comes from the
+976-byte `IconState.plist` (Photos/App Store/Preferences + Photos widget; dock
+Phone/Safari/SMS).  `DefaultIconState*.plist` in SpringBoard.app has logical
+size 0 (HFS `decmpfs` is `#undef HFS_COMPRESSION` in the port), so a rebuild is
+the only way to get the full default layout.  In TWRP the catalog file record
+`/private/var/mobile/Library/SpringBoard/IconState.plist` was renamed in place
+to `XconState.plist` (same-length UTF-16BE key, node 12648 at userdata byte
+856,104,960; `work/rename_catalog_entry.py`, readback verified).  SpringBoard
+should now create a fresh IconState on boot; reverse with
+`--path .../XconState.plist --to IconState.plist --write` if it regresses.
+`applicationState.db` pulls still look malformed (WAL/WAL-index not replayed),
+so do not trust its tables from a raw dump.
+
+**Next step:** when CI `43287480172` is green, download `xnu-kernel`, build
+probe43 (`-Version 43`, cmdline from probe40 but `cpus=8`, native
+`1125x2436@3`), flash from TWRP, and check 8/8 CPUs, icon layout and the
+status bar.  Then continue with `ignition_level=2`/preboot, the service chain
+and Wi-Fi/BT/audio.
+
 ### >>> UPDATE 2026-11-11: probe35 census, patch 0120 (native 720x1560, /product, IOCoreSurfaceRoot) <<<
 
 **probe35** (patch 0119, CI `43060901124` green, image
@@ -42,9 +105,14 @@ a10bl=2 a10keys_hold_ms=0`; log in `work/sweetlog-probe35/`.
   tree pass.
 * `tools/build_probe28.ps1` default cmdline no longer passes
   `sweetfb_w/h=1170x2532` or `sweetfb_fit`, and uses `a10bl=2`.
-* Next: CI build of 0120, then probe36 with the new ADT and cmdline, pull the
-  log from TWRP, and check the startup `presented as`, `nz`, `/product`
-  lookups and `display-scale`.  If `nz` is still 0, investigate the
+* CI run `43071522465` (gui2, commit `d338e11`) is **green**; 0120 applied and
+  the A10 marker check passed.  Probe36 image
+  `dist/boot-a10-probe36.img` (16,758,784 bytes, SHA256
+  `FC670DB3...3ADB298`) was built with `sweetfb_stats=12 sweetfb_bar=1
+  a10bl=2 a10keys_hold_ms=0` and flashed to `boot` from TWRP.
+* Next: watch probe36 on the device (green bar, clock, wallpaper), then boot
+  to TWRP, pull the log, and check the startup `presented as`, `nz`,
+  `/product` lookups and `display-scale`.  If `nz` is still 0, investigate the
   CoreAnimation renderer selection (`IOAcceleratorES`, `CA_*` preferences);
   sweet renders without a GPU through `CA::OGL::SWContext`, so the missing
   accelerator is a symptom, not proof.  Adding `/product` may also require
