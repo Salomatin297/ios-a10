@@ -28,6 +28,34 @@ note.  The patch (7,612 bytes) passes the generator's reverse check and the
   mode to watch for: an E/P topology assertion in `ml_parse_cpu_topology` /
   `pset_create`; the boot log prints each CPU as it registers.
 
+**probe43-45: the 0126 kernel is broken at any core count.**  probe43 (E/P
+ADT, `cpus=8`), probe44 (probe40 ADT, `cpus=8`) and probe45 (0126 kernel +
+the *exact* probe40 ADT and cmdline, `cpus=4`) all show the same full-screen
+fine vertical stripes.  probe43's persistent ring was unchanged from probe40
+(`total=286586`, md5 `48a94d6c…`); probe45's ring pulled from TWRP is
+byte-identical (286,586 bytes, same md5), so the kernel dies before UFS init
+and the SWEET LOG thread never starts.  Cause in the source: with
+`MAX_CPU_CLUSTERS=2` the build sets `__ARM_AMP__`, but on an SMP ADT
+`ml_processor_register()` maps every CPU to `PSET_AMP_P`, so only a P pset
+exists and `ecore_set == NULL`; `pcores_recommended()` calls
+`pset_is_recommended(ecore_set)` and `sched_amp_choose_processor()` asserts
+`nset != NULL` on the first E-recommended kernel thread.  The asserts in
+`sched_amp_cpu_init_completed()` never run because it early-returns when the
+`cpus=` boot-arg is present.  probe43 (E/P ADT) has both psets, so its failure
+is a separate eight-core bring-up issue, still unresolved.
+
+**0127 (fix, committed `f5f37c1` on `gui2`/`gui3`, pushed to `a10` main,
+CI `43302031409`)** reverts `MAX_CPU_CLUSTERS` to 1 (AMP compiled out) and
+keeps 0126's serialized secondary bring-up.  Patch:
+`xnu/patches/0127-a10-smp-single-cluster.patch`, verified to apply on top of
+0126 in `work/patchtest`.
+
+**probe46** = old proven kernel (CI `43251466118`) + `work/a10-mixed-smp.adt`
+= 2×A73 (`0x0`,`0x1`) + 2×A53 (`0x100`,`0x101`), all `cluster-type` 0,
+`cluster-id` 0, `cpus=4`, probe40 cmdline.  Tests whether the A73/PSCI start
+path works at all, independently of 0126; image `dist/boot-a10-probe46.img`
+(ADT md5 `cbdf431b2fbe211d0d6fe8a8a3522bef`).
+
 **Migration experiment (patched `com.apple.migration.plist` 20H392 -> 20H391)
 ran but hung.**  The volume is writable at runtime: the first boot with the
 patched plist spawned `datamigrator` and the serial
@@ -59,10 +87,14 @@ should now create a fresh IconState on boot; reverse with
 `applicationState.db` pulls still look malformed (WAL/WAL-index not replayed),
 so do not trust its tables from a raw dump.
 
-**Next step:** when CI `43287480172` is green, download `xnu-kernel`, build
-probe43 (`-Version 43`, cmdline from probe40 but `cpus=8`, native
-`1125x2436@3`), flash from TWRP, and check 8/8 CPUs, icon layout and the
-status bar.  Then continue with `ignition_level=2`/preboot, the service chain
+**Next step:** probe46 is flashed and booting (2×A73+2×A53 on the proven
+kernel).  If the GUI appears, the performance fallback is achieved; if it
+stripes, the A73 `CPU_ON` path is the problem and 8 cores need different
+work.  When CI `43302031409` (0127) is green, download `xnu-kernel`, build
+probe47 = 0127 kernel + `work/boot-a10-probe40-adt.adt` (8 CPU, SMP) +
+`cpus=8`, flash and test; if that fails, try `cpus=6` (A53s only:
+`0x100-0x103`, `0x200`, `0x201`).  Then confirm the IconState rebuild, the
+status bar and continue with `ignition_level=2`/preboot, the service chain
 and Wi-Fi/BT/audio.
 
 ### >>> UPDATE 2026-11-11: probe35 census, patch 0120 (native 720x1560, /product, IOCoreSurfaceRoot) <<<
