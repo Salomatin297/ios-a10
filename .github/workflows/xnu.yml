@@ -186,6 +186,8 @@ jobs:
           need dxb/xnu/bsd/dev/a10_keys.c 'A10_POWER_HOLD_MS  0' present '0117 power key to iOS'
           need dxb/xnu/iokit/Kernel/arm/SweetFramebuffer.cpp 'SWEET FB: pix id' present '0118 surface pixel log'
           need dxb/xnu/iokit/Kernel/arm/SweetFramebuffer.cpp 'SWEET FB: stats' present '0119 surface census'
+          need dxb/xnu/iokit/Kernel/arm/SweetCPU.cpp 'mark=%x/%x/%x/%x/%x/%x' present '0125 SMP secondary markers'
+          need dxb/xnu/osfmk/arm64/start.s 'SWEET_SMP_MARK_ENTRY' present '0125 SMP secondary entry marker'
           if [ "$fail" -ne 0 ]; then
             echo "::error::A10 port patches did not apply cleanly"
             exit 1

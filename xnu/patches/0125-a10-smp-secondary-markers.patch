@@ -1,0 +1,184 @@
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index 11100c3..de76946 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -50,6 +50,35 @@ sweet_psci_cpu_on(uint64_t target, uint64_t entry, uint64_t context)
+ 	return (int32_t)x0;
+ }
+ 
++/*
++ * Per-MPIDR secondary-boot progress rows.  osfmk/arm64/start.s writes
++ * slots 0-6 with the MMU and caches off before the secondary reaches C;
++ * slot 7 is written here from initCPU().  The bring-up CPU owns the
++ * cache lines: it clears and clean+invalidates the array before CPU_ON,
++ * and clean+invalidates again before reading the rows on timeout.
++ */
++extern "C" uint64_t sweet_smp_mark[64][8] __attribute__((aligned(64)));
++extern "C" void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);
++
++static uint64_t *
++sweet_smp_mark_row(uint64_t mpidr)
++{
++	uint32_t row = (uint32_t)((mpidr & 0xf) | ((mpidr & 0xf00) >> 4));
++
++	return sweet_smp_mark[row & 0x3f];
++}
++
++static void
++sweet_smp_mark_clear(void)
++{
++	volatile uint64_t *mark = &sweet_smp_mark[0][0];
++
++	for (unsigned int i = 0; i < sizeof(sweet_smp_mark) / sizeof(mark[0]); i++) {
++		mark[i] = 0;
++	}
++	FlushPoC_DcacheRegion((vm_offset_t)sweet_smp_mark, sizeof(sweet_smp_mark));
++}
++
+ class SweetCPU : public IOCPU {
+ 	OSDeclareDefaultStructors(SweetCPU);
+ 	const OSSymbol *cpuName = NULL;
+@@ -214,6 +243,9 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ 	IOLog("SWEET CPU: bring-up on cpu=%d (boot logical=%u)\n",
+ 	    cpu_number(), topology->boot_cpu->cpu_id);
+ 
++	/* Rows are written only by secondaries until the timeout report. */
++	sweet_smp_mark_clear();
++
+ 	for (unsigned int i = 0; i < topology->num_cpus; i++) {
+ 		SweetCPU *cpu = __atomic_load_n(&sweet_cpus[i], __ATOMIC_ACQUIRE);
+ 		IOLog("SWEET CPU: processor_start cpu=%u mpidr=0x%x from cpu=%d\n",
+@@ -249,13 +281,22 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ 				    __atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE),
+ 				    sweet_cpu_signal_is_enabled(i) ? 1 : 0, nudges,
+ 				    on_retries, cpu_number());
++				uint64_t *mark =
++				    sweet_smp_mark_row(topology->cpus[i].phys_id);
++				FlushPoC_DcacheRegion((vm_offset_t)sweet_smp_mark,
++				    sizeof(sweet_smp_mark));
+ 				panic("SWEET CPU: cpu=%u timeout mpidr=0x%x init=%u "
+-				    "sgi=%u nudges=%u on=%u rc0=%d rc=%d thread_cpu=%d",
++				    "sgi=%u nudges=%u on=%u rc0=%d rc=%d thread_cpu=%d "
++				    "mark=%x/%x/%x/%x/%x/%x el=%x ctx=%x",
+ 				    i, topology->cpus[i].phys_id,
+ 				    __atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE),
+ 				    sweet_cpu_signal_is_enabled(i) ? 1 : 0,
+ 				    nudges, on_retries, cpu->first_psci_rc,
+-				    cpu->last_psci_rc, cpu_number());
++				    cpu->last_psci_rc, cpu_number(),
++				    (uint32_t)mark[0], (uint32_t)mark[1],
++				    (uint32_t)mark[2], (uint32_t)mark[3],
++				    (uint32_t)mark[4], (uint32_t)mark[7],
++				    (uint32_t)mark[5], (uint32_t)mark[6]);
+ 			}
+ 			if (i != topology->boot_cpu->cpu_id &&
+ 			    __atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE) == 0 &&
+@@ -335,6 +376,11 @@ SweetCPU::initCPU(bool boot)
+ 	}
+ 	assert(cpu_number() == (int)getCPUNumber());
+ 
++	/* Slot 7: the generic boot path reached C with the MMU on. */
++	uint64_t *mark = sweet_smp_mark_row(__builtin_arm_rsr64("MPIDR_EL1"));
++	mark[7] = 6;
++	FlushPoC_DcacheRegion((vm_offset_t)mark, sizeof(sweet_smp_mark[0]));
++
+ 	ml_broadcast_cpu_event(CPU_BOOTED, getCPUNumber());
+ 
+ 	/* Secondary startup runs at splsched: queue the self-IPI and return.
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index aab55bb..71b7dc7 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -88,6 +88,48 @@
+ #endif /* defined(KERNEL_INTEGRITY_KTRR) */
+ .endmacro
+ 
++#if defined(SWEET)
++/*
++ * A10 SMP secondary-boot progress markers (patch 0125).
++ *
++ * sweet_smp_mark holds 64 rows of 8 words, indexed by
++ * (MPIDR.Aff0 | (MPIDR.Aff1 << 4)) & 0x3f.  A secondary writes its row
++ * with the MMU and caches off, so the stores are Device-nGnRnE and land
++ * in DRAM; the bring-up CPU clean+invalidates the whole array before
++ * CPU_ON and again before reading it.  Slot 7 is written by
++ * SweetCPU::initCPU() once the generic boot path reaches C.
++ *
++ * Clobbers x9-x12 only; never x0-x2, x19-x26 or lr.
++ */
++.macro SWEET_SMP_MARK slot, value
++	mrs		x9, MPIDR_EL1
++	and		x10, x9, #0xf
++	ubfx	x11, x9, #8, #4
++	orr		x10, x10, x11, lsl #4
++	adrp	x12, EXT(sweet_smp_mark)@page
++	add		x12, x12, EXT(sweet_smp_mark)@pageoff
++	add		x12, x12, x10, lsl #6
++	mov		x11, #\value
++	str		x11, [x12, #(8 * \slot)]
++.endm
++
++.macro SWEET_SMP_MARK_ENTRY
++	mrs		x9, MPIDR_EL1
++	and		x10, x9, #0xf
++	ubfx	x11, x9, #8, #4
++	orr		x10, x10, x11, lsl #4
++	adrp	x12, EXT(sweet_smp_mark)@page
++	add		x12, x12, EXT(sweet_smp_mark)@pageoff
++	add		x12, x12, x10, lsl #6
++	mov		x11, #1
++	str		x11, [x12]			/* slot 0: entry reached */
++	mrs		x11, CurrentEL
++	lsr		x11, x11, #2
++	str		x11, [x12, #40]			/* slot 5: EL at entry */
++	str		x0, [x12, #48]			/* slot 6: PSCI context */
++.endm
++#endif /* SWEET */
++
+ /*
+  * Checks the reset handler for global and CPU-specific reset-assist functions,
+  * then jumps to the reset handler with boot args and cpu data. This is copied
+@@ -162,6 +204,7 @@ Lnext_cpu_data_entry:
+ 	b.eq	Lskip_cpu_reset_handler				// Not found
+ 	b		Lcheck_cpu_data_entry	// loop
+ Lfound_cpu_data_entry:
++	SWEET_SMP_MARK 2, 3
+ 	adrp	x20, EXT(const_boot_args)@page
+ 	add		x20, x20, EXT(const_boot_args)@pageoff
+ 	ldr		x0, [x21, CPU_RESET_HANDLER]		// Call CPU reset handler
+@@ -289,6 +332,7 @@ LEXT(bootstrap_instructions)
+ 	.globl EXT(sweet_secondary_entry)
+ LEXT(sweet_secondary_entry)
+ 	msr		DAIFSet, #0xf
++	SWEET_SMP_MARK_ENTRY
+ 	mrs		x1, CurrentEL
+ 	cmp		x1, #0x4
+ 	b.eq	Lsweet_secondary_el1
+@@ -325,6 +369,7 @@ Lsweet_secondary_bad_el:
+ 	b		.
+ Lsweet_secondary_el1:
+ 	/* x0 is deliberately unused; reset_vector selects CPU data by MPIDR. */
++	SWEET_SMP_MARK 1, 2
+ 	msr		SPSel, #1
+ 	b		EXT(LowResetVectorBase)
+ #endif /* SWEET */
+@@ -345,6 +390,7 @@ LEXT(start_cpu)
+ 
+ 	.align 2
+ start_cpu:
++	SWEET_SMP_MARK 3, 4
+ #if defined(KERNEL_INTEGRITY_KTRR) || defined(KERNEL_INTEGRITY_CTRR)
+ 	// This is done right away in reset vector for pre-KTRR devices
+ 	// Set low reset vector now that we are in the KTRR-free zone
+@@ -854,6 +900,11 @@ common_start:
+ 	MSR_SCTLR_EL1_X0
+ 	isb		sy
+ 
++	/* Slot 4: the MMU is on.  Push this row past the caches to PoC. */
++	SWEET_SMP_MARK 4, 5
++	dc		civac, x12
++	dsb		sy
++
+ #if !VMAPPLE && !defined(SWEET)
+ 	MOV64   x1, SCTLR_EL1_DEFAULT
+ 	cmp		x0, x1
