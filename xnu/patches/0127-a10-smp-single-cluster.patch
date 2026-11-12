@@ -1,0 +1,23 @@
+diff --git a/pexpert/pexpert/arm64/board_config.h b/pexpert/pexpert/arm64/board_config.h
+--- a/pexpert/pexpert/arm64/board_config.h
++++ b/pexpert/pexpert/arm64/board_config.h
+@@ -103,13 +103,13 @@
+ #define MAX_L2_CLINE                   6
+ #define MAX_CPUS                       8
+ /*
+- * Two logical clusters: the six Cortex-A53s are the E cluster and the two
+- * Cortex-A73s the P cluster (the A10 has three physical clusters, which the
+- * ADT collapses into E/P because this build has HAS_CLUSTER=0).  With one
+- * cluster __ARM_AMP__ is compiled out and a "cluster-type" of 'P'/'E' would
+- * assert in ml_parse_cpu_topology().
++ * One SMP cluster: HAS_CLUSTER is off, so the three physical clusters are
++ * collapsed into a single logical cluster and MAX_CPU_CLUSTERS must stay 1.
++ * With 2, __ARM_AMP__ builds the AMP scheduler; it requires a P *and* an E
++ * pset, and the SMP ADT only ever creates a P pset, so the first
++ * E-recommended kernel thread dereferences ecore_set == NULL.
+  */
+-#define MAX_CPU_CLUSTERS               2
++#define MAX_CPU_CLUSTERS               1
+ 
+ #define CORE_NCTRS                     8 /* Placeholder; KPC is not enabled for this target */
+ 
