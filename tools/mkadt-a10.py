@@ -9,8 +9,10 @@ Usage:
 
 --qemu switches the boot-core reg to 0 for the QEMU virt board: there the
 single TCG vCPU reports Aff1=0/Aff0=0 (mask MPIDR_AFF1|MPIDR_AFF0 in
-ml_get_cpu_number).  The phone boot core must be measured on hardware; on
-the A10 it is the first Cortex-A73 (MPIDR 0x80000000 -> reg 0).
+ml_get_cpu_number).  The phone boots on the first Cortex-A53 of cluster 1:
+stock dmesg says "Booting Linux on physical CPU 0x100", and probe #9 with
+reg=0 panicked in ml_get_cpu_number_local() because the live MPIDR
+0x80000100 did not match any ADT cpu node.
 
 A10 facts:
   - SoC Exynos 7884B (ro.boot.hardware), 2x Cortex-A73 + 6x Cortex-A53;
@@ -56,6 +58,17 @@ GICC_QEMU, GICD_QEMU = 0x08010000, 0x08000000
 # fbcon: s3cfb.bootloaderfb=0xEC000000, panel s6d7at0b 720x1600.
 FB, FB_SIZE = 0xec000000, 0x1400000
 FB_W, FB_H, FB_STRIDE = 720, 1600, 720 * 4
+# IOMobileFramebuffer.framework reads the canvas from the disp0 node; present
+# the native panel: 720x1560 at display-scale 2 (360x780 points).  These are
+# fixed here on purpose; the kernel no longer defaults to an iPhone X canvas.
+CANVAS_W, CANVAS_H = 720, 1560
+# Environment overrides exist for experiments only.
+CANVAS_W = int(os.environ.get("A10_CANVAS_W", CANVAS_W))
+CANVAS_H = int(os.environ.get("A10_CANVAS_H", CANVAS_H))
+DISPLAY_SCALE = int(os.environ.get("A10_DISPLAY_SCALE", 2))
+# /product/artwork-scale-factor decides which @Nx asset set UIKit loads.
+# Keep the real D22AP value (3) unless an experiment overrides it.
+ARTWORK_SCALE = int(os.environ.get("A10_ARTWORK_SCALE", 0))
 # Exynos DW-MMC 0 hosts the soldered eMMC.  DT interrupts = <0 146 0>;
 # XNU wants the GIC INTID, i.e. 146 + 32 = 178.
 DWMMC0, DWMMC0_SIZE = 0x13500000, 0x2000
@@ -65,11 +78,13 @@ DWMMC0_IRQ = 178
 A10_ECID = 0x4131303000000001
 TIMEBASE = 26000000		# CNTFRQ at boot, FDT clock-frequency 0x18cba80
 VTIMER_INTID = 27		# FDT timer: type1 PPI 11 (virtual) -> INTID 27
-# Masked MPIDR (Aff1<<8 | Aff0) of the boot core.  Probe #1 on the A10 read
-# MPIDR_EL1 = 0x80000000 -> Aff1=0, Aff0=0 -> cpu@0, the first Cortex-A73
-# (the A73 pair is cluster 0; the A53s are clusters 1 and 2).  So the ADT
-# cpu node must carry reg = 0, not the A30s value 0x100.
-BOOT_CORE_PHYS_ID = 0x0
+# Masked MPIDR (Aff1<<8 | Aff0) of the boot core.  The A10 FDT puts the two
+# Cortex-A73s in cluster 0 (cpu@0/1) and the six A53s in clusters 1-2
+# (cpu@100..103, cpu@200/201).  Stock dmesg: "Booting Linux on physical CPU
+# 0x100" -> Aff1=1, Aff0=0: the boot core is the first A53, not an A73.
+# Probe #9 declared reg=0 and hit the machine_routines.c:1244 assert because
+# the live MPIDR (0x80000100) matched no topology entry.
+BOOT_CORE_PHYS_ID = 0x100
 BOOT_MANIFEST_HASH = hashlib.sha384(b'a10 boot manifest').digest()
 
 # The real D22AP tree provides /product; kept out of git.  Same optional
@@ -87,8 +102,14 @@ def d22ap_product(path=D22AP_ADT):
         return None
     for c in adt.parse(open(path, 'rb').read())[0].children:
         if dict((k, v) for k, f, v in c.props).get('name') == b'product\0':
-            return [(k, v) for k, f, v in c.props
-                    if not f and k not in ('name', 'AAPL,phandle')]
+            props = [(k, v) for k, f, v in c.props
+                     if not f and k not in ('name', 'AAPL,phandle')]
+            # A10_ARTWORK_SCALE=2 selects the @2x asset set when the canvas is
+            # rendered at 2x for speed (the real D22AP tree says 3).
+            if ARTWORK_SCALE:
+                props = [(k, struct.pack('<I', ARTWORK_SCALE) if
+                          k == 'artwork-scale-factor' else v) for k, v in props]
+            return props
     raise SystemExit(f'{path}: no /product node')
 
 
@@ -138,7 +159,7 @@ def build():
         ('system-firmware-version', cstr('a10-shim')),
         ('boot-manifest-hash', BOOT_MANIFEST_HASH),
         ('crypto-hash-method', cstr('sha2-384')),
-        ('display-scale', u32(2)),
+        ('display-scale', u32(DISPLAY_SCALE)),
         ('unique-chip-id', struct.pack('<Q', A10_ECID)),
         ('chip-id', u32(0x8015)),
         ('certificate-production-status', u32(0)),
@@ -150,28 +171,80 @@ def build():
         node('asmb', [ph(), ('lp-sip0', u64(0x6f)), ('lp-sip1', u32(1))]),
     ])
 
+    # CPU nodes. The boot core is enumerated first: ml_parse_cpu_topology
+    # assigns logical ids in DT order, and SweetCPU::startAll requires the
+    # boot CPU to be logical 0. Only the boot node has state = "running";
+    # ml_is_boot_cpu() treats that (and only that) as the boot CPU. The
+    # A10 has 2x Cortex-A73 (cluster 0, little-endian MPIDRs 0x000/0x001)
+    # + 6x Cortex-A53 (clusters 1-2, 0x100..0x103 and 0x200/0x201);
+    # cpus=N in the boot-args still selects how many enter the topology.
+    # cluster-type is the ASCII code XNU compares against 'E'/'P'.  With
+    # patch 0126 (MAX_CPU_CLUSTERS=2) 'E'/'P' gave one E pset (A53) and one
+    # P pset (A73); patch 0128 reverted MAX_CPU_CLUSTERS to 1 and made the
+    # kernel ignore the property, so A10_CLUSTER_TYPE=smp emits the plain
+    # single-cluster form (cluster-type 0, cluster-id 0) for every core.
+    cluster_type = os.environ.get('A10_CLUSTER_TYPE', 'amp').lower()
+    if cluster_type in ('smp', '0', 'none'):
+        cluster_type = 'smp'
+    elif cluster_type not in ('amp', 'ep'):
+        raise SystemExit('A10_CLUSTER_TYPE must be amp or smp')
+
+    if qemu:
+        cpu_list = [(boot_core, 'arm,cortex-a53')]
+    else:
+        a10_cpus = [
+            (0x100, 'arm,cortex-a53'),
+            (0x101, 'arm,cortex-a53'),
+            (0x102, 'arm,cortex-a53'),
+            (0x103, 'arm,cortex-a53'),
+            (0x200, 'arm,cortex-a53'),
+            (0x201, 'arm,cortex-a53'),
+            (0x000, 'arm,cortex-a73'),
+            (0x001, 'arm,cortex-a73'),
+        ]
+        # A10_CPU_ORDER=0x100,0x103,0x102,... overrides the enumeration
+        # order (and therefore which cores cpus=N selects) without a kernel
+        # rebuild.  The boot core is always enumerated first.
+        order = os.environ.get('A10_CPU_ORDER')
+        if order:
+            by_phys = dict(a10_cpus)
+            want = [int(part, 0) for part in order.split(',') if part.strip()]
+            missing = [hex(phys) for phys in want if phys not in by_phys]
+            if missing:
+                raise SystemExit('A10_CPU_ORDER: unknown MPIDRs ' + ','.join(missing))
+            a10_cpus = [(phys, by_phys[phys]) for phys in want]
+        cpu_list = [(boot_core, 'arm,cortex-a53')] + [
+            (phys, compat) for phys, compat in a10_cpus if phys != boot_core]
+
     cpus = node('cpus', [ph(), ('#address-cells', u32(1)),
                          ('#size-cells', u32(0))], [
-        node('cpu0', [
+        node('cpu%d' % i, [
             ph(),
             ('device_type', cstr('cpu')),
-            ('compatible', cstr('arm,cortex-a73') + cstr('ARM,v8')),
-            ('reg', u32(boot_core)),	# MPIDR Aff1:Aff0, not logical
-            ('cpu-id', u32(0)),
-            ('cluster-id', u32(0)),
-            ('cluster-type', u32(0)),
+            ('compatible', cstr(compat) + cstr('ARM,v8')),
+            ('reg', u32(phys)),	# MPIDR Aff1:Aff0, not logical
+            ('cpu-id', u32(i)),
+            # Logical cluster id after the E/P collapse (HAS_CLUSTER is off).
+            ('cluster-id', u32(0 if cluster_type == 'smp'
+                               or compat == 'arm,cortex-a53' else 1)),
+            ('cluster-type', u32(0 if cluster_type == 'smp'
+                                 else (ord('E') if compat == 'arm,cortex-a53'
+                                       else ord('P')))),
             ('die-cluster-id', u32(0)),
-            ('cluster-core-id', u32(0)),
-            ('l2-cache-id', u32(0)),
+            ('cluster-core-id', u32(phys & 0xff)),
+            # Every E core is in the logical E cluster (id 0), every P core in
+            # the logical P cluster (id 1).  This matches cpu_cluster_id, which
+            # pset_create() uses.
+            ('l2-cache-id', u32(0 if compat == 'arm,cortex-a53' else 1)),
             ('l3-cache-id', u32(0)),
-            ('state', cstr('running')),
+            ('state', cstr('running' if i == 0 else 'stopped')),
             ('timebase-frequency', u32(TIMEBASE)),
             ('clock-frequency', u32(1600000000)),
             ('bus-frequency', u32(100000000)),
             ('memory-frequency', u32(1600000000)),
             ('peripheral-frequency', u32(TIMEBASE)),
             ('fixed-frequency', u32(TIMEBASE)),
-        ]),
+        ]) for i, (phys, compat) in enumerate(cpu_list)
     ])
 
     gic = node('gic', [
@@ -207,8 +280,8 @@ def build():
             ph(),
             ('device_type', cstr('display-subsystem')),
             ('compatible', cstr('sweet,display')),
-            ('canvas-width', u32(FB_W)),
-            ('canvas-height', u32(FB_H)),
+            ('canvas-width', u32(CANVAS_W)),
+            ('canvas-height', u32(CANVAS_H)),
         ]),
     ])
 

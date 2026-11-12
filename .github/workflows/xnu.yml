@@ -188,6 +188,9 @@ jobs:
           need dxb/xnu/iokit/Kernel/arm/SweetFramebuffer.cpp 'SWEET FB: stats' present '0119 surface census'
           need dxb/xnu/iokit/Kernel/arm/SweetCPU.cpp 'mark=%x/%x/%x/%x/%x/%x' present '0125 SMP secondary markers'
           need dxb/xnu/osfmk/arm64/start.s 'SWEET_SMP_MARK_ENTRY' present '0125 SMP secondary entry marker'
+          need dxb/xnu/bsd/dev/sweet_emmc.c 'Fill every block that is written with the ring bytes' present '0128 persistent log flush fix'
+          need dxb/xnu/osfmk/arm64/machine_routines.c 'One logical cluster: the three physical clusters are collapsed' present '0128 single SMP cluster'
+          need dxb/xnu/iokit/Kernel/arm/SweetCPU.cpp 'Report the progress of every secondary' present '0128 SMP bring-up diagnostics'
           if [ "$fail" -ne 0 ]; then
             echo "::error::A10 port patches did not apply cleanly"
             exit 1
