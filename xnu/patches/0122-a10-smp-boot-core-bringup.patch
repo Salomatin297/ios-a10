@@ -1,16 +1,29 @@
 diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
-index dae6f87..b6afb3d 100644
+index dae6f87..3023e9b 100644
 --- a/iokit/Kernel/arm/SweetCPU.cpp
 +++ b/iokit/Kernel/arm/SweetCPU.cpp
-@@ -17,6 +17,7 @@
- #include <machine/atomic.h>
- #include <kern/clock.h>
- #include <kern/processor.h>
-+#include <kern/sched_prim.h>
- #include <kern/thread.h>
- #include <mach/mach_time.h>
- #include <pexpert/pexpert.h>
-@@ -188,14 +189,37 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+@@ -7,8 +7,9 @@
+ 
+ #if defined(SWEET)
+ /* pexpert/arm/protos.h is not includable from IOKit C++ TUs (it fails to
+- * compile there: kern_return_t is undefined), so the GICv2 IPI helper is
+- * declared locally before its call below. */
++ * compile there: kern_return_t is undefined), and sched_prim.h hides
++ * thread_bind() behind MACH_KERNEL_PRIVATE, which the IOKit build does not
++ * define.  Declare just the two symbols used below. */
+ #include <IOKit/IOCPU.h>
+ #include <IOKit/IOLib.h>
+ #include <libkern/c++/OSData.h>
+@@ -28,6 +29,8 @@ extern "C" boolean_t sweet_cpu_signal_is_enabled(unsigned int cpu);
+ extern "C" void pe_sweet_gic_self_sgi(uint32_t intid);
+ extern "C" void pe_sweet_gic_broadcast_sgi(uint32_t intid);
+ #endif /* SWEET_GICV2 */
++/* thread_bind() is declared in sched_prim.h only for the private osfmk build. */
++extern "C" processor_t thread_bind(processor_t processor);
+ 
+ class SweetCPU;
+ static SweetCPU *sweet_cpus[MAX_CPUS];
+@@ -188,14 +191,37 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
  		panic("SWEET CPU: expected logical boot CPU 0, got %u",
  		    topology->boot_cpu->cpu_id);
  	}
@@ -50,7 +63,7 @@ index dae6f87..b6afb3d 100644
  		/*
  		 * processor_start() is asynchronous for secondaries in this XNU.
  		 * The secondary clears SIGPdisabled by taking its own SGI after
-@@ -205,19 +229,39 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+@@ -205,19 +231,39 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
  		 * handshake while waiting instead of declaring the CPU dead.
  		 */
  		nanoseconds_to_deadline(5 * NSEC_PER_SEC, &deadline);
@@ -94,7 +107,7 @@ index dae6f87..b6afb3d 100644
  #if defined(SWEET_GICV2)
  			if (__atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE) != 0 &&
  			    !sweet_cpu_signal_is_enabled(i) &&
-@@ -242,9 +286,18 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+@@ -242,9 +288,18 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
  			IOLog("SWEET CPU: cpu=%u needed %u bring-up SGI retry(ies)\n",
  			    i, nudges);
  		}
