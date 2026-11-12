@@ -1,0 +1,72 @@
+diff --git a/bsd/dev/a10_battery.c b/bsd/dev/a10_battery.c
+index 4bccf76..3295988 100644
+--- a/bsd/dev/a10_battery.c
++++ b/bsd/dev/a10_battery.c
+@@ -104,6 +104,34 @@ static bool a10_charger_ok;
+ static bool a10_backlight_ready;
+ static bool a10_backlight_on = true;
+ static int a10_backlight_mode = -1;	/* a10bl: 0 off, 1 full init, 2 enable only */
++static int a10_backlight_level = -1;	/* a10bl_level: 0..255 (LM3632 reg 0x05) */
++
++/*
++ * The LM3632 takes the backlight brightness in register 0x05 (0x00 = off,
++ * 0xff = full).  The port has no IODisplay, so iOS cannot drive a slider;
++ * the level is taken from the boot arguments instead.
++ */
++static int
++a10_backlight_get_level(void)
++{
++	int level = 0xff;
++
++	if (a10_backlight_level >= 0) {
++		return a10_backlight_level;
++	}
++	if (!PE_parse_boot_argn("a10bl_level", &level, sizeof(level))) {
++		level = 0xff;
++	}
++	if (level < 0) {
++		level = 0;
++	}
++	if (level > 0xff) {
++		level = 0xff;
++	}
++	a10_backlight_level = level;
++	printf("A10 BATTERY: backlight level %d/255\n", level);
++	return level;
++}
+ 
+ static int
+ a10_backlight_get_mode(void)
+@@ -551,7 +579,7 @@ a10_backlight_init(void)
+ 		 * the bootloader programmed. */
+ 		value = 0x07;
+ 		(void)a10_i2c_write_reg(a10_i2c_bl, A10_BL_ADDR, 0x04, &value, 1);
+-		value = 0xff;
++		value = (uint8_t)a10_backlight_get_level();
+ 		(void)a10_i2c_write_reg(a10_i2c_bl, A10_BL_ADDR, 0x05, &value, 1);
+ 	} else {
+ 		for (unsigned i = 0; i < sizeof(a10_lm3632_init); i += 2) {
+@@ -559,10 +587,13 @@ a10_backlight_init(void)
+ 			(void)a10_i2c_write_reg(a10_i2c_bl, A10_BL_ADDR,
+ 			    a10_lm3632_init[i], &value, 1);
+ 		}
++		value = (uint8_t)a10_backlight_get_level();
++		(void)a10_i2c_write_reg(a10_i2c_bl, A10_BL_ADDR, 0x05, &value, 1);
+ 	}
+ 	a10_backlight_ready = true;
+ 	a10_backlight_on = true;
+-	printf("A10 BATTERY: LM3632 initialised (mode %d)\n", mode);
++	printf("A10 BATTERY: LM3632 initialised (mode %d, level %d/255)\n",
++	    mode, a10_backlight_get_level());
+ 	return 0;
+ }
+ 
+@@ -584,7 +615,7 @@ a10_backlight_set(int on)
+ 	if (on) {
+ 		value = 0x07;
+ 		(void)a10_i2c_write_reg(a10_i2c_bl, A10_BL_ADDR, 0x04, &value, 1);
+-		value = 0xff;
++		value = (uint8_t)a10_backlight_get_level();
+ 		(void)a10_i2c_write_reg(a10_i2c_bl, A10_BL_ADDR, 0x05, &value, 1);
+ 	} else {
+ 		value = 0x00;
