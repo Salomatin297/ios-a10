@@ -1,0 +1,167 @@
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index 4afc4f2..d487e0c 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -246,17 +246,29 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ 	/* Rows are written only by secondaries until the timeout report. */
+ 	sweet_smp_mark_clear();
+ 
++	/*
++	 * Publish the ADT/cpu_data for the secondary before releasing it.
++	 * 0122 started every secondary before waiting for any of them, but
++	 * the Samsung secure monitor on this SoC only reliably services one
++	 * outstanding CPU_ON: with eight (and occasionally four) cores a
++	 * target stayed stopped although every SMC returned 0, and a retry
++	 * appeared to reset it in the middle of the reset stub (probe:
++	 * mark=1/2/3/0/0/0, on=4, rc=0).  Release one core, wait for its
++	 * initCPU handshake, then release the next.
++	 */
+ 	for (unsigned int i = 0; i < topology->num_cpus; i++) {
+ 		SweetCPU *cpu = __atomic_load_n(&sweet_cpus[i], __ATOMIC_ACQUIRE);
++		uint64_t next_nudge, next_on;
++		uint32_t nudges = 0, on_retries = 0;
++		vm_offset_t entry = ml_static_vtop((vm_offset_t)&sweet_secondary_entry);
++
+ 		IOLog("SWEET CPU: processor_start cpu=%u mpidr=0x%x from cpu=%d\n",
+ 		    i, topology->cpus[i].phys_id, cpu_number());
+ 		kern_return_t kr = processor_start(cpu->machProcessor);
+ 		if (kr != KERN_SUCCESS) {
+ 			panic("SWEET CPU: cpu=%u processor_start failed: %d", i, kr);
+ 		}
+-	}
+-	for (unsigned int i = 0; i < topology->num_cpus; i++) {
+-		SweetCPU *cpu = __atomic_load_n(&sweet_cpus[i], __ATOMIC_ACQUIRE);
++
+ 		/*
+ 		 * processor_start() is asynchronous for secondaries in this XNU.
+ 		 * The secondary clears SIGPdisabled by taking its own SGI after
+@@ -265,24 +277,27 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ 		 * occasionally dropped (observed on MPIDR 0x102).  Retry the
+ 		 * handshake while waiting instead of declaring the CPU dead.
+ 		 */
+-		nanoseconds_to_deadline(5 * NSEC_PER_SEC, &deadline);
+-		uint64_t next_nudge, next_on;
++		nanoseconds_to_deadline(10 * NSEC_PER_SEC, &deadline);
+ 		nanoseconds_to_deadline(100 * NSEC_PER_MSEC, &next_nudge);
+ 		nanoseconds_to_deadline(500 * NSEC_PER_MSEC, &next_on);
+-		uint32_t nudges = 0, on_retries = 0;
+-		vm_offset_t entry = ml_static_vtop((vm_offset_t)&sweet_secondary_entry);
+ 		while (__atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE) == 0 ||
+ 		    !sweet_cpu_signal_is_enabled(i)) {
++			uint64_t *mark = sweet_smp_mark_row(topology->cpus[i].phys_id);
++			/*
++			 * The secondary writes with caches off.  Drop our cached
++			 * copy (the clear above left the lines clean) so the
++			 * progress row reflects what the target actually wrote.
++			 */
++			FlushPoC_DcacheRegion((vm_offset_t)mark,
++			    sizeof(sweet_smp_mark[0]));
+ 			if (mach_absolute_time() > deadline) {
+-				IOLog("SWEET CPU: cpu=%u mpidr=0x%x NOT alive after 5s "
++				IOLog("SWEET CPU: cpu=%u mpidr=0x%x NOT alive after 10s "
+ 				    "(initialized=%u signal_enabled=%u nudges=%u "
+ 				    "on_retries=%u thread_cpu=%d)\n",
+ 				    i, topology->cpus[i].phys_id,
+ 				    __atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE),
+ 				    sweet_cpu_signal_is_enabled(i) ? 1 : 0, nudges,
+ 				    on_retries, cpu_number());
+-				uint64_t *mark =
+-				    sweet_smp_mark_row(topology->cpus[i].phys_id);
+ 				FlushPoC_DcacheRegion((vm_offset_t)sweet_smp_mark,
+ 				    sizeof(sweet_smp_mark));
+ 				panic("SWEET CPU: cpu=%u timeout mpidr=0x%x init=%u "
+@@ -298,8 +313,15 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ 				    (uint32_t)mark[4], (uint32_t)mark[7],
+ 				    (uint32_t)mark[5], (uint32_t)mark[6]);
+ 			}
++			/*
++			 * Re-issue CPU_ON only when the target never entered the
++			 * reset stub (slot 0 still zero).  Once it is executing
++			 * the stub a second CPU_ON can reset it and prevent it
++			 * from ever reaching start_cpu.
++			 */
+ 			if (i != topology->boot_cpu->cpu_id &&
+ 			    __atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE) == 0 &&
++			    __atomic_load_n(&mark[0], __ATOMIC_ACQUIRE) == 0 &&
+ 			    mach_absolute_time() > next_on && on_retries < 4) {
+ 				/*
+ 				 * CPU_ON can be accepted and then lost by the
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 71b7dc7..87b1ab2 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -207,6 +207,19 @@ Lfound_cpu_data_entry:
+ 	SWEET_SMP_MARK 2, 3
+ 	adrp	x20, EXT(const_boot_args)@page
+ 	add		x20, x20, EXT(const_boot_args)@pageoff
++#if defined(SWEET)
++	/*
++	 * The A10 has no CPU idle/suspend: every core that reaches this
++	 * point was released by SweetCPU::startCPU() as a cold start.
++	 * The generic path validates cpu_reset_handler against
++	 * start_cpu/resume_idle_cpu before branching.  On this port the
++	 * field is not reliable: probe40 reached slot 2 (cpu_data match)
++	 * but never wrote slot 3, although every CPU_ON SMC returned 0,
++	 * and a failed validation spins at Lskip_cpu_reset_handler.  Enter
++	 * the cold-start trampoline directly instead.
++	 */
++	b		EXT(start_cpu)
++#endif /* SWEET */
+ 	ldr		x0, [x21, CPU_RESET_HANDLER]		// Call CPU reset handler
+ 	cbz		x0, Lskip_cpu_reset_handler
+ 
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+index e4c15f2..dbabcdb 100644
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -955,7 +955,8 @@ ml_parse_cpu_topology(void)
+ 	const boolean_t cpumask_boot_arg_present = PE_parse_boot_argn("cpumask", &cpumask_boot_arg, sizeof(cpumask_boot_arg));
+ 
+ #if defined(SWEET)
+-	/* Opt in to SMP: cpus=N (N <= SWEET_SMP_MAX_CPUS; cores 6-7 are the A76s). */
++	/* Opt in to SMP: cpus=N (N <= SWEET_SMP_MAX_CPUS; the two A73s are
++	 * the last nodes in the A10 ADT). */
+ 	if (!cpus_boot_arg_present || cpu_boot_arg == 0) {
+ 		cpu_boot_arg = 1;
+ 	}
+diff --git a/pexpert/pexpert/arm64/board_config.h b/pexpert/pexpert/arm64/board_config.h
+index 88e524a..f13157d 100644
+--- a/pexpert/pexpert/arm64/board_config.h
++++ b/pexpert/pexpert/arm64/board_config.h
+@@ -102,7 +102,14 @@
+ 
+ #define MAX_L2_CLINE                   6
+ #define MAX_CPUS                       8
+-#define MAX_CPU_CLUSTERS               1
++/*
++ * Two logical clusters: the six Cortex-A53s are the E cluster and the two
++ * Cortex-A73s the P cluster (the A10 has three physical clusters, which the
++ * ADT collapses into E/P because this build has HAS_CLUSTER=0).  With one
++ * cluster __ARM_AMP__ is compiled out and a "cluster-type" of 'P'/'E' would
++ * assert in ml_parse_cpu_topology().
++ */
++#define MAX_CPU_CLUSTERS               2
+ 
+ #define CORE_NCTRS                     8 /* Placeholder; KPC is not enabled for this target */
+ 
+diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
+index fd2b8f7..5002196 100644
+--- a/pexpert/pexpert/arm64/SWEET.h
++++ b/pexpert/pexpert/arm64/SWEET.h
+@@ -18,10 +18,12 @@
+ #define SWEET                     1
+ 
+ /*
+- * All eight cores (six A55 + two A76) as one homogeneous SMP cluster:
+- * cpus=N is clamped here. Same ISA level (ARMv8.2), 64-byte lines, PSCI
+- * CPU_ON; the scheduler does not know the A76s are faster (no AMP/P-E
+- * clusters yet).
++ * All eight cores are selectable with cpus=N (clamped here).  On the A10
++ * that is six Cortex-A53s (E) plus two Cortex-A73s (P); the ADT marks them
++ * with cluster-type 'E'/'P' and board_config gives SWEET two logical
++ * clusters, so XNU builds the AMP psets.  Leaving cluster-type at 0 keeps
++ * the older homogeneous SMP behaviour, which is useful for A/B testing
++ * without a kernel rebuild.
+  */
+ #define SWEET_SMP_MAX_CPUS         8
+ 
