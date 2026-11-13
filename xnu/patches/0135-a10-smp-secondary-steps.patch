@@ -1,0 +1,126 @@
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -55,10 +55,11 @@
+ 
+ /*
+  * Per-MPIDR secondary-boot progress rows.  osfmk/arm64/start.s writes
+- * slots 0-6 with the MMU and caches off before the secondary reaches C;
+- * slot 7 is written here from initCPU().  The bring-up CPU owns the
+- * cache lines: it clears and clean+invalidates the array before CPU_ON,
+- * and clean+invalidates again before reading the rows on timeout.
++ * slots 0, 2-6 with the MMU and caches off before the secondary reaches
++ * C; slot 7 is written here from initCPU(), and slot 1 carries a step
++ * counter advanced by arm_init_cpu().  The bring-up CPU owns the cache
++ * lines: it clears and clean+invalidates the array before CPU_ON, and
++ * clean+invalidates again before reading the rows on timeout.
+  */
+ extern "C" uint64_t sweet_smp_mark[64][8] __attribute__((aligned(64))) = {};
+ extern "C" void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);
+@@ -69,6 +70,21 @@
+ 	uint32_t row = (uint32_t)((mpidr & 0xf) | ((mpidr & 0xf00) >> 4));
+ 
+ 	return sweet_smp_mark[row & 0x3f];
++}
++
++/*
++ * Called by osfmk/arm/arm_init.c from the secondary after each init step.
++ * A plain store is enough: the bring-up CPU reads the row through the
++ * coherent interconnect.  Step numbers are documented in arm_init.c.
++ */
++extern "C" void
++sweet_smp_mark_step(uint32_t step)
++{
++	uint64_t *mark = sweet_smp_mark_row(
++	    __builtin_arm_rsr64("MPIDR_EL1"));
++
++	mark[1] = step;
++	__builtin_arm_dsb(DSB_ISHST);
+ }
+ 
+ static void
+diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -58,6 +58,16 @@
+ #include <arm64/proc_reg.h>
+ #include <arm64/sweet_early.h>
+ #include <arm/pmap.h>
++
++#if defined(SWEET)
++/*
++ * Secondary-boot step counter, implemented in
++ * iokit/Kernel/arm/SweetCPU.cpp.  The bring-up CPU reports slot 1 of the
++ * target's row while it waits, so a hang or reboot inside arm_init_cpu()
++ * leaves the last completed step in the persistent log.
++ */
++extern void sweet_smp_mark_step(uint32_t step);
++#endif /* SWEET */
+ #include <arm/caches_internal.h>
+ #include <arm/cpu_internal.h>
+ #include <arm/cpu_data_internal.h>
+@@ -676,6 +686,9 @@
+ arm_init_cpu(
+ 	cpu_data_t      *cpu_data_ptr)
+ {
++#if defined(SWEET)
++	sweet_smp_mark_step(1);
++#endif
+ #if __ARM_PAN_AVAILABLE__
+ 	__builtin_arm_wsr("pan", 1);
+ #endif
+@@ -725,8 +738,14 @@
+ #endif
+ 
+ 	cpu_machine_idle_init(FALSE);
++#if defined(SWEET)
++	sweet_smp_mark_step(2);         /* cpu_machine_idle_init done */
++#endif
+ 
+ 	cpu_init();
++#if defined(SWEET)
++	sweet_smp_mark_step(3);         /* cpu_init done */
++#endif
+ 
+ #ifdef  APPLETYPHOON
+ 	if ((cpus_defeatures & (0xF << 4 * cpu_data_ptr->cpu_number)) != 0) {
+@@ -737,6 +756,9 @@
+ 	 * drivers use mach_absolute_time() to implement rate control
+ 	 */
+ 	cpu_timebase_init(FALSE);
++#if defined(SWEET)
++	sweet_smp_mark_step(4);         /* cpu_timebase_init done */
++#endif
+ 
+ #if KPERF
+ 	/* kptimer_curcpu_up() must be called after cpu_timebase_init */
+@@ -756,10 +778,19 @@
+ 		commpage_update_timebase();
+ 	}
+ 	PE_init_cpu();
++#if defined(SWEET)
++	sweet_smp_mark_step(5);         /* PE_init_cpu done */
++#endif
+ 
+ 	fiq_context_init(TRUE);
++#if defined(SWEET)
++	sweet_smp_mark_step(6);         /* fiq_context_init done */
++#endif
+ 	cpu_data_ptr->rtcPop = EndOfAllTime;
+ 	timer_resync_deadlines();
++#if defined(SWEET)
++	sweet_smp_mark_step(7);         /* timer_resync_deadlines done */
++#endif
+ 
+ 	processor_t processor = PERCPU_GET_RELATIVE(processor, cpu_data, cpu_data_ptr);
+ 	bool should_kprintf = processor_should_kprintf(processor, true);
+@@ -797,6 +828,9 @@
+ #endif
+ 
+ 
++#if defined(SWEET)
++	sweet_smp_mark_step(8);         /* entering slave_main */
++#endif
+ 	slave_main(NULL);
+ }
+ 
