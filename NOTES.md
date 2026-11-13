@@ -2,6 +2,52 @@
 
 ## >>> A10 PORT (Samsung Galaxy A10, SM-A105F) - active work 2026-11-13 <<<
 
+### >>> UPDATE 2026-11-13 (ночь): 0132 early eMMC log, probe51-55, все 8 ядер <<<
+
+**Состояние SMP.** probe51 (старое ядро + 8-CPU ADT + `cpus=6`) — Kernel
+Panic; probe52 (`cpus=8`) собран, не прошивался. probe53 (0131 + 8-CPU ADT +
+`cpus=6`) — полосы, лог не обновился (смерть до eMMC). probe54 (0126 +
+`cpus=4`) — чёрный экран без подсветки. probe55 (0127 + 8-CPU ADT + `cpus=4`)
+— **полосы**: значит, AMP-кластеры 0126 не единственная причина, сериализованный
+bring-up падает и на 4 ядрах. Все падения происходят до старта log-треда,
+поэтому причина не видна.
+
+**`cpus=N` — это не «лимит поверх ADT», а выбор первых N узлов топологии.**
+XNU 8796 присваивает `cpu->cpu_id = topology_info.num_cpus++` в порядке DT
+(`osfmk/arm64/machine_routines.c:1017`); свойства `logical-cpu-id`/`cpu-id` из
+ADT он не читает. В `work/a10-8cpu-smp.adt` уже 8 узлов, boot 0x100 первым,
+`cpu-id` 0..7, `cpus=8` регистрирует все восемь. Поэтому «все 8» = `cpus=8`
+(probe50/52/53), а `cpus=4` был диагностическим шагом.
+
+**Патч 0132** (`f2ca068`, CI `43429363678`, файл
+`xnu/patches/0132-a10-smp-early-emmc-log.patch`):
+* `sweet_emmc_log_flush()`: `block_base = pos - skip`, `pos = block_base +
+  n*512`; `copy` — абсолютная позиция, `dst` — смещение в bounce-буфере при
+  отставании от окна ring. Старый код терял старшие биты ring при wrap.
+* `sweet_emmc_bringup()` вынесен из `sweet_emmc_init()`; новый
+  `sweet_emmc_early_init()` поднимает карту/карточку/раздел и запускает
+  log-тред до первого CPU_ON; `sweet_emmc_init()` переиспользует bring-up.
+* `sweet_emmc_log_flush_now(tag)` — синхронный чекпойнт; `SweetCPU::startAll`
+  вызывает его после `sweet_emmc_early_init()` и вокруг каждого
+  `processor_start`.
+* CI: отдельный артефакт `xnu-kernel-only` (16 МБ), чтобы не качать 142 МБ
+  `xnu-kernel`.
+
+**Диск:** удалены старые `ci/xnu-kernel-430*`, buildtree, probe34-50 и
+`*.link`; свободно ~1.9 ГБ вместо 53 МБ.
+
+**Лог probe55 снят в TWRP** (`dist/logs/probe55/`): заголовок не изменился —
+`total=222974`, `seq=1567`, то есть ядро 0127 при `cpus=4` умирает до
+`sweet_emmc_init()`/log-треда, как и 0126/0131. Это ещё раз подтверждает, что
+причина — сериализованный bring-up (или direct branch в start.s), а не число
+ядер и не AMP-кластеры.
+
+**Дальше:** дождаться CI 43429363678, собрать probe56 = 0132 + 8-CPU ADT +
+`cpus=8` (все ядра), прошить и снять лог. Если снова паника — по
+`SWEET SMP: cpu=N mark=...` и `pre/post-cpu-on` будет видно, на каком CPU и
+на каком этапе. Fallback — 4 ядра (2×A73 + 2×A53), для него нужен ADT с
+порядком `0x100,0x000,0x001,0x101,...`.
+
 ### >>> UPDATE 2026-11-13 (вечер): приложения перенесены в /Applications, boot probe40d <<<
 
 **Решение по приложениям изменено: миграцию не запускаем.** Прошлый запуск
