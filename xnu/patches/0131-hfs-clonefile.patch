@@ -1,0 +1,135 @@
+diff --git a/bsd/sweet_hfs/core/hfs.h b/bsd/sweet_hfs/core/hfs.h
+index 1a6b5a8..04e3360 100644
+--- a/bsd/sweet_hfs/core/hfs.h
++++ b/bsd/sweet_hfs/core/hfs.h
+@@ -762,6 +762,9 @@ int hfs_set_backingstore (struct vnode *vp, int val);				/* in hfs_cnode.c */
+ int hfs_is_backingstore (struct vnode *vp, int *val);		/* in hfs_cnode.c */
+ 
+ int hfs_vnop_link(struct vnop_link_args *);                /* in hfs_link.c */
++int hfs_vnop_clonefile(struct vnop_clonefile_args *);      /* in hfs_link.c */
++int hfs_vnop_symlink(struct vnop_symlink_args *);          /* in hfs_vnops.c */
++int hfs_vnop_readlink(struct vnop_readlink_args *);        /* in hfs_vnops.c */
+ 
+ int hfs_vnop_lookup(struct vnop_lookup_args *);            /* in hfs_lookup.c */
+ 
+diff --git a/bsd/sweet_hfs/core/hfs_link.c b/bsd/sweet_hfs/core/hfs_link.c
+index bad126d..7942031 100644
+--- a/bsd/sweet_hfs/core/hfs_link.c
++++ b/bsd/sweet_hfs/core/hfs_link.c
+@@ -36,6 +36,7 @@
+ #include <vfs/vfs_support.h>
+ #include <libkern/libkern.h>
+ #include <sys/fsctl.h>
++#include <sys/uio.h>
+ 
+ #include "hfs.h"
+ #include "hfs_catalog.h"
+@@ -702,6 +703,96 @@ out:
+ }
+ 
+ 
++/*
++ * Clone a file.
++ *
++ * HFS+ has no copy-on-write extent cloning, so a clone of a regular file is
++ * represented by a hard link.  That shares the data, which is exactly what
++ * the iOS installer needs: it clones each bundle file into a staging area,
++ * moves the staged tree into the app container, and deletes the source
++ * bundle.  Directories are created by the installer itself; symbolic links
++ * are recreated with the same target.
++ *
++ * clonefile_internal() accepts a NULL *a_vpp from a filesystem that clones
++ * without returning a vnode, so we can hand the work to the existing link
++ * and symlink paths and skip the attribute fallback.
++ */
++int
++hfs_vnop_clonefile(struct vnop_clonefile_args *ap)
++{
++	struct vnop_link_args linkargs;
++	struct vnop_symlink_args symargs;
++	struct vnop_readlink_args readargs;
++	struct vnode *tvp = NULLVP;
++	uio_t uio;
++	char *target;
++	int error;
++
++	switch (vnode_vtype(ap->a_fvp)) {
++	case VREG:
++		linkargs.a_desc = &vnop_link_desc;
++		linkargs.a_vp = ap->a_fvp;
++		linkargs.a_tdvp = ap->a_dvp;
++		linkargs.a_cnp = ap->a_cnp;
++		linkargs.a_context = ap->a_context;
++
++		error = hfs_vnop_link(&linkargs);
++		if (error == 0) {
++			*ap->a_vpp = NULLVP;
++		}
++		return (error);
++
++	case VLNK:
++		target = hfs_malloc(MAXPATHLEN + 1);
++		if (target == NULL) {
++			return (ENOMEM);
++		}
++		uio = uio_create(1, 0, UIO_SYSSPACE, UIO_READ);
++		if (uio == NULL) {
++			hfs_free(target, MAXPATHLEN + 1);
++			return (ENOMEM);
++		}
++		if (uio_addiov(uio, CAST_USER_ADDR_T(target), MAXPATHLEN) != 0) {
++			uio_free(uio);
++			hfs_free(target, MAXPATHLEN + 1);
++			return (ENOMEM);
++		}
++
++		readargs.a_desc = &vnop_readlink_desc;
++		readargs.a_vp = ap->a_fvp;
++		readargs.a_uio = uio;
++		readargs.a_context = ap->a_context;
++
++		error = hfs_vnop_readlink(&readargs);
++		if (error == 0) {
++			target[MAXPATHLEN - uio_resid(uio)] = '\0';
++
++			symargs.a_desc = &vnop_symlink_desc;
++			symargs.a_dvp = ap->a_dvp;
++			symargs.a_vpp = &tvp;
++			symargs.a_cnp = ap->a_cnp;
++			symargs.a_vap = ap->a_vap;
++			symargs.a_target = target;
++			symargs.a_context = ap->a_context;
++
++			error = hfs_vnop_symlink(&symargs);
++			if (error == 0) {
++				if (tvp != NULLVP) {
++					vnode_put(tvp);
++				}
++				*ap->a_vpp = NULLVP;
++			}
++		}
++		uio_free(uio);
++		hfs_free(target, MAXPATHLEN + 1);
++		return (error);
++
++	default:
++		return (ENOTSUP);
++	}
++}
++
++
+ /*
+  * Remove a link to a hardlink file/dir.
+  *
+diff --git a/bsd/sweet_hfs/core/hfs_vnops.c b/bsd/sweet_hfs/core/hfs_vnops.c
+index d210179..9ea7cc2 100644
+--- a/bsd/sweet_hfs/core/hfs_vnops.c
++++ b/bsd/sweet_hfs/core/hfs_vnops.c
+@@ -7408,6 +7408,7 @@ const struct vnodeopv_entry_desc hfs_vnodeop_entries[] = {
+     { &vnop_pagein_desc, (VOPFUNC)hfs_vnop_pagein },		/* pagein */
+     { &vnop_pageout_desc,(VOPFUNC) hfs_vnop_pageout },		/* pageout */
+     { &vnop_copyfile_desc, (VOPFUNC)err_copyfile },		/* copyfile */
++    { &vnop_clonefile_desc, (VOPFUNC)hfs_vnop_clonefile },	/* clonefile */
+     { &vnop_blktooff_desc, (VOPFUNC)hfs_vnop_blktooff },		/* blktooff */
+     { &vnop_offtoblk_desc, (VOPFUNC)hfs_vnop_offtoblk },		/* offtoblk */
+     { &vnop_blockmap_desc, (VOPFUNC)hfs_vnop_blockmap },			/* blockmap */

@@ -1,6 +1,51 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
-## >>> A10 PORT (Samsung Galaxy A10, SM-A105F) - active work 2026-11-09 <<<
+## >>> A10 PORT (Samsung Galaxy A10, SM-A105F) - active work 2026-11-13 <<<
+
+### >>> UPDATE 2026-11-13: 8 ядер (0128/0129), разбор probe47/48, приложения, яркость <<<
+
+**Что показали probe47/probe48 (пользователь; логов на руках нет):**
+* probe47 = ядро 0127 (CI `43302031409`) + ADT probe40 (8 CPU, `cluster-type 0`) + `cpus=8` → 1-й запуск «полосы», 2-й/3-й «чёрный экран без подсветки + фонарик».
+* probe48 = старое рабочее ядро (CI `43251466118`) + `work/a10-mixed-native.adt` (`cluster-type 'E'/'P'`) + `cpus=4` → `SWEET EARLY PANIC: machine_routines.c:1055 Assertion failed: phys_cluster_id <= MAX_CPU_CLUSTER_PHY_ID`.
+
+**Причина assert (проверена по коду, `osfmk/arm64/machine_routines.c`).** При `MAX_CPU_CLUSTERS=1` (`HAS_CLUSTER=0`) ветка `#else` даёт `phys_cluster_id = (cpu->cluster_type == CLUSTER_TYPE_P)`, то есть 1 для узлов с `cluster-type 'P'`, тогда как `MAX_CPU_CLUSTER_PHY_ID = MAX_CPU_CLUSTERS-1 = 0` → assert. Именно такие узлы (два A73) были в `dist/a10.adt`. Рабочие конфигурации (probe40, probe46) использовали `cluster-type 0` у всех узлов. Это же объясняет, почему probe47 (он шёл с ADT probe40, `cluster-type 0`) не падал с assert — его полосы/чёрный экран имеют другую причину.
+
+**Что ещё вскрыто (важно для 8 ядер):**
+* На Exynos 7884B три физических кластера: A73×2 (MPIDR `0x0`/`0x1`, кластер 0), A53×4 (`0x100`–`0x103`, кластер 1), A53×2 (`0x200`/`0x201`, кластер 2). Живой DT (`dist/A10/fdt.dtb`) это подтверждает, все восемь узлов `enable-method='psci'`.
+* GIC — **GIC-400 (GICv2)**: в живом DT `arm,cortex-a15-gic`, четыре MMIO-окна — GICD `0x12301000`, GICC `0x12302000`, `0x12304000` (0x2000), `0x12306000` (0x2000). То есть у чипа **три CPU-интерфейса** (по одному на кластер), а порт маппит только один (`0x12302000`). Это главный подозреваемый на «8 ядер»: вторичное ядро из другого кластера программирует чужой интерфейс, поэтому прерывания (PPIs, SGI) могут не прийти вовсе.
+* Никогда не проверялось: **кластер 2** (`0x200`/`0x201`). Работали только `0x100`–`0x103` (кластер 1, probe40) и `0x0`/`0x1` (кластер 0 — A73, probe46: `came alive; SGI1 OK`, 4/4 CPUs initialized).
+* Boot CPU — MPIDR `0x100` (первый A53 кластера 1); в ADT он помечен `state='running'`, и XNU по этому признаку считает его логическим CPU 0.
+* `probe40`-подобная конфигурация (4×A53) работает и сегодня: `SWEET CPU: requested=4 selected=4`, `4/4 CPUs initialized, SGI1 verified`.
+
+**Патч 0128** (`xnu/patches/0128-a10-smp-logflush-diagnostics.patch`, три изменения):
+1. `bsd/dev/sweet_emmc.c` — **фикс флаша персистентного лога**: в bounce-буфер копируется весь блок кольца, а не только новый хвост. Раньше каждый флаш затирал уже записанную часть того же 4-КиБ блока и обнулял последующие блоки — отсюда «лоскутный» лог и пропадающие строки (в том числе текст паники SMP).
+2. `osfmk/arm64/machine_routines.c` — на SWEET всегда **один логический SMP-кластер**: `cluster-type` из ADT игнорируется, `phys_cluster_id = 0`. Любой ADT теперь проходит топологию без assert (и AMP-pset не строится).
+3. `iokit/Kernel/arm/SweetCPU.cpp` — при таймауте bring-up печатается строка `SWEET SMP: cpu=N mpidr=0x… mark=…` для **каждого** CPU (маркер: 0 — не вошёл в reset-stub, 3 — нашёл свой cpu_data, 7 — дошёл до точки входа на C). По таблице видно, до какой стадии дошёл каждый вторичный CPU.
+
+**Патч 0129** (`xnu/patches/0129-a10-backlight-level.patch`): уровень подсветки LM3632 (регистр `0x05`) задаётся boot-аргументом `a10bl_level=0..255` (по умолчанию `0xff`). Раньше был только `a10bl=0/1/2` (выкл / полная инициализация / только enable-регистры) и всегда `0xff`.
+
+**ADT для 8 ядер** (`tools/mkadt-a10.py`): добавлен `A10_CLUSTER_TYPE=smp` (у всех узлов `cluster-type 0`, `cluster-id 0`) и изменён порядок узлов на `[0x100, 0x101, 0x102, 0x103, 0x0, 0x1, 0x200, 0x201]` — сначала проверенный кластер 1, потом кластер 0 (A73, проверен в probe46) и только потом кластер 2 (не проверен). `cpus=6` ⇒ 4×A53 + 2×A73 (риск минимален), `cpus=8` добавляет кластер 2. Файл: `work/a10-8cpu-smp.adt` (12 980 байт).
+
+**probe49 = ядро 0128/0129 + `work/a10-8cpu-smp.adt` + `cpus=6`**, **probe50 = то же + `cpus=8`** — между ними ровно одна переменная.
+
+**Порядок проверки:** прошить probe49 → если GUI поднялся и в логе `6/6 CPUs initialized` — прошить probe50 → если probe50 падает, снять лог (`python tools\a10_log_pull.py --out dist\logs\probe50`) и смотреть строку `SWEET SMP: cpu=… mark=…`: если у ядер кластера 2 (`0x200`/`0x201`) маркер 0 — значит кластер 2 не поднят (не подано питание/не включён), и 6 ядер — это максимум без отдельной работы по питанию кластеров.
+
+**Приложения (уточнение задачи: «Заметки, Музыка и другие»).** Разбор тома дал неожиданный результат:
+* `/Applications` содержит 140 бандлов, и это в основном **служебные** приложения (ViewService/UI-service, AppStore, Preferences, MobileSlideShow = Photos, MobileSafari, MobilePhone, MobileSMS, Camera, Siri, Setup, Family). **Notes.app, Music.app, Weather.app, Calendar.app, Reminders.app, Podcasts, Books, TV, Wallet, Health, Fitness, Voice Memos, Files, Freeform, Journal, Tips, Translate, Magnifier, Home, News, Stocks в томе отсутствуют** (проверено по каталогу: 140 bundle id собраны и вычитаны из `Info.plist`, `work/bundle_ids.json`).
+* `/private/var/staged_system_apps` — **пуст (0 записей)**. До миграционного эксперимента там было 5 576 папок / 3 840 файлов: там и лежали пользовательские приложения, их удалил `datamigrator` во время миграции 20H391 → 20H392 (миграцию потом откатили, но файлы уже пропали). Разбор: `work/analyze_staged_restore.py`.
+* `DefaultIconState*.plist` в `SpringBoard.app` — **data fork пуст (0 байт)**, то есть ресурс потерялся ещё при создании тома. Поэтому SpringBoard при каждой загрузке строит минимальный `IconState.plist`: 6 виджетов Today + Photos/App Store/Settings + док Phone/Safari/SMS (2720 байт) — это и есть «скудный» домашний экран. Переименование `IconState.plist` → `XconState.plist` (чтобы SpringBoard пересоздал файл) сработало — новый файл он действительно создал, но по пустому шаблону.
+* Том: 5 242 880 блоков по 4096 Б, свободно 2 258 963 блока (8.6 ГБ). **Битмап выделения устарел**: ядро при записи файлов его не обновляет (блок 3473838 с `IconState.plist` помечен свободным, хотя занят) — значит «свободные» блоки реально пригодны для записи.
+* Формат записи каталога в томе (нестандартный, пишет порт): `logicalSize` @+88, `totalBlocks` @+100, экстенты @+104 (8 слотов по 8 байт), лист-узел 8 КиБ, каталог начинается с блока 183714. Правка записи возможна (так уже делалось переименованием).
+* **Что нужно для полного решения:** (1) вернуть системные приложения в том — это перенос тысяч объектов из исходного образа iOS (`C:\Users\User\AppData\Local\Temp\opencode\ios-root.zip`, 6 ГБ, `ios-root.img.gz.part*`) с **созданием** каталогов и файлов в HFS+ (порт умеет только перезаписывать существующие файлы; вставки в B-дерево каталога нет) и (2) восстановить `DefaultIconState` (rsrc-форк) — либо синтезировать шаблон. Это отдельная большая задача, а не патч.
+* Без риска для тома можно сделать только одно: переписать `IconState.plist` (файл в `/private/var/mobile/Library/SpringBoard/`, вне подписи бандла) — но SpringBoard может перезаписать его сам при следующей загрузке, и починить шаблон в подписанном `SpringBoard.app` нельзя без риска для подписи кода.
+
+**Яркость.** Класс `AppleCLCD` в порту — это `IOMobileFramebuffer`, а **не `IODisplay`**: iOS не имеет ни ползунка яркости, ни сервиса, который ею управляет. Регулировка возможна только через boot-аргумент. Сделано: `a10bl_level=0..255` (патч 0129) — уровень пишется в регистр LM3632 `0x05` при инициализации и при каждом включении подсветки. Полноценный ползунок = реализация `IODisplay::setBrightness` (отдельная задача).
+
+**Wi-Fi / Bluetooth / Cellular — трезвая оценка (в этом цикле не начинаю).**
+* Wi-Fi/BT: чип Broadcom; в DT есть только reserved-окно `wifibt_if` (0xe9000000, 4 МБ) — это память сопроцессора, не драйвер. Нужны firmware-шейд, собственный драйвер и iOS-стек (IO80211Family/CoreBluetooth) поверх него. Для iOS-userland это новая подсистема, а не патч.
+* Cellular: модем Exynos (SHANNON) в чипе есть, но init-прошивка и AT-порт в порту не заведены; iOS-userland ждёт `com.apple.CommCenter`/CoreTelephony. Реалистично — только после появления рабочего Wi-Fi/BT.
+* Практический вывод: без Wi-Fi/BT не заработает и модемный стек, а без них — половина системных сервисов. Это правильно оформить как отдельные milestones, а не как «недоделку».
+
 
 ### >>> UPDATE 2026-11-12: eight-core SMP (0126), migration diagnosis, IconState reset <<<
 
@@ -56,6 +101,30 @@ keeps 0126's serialized secondary bring-up.  Patch:
 path works at all, independently of 0126; image `dist/boot-a10-probe46.img`
 (ADT md5 `cbdf431b2fbe211d0d6fe8a8a3522bef`).
 
+**probe46 result (ring `work/logs-probe46`, 1,439,281 bytes, seq=19570):**
+the A73 start path works — `cpu=2 mpidr=0x0` and `cpu=3 mpidr=0x1` both
+`came alive; SGI1 OK`, `4/4 CPUs initialized`.  Userland runs too
+(backboardd, SpringBoard, touch events), but the screen stays black: every
+presented frame is empty (`SWEET FB: stats ... nz 0/56028 sum 0`, pixels
+`00000000`), while probe40's first frame is the white logo (`nz 56028/56028`).
+backboardd retries `AppleM2ScalerCSCDriver` 255 times in this log vs once in
+probe40.  No panic/assert in the ring.  Control experiment now booting:
+probe40 image on the current userdata (the migration experiment and the
+`IconState.plist` rename happened after the last probe40 boot) to separate a
+userdata regression from a CPU-topology effect.
+
+The black frames are explained by the ADT, not the CPUs: `work/a10-mixed-smp.adt`
+had been generated with the generator defaults, so it carried `display-scale`
+2 and a 720×1560 disp0 canvas while probe40's ADT has `display-scale` 3 and
+1125×2436.  `work/a10-mixed-native.adt` is the same 2×A73+2×A53 tree
+regenerated with `A10_CANVAS_W=1125 A10_CANVAS_H=2436 A10_DISPLAY_SCALE=3
+A10_ARTWORK_SCALE=3`; apart from CPU nodes it differs from probe40's ADT only
+in phandle numbering and the random seed.  **probe48** = old proven kernel
+(CI `43251466118`) + `a10-mixed-native.adt`, `cpus=4`,
+`dist/boot-a10-probe48.img` — the corrected mixed-cluster fallback test.
+**probe47** = 0127 kernel (CI `43302031409`) + `work/boot-a10-probe40-adt.adt`
+(8 CPUs, native canvas) + `cpus=8`, `dist/boot-a10-probe47.img`.
+
 **Migration experiment (patched `com.apple.migration.plist` 20H392 -> 20H391)
 ran but hung.**  The volume is writable at runtime: the first boot with the
 patched plist spawned `datamigrator` and the serial
@@ -71,6 +140,24 @@ and CommCenter XPC lookups fail; the CoreLocation migrator never returns.
 The migration block was restored to the original bytes (md5
 `0b4c192f3a67edf71063817f9a559cd7`, `work/migration-block.bin`) so the phone
 boots again; re-patch only after skipping CoreLocation.
+
+**Correction (probe40c): that block was inert.**  `/private/var/db/com.apple.migration.plist`
+no longer exists in the HFS catalog, so patching its stale data block (LBA
+3244033) changed nothing.  The live iOS 16 state is
+`/private/var/mobile/Library/Preferences/com.apple.migration.plist` (179-byte
+bplist, one 4096-byte block at LBA 3409055).  It still had
+`LastSystemVersion` = `previousBuildVersion` = `20H391` against `buildVersion`
+20H392, so DataMigration judged migration necessary on every boot.  probe40c
+symbolication confirms the chain: backboardd blocked in
+`-[DMConnection migrateCheckingNecessity:lastRelevantPlugin:testMigrationInfrastructureOnly:]`
+-> `-[DMXPCConnection sendMessageSync:]` -> `dispatch_mach_send_and_wait_for_reply`,
+and SpringBoard blocked in `-[BKSSystemShellService _checkIn]` waiting for
+backboardd.  **Fix:** `work/fix_user_migration.py --apply` replaces the one
+shared bplist string `20H391` with `20H392` (both `LastSystemVersion` and
+`previousBuildVersion`; same length, no catalog change).  Note: TWRP's toybox
+`dd` truncates its output by default and fails on a block device with
+`ftruncate: Invalid argument`, so block writes need `conv=notrunc,fsync`.
+probe40 was reflashed on the fixed state as the control.
 
 **Icons:** `/Applications` holds all 141 app bundles, the csstore has 140
 `/Applications/*.app` paths, and `lsd`, `installd`, `installcoordinationd`,

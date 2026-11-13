@@ -11,10 +11,9 @@ index f1f0d49..a0ce61c 100644
  bsd/dev/sweet_spmi.c			standard
  bsd/dev/sweet_usb.c			standard
 diff --git a/bsd/dev/sweet_emmc.c b/bsd/dev/sweet_emmc.c
-index 584a763..b415772 100644
 --- a/bsd/dev/sweet_emmc.c
 +++ b/bsd/dev/sweet_emmc.c
-@@ -1535,8 +1535,11 @@ sweet_emmc_rootdev(dev_t *dev)
+@@ -1535,8 +1535,11 @@
  {
  	extern void a10_keys_init(void);
  	extern void a10_touch_init(void);
@@ -23,9 +22,9 @@ index 584a763..b415772 100644
  	a10_keys_init();
 +	/* Audio block probe (SPEEDY + ABOX + codec); opt-in via a10audio=1. */
 +	(void)a10_audio_init();
- 	printf("SWEET: a10_touch_init entry\n");
  	a10_touch_init();
- 	printf("SWEET: a10_touch_init done\n");
+ 	if (!se.ready) {
+ 		int error = sweet_emmc_init();
 diff --git a/bsd/dev/a10_audio.c b/bsd/dev/a10_audio.c
 new file mode 100644
 index 0000000..6c707ac
