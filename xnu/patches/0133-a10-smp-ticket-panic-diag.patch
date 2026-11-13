@@ -1,0 +1,25 @@
+diff --git a/osfmk/kern/lock_ticket.c b/osfmk/kern/lock_ticket.c
+--- a/osfmk/kern/lock_ticket.c
++++ b/osfmk/kern/lock_ticket.c
+@@ -122,7 +122,20 @@
+ static void
+ __hw_lck_ticket_invalid_panic(hw_lck_ticket_t *lck)
+ {
+-	panic("Invalid HW ticket lock %p <0x%08x>", lck, lck->lck_value);
++	/*
++	 * A10 SMP bring-up diagnostic: the panic text is the only record
++	 * that survives to the persistent eMMC log, so include the caller
++	 * and the CPU identity here.  lck points at the embedded
++	 * hw_lck_ticket_t (the "tu" field of lck_ticket_t), hence the
++	 * four words at lck-8 describe the enclosing lock.
++	 */
++	panic("Invalid HW ticket lock %p <0x%08x> lr=%p mpidr=0x%llx "
++	    "tpidr=0x%llx outer=%08x/%08x/%08x/%08x", lck, lck->lck_value,
++	    __builtin_return_address(0),
++	    (unsigned long long)__builtin_arm_rsr64("MPIDR_EL1"),
++	    (unsigned long long)__builtin_arm_rsr64("TPIDR_EL0"),
++	    ((const uint32_t *)lck)[-2], ((const uint32_t *)lck)[-1],
++	    ((const uint32_t *)lck)[0], ((const uint32_t *)lck)[1]);
+ }
+ 
+ __abortlike
