@@ -1,0 +1,48 @@
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -273,7 +273,7 @@
+ 	 */
+ 	for (unsigned int i = 0; i < topology->num_cpus; i++) {
+ 		SweetCPU *cpu = __atomic_load_n(&sweet_cpus[i], __ATOMIC_ACQUIRE);
+-		uint64_t next_nudge, next_on;
++		uint64_t next_nudge, next_on, next_report;
+ 		uint32_t nudges = 0, on_retries = 0;
+ 		vm_offset_t entry = ml_static_vtop((vm_offset_t)&sweet_secondary_entry);
+ 
+@@ -298,6 +298,7 @@
+ 		nanoseconds_to_deadline(10 * NSEC_PER_SEC, &deadline);
+ 		nanoseconds_to_deadline(100 * NSEC_PER_MSEC, &next_nudge);
+ 		nanoseconds_to_deadline(500 * NSEC_PER_MSEC, &next_on);
++		nanoseconds_to_deadline(500 * NSEC_PER_MSEC, &next_report);
+ 		while (__atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE) == 0 ||
+ 		    !sweet_cpu_signal_is_enabled(i)) {
+ 			uint64_t *mark = sweet_smp_mark_row(topology->cpus[i].phys_id);
+@@ -308,6 +309,27 @@
+ 			 */
+ 			FlushPoC_DcacheRegion((vm_offset_t)mark,
+ 			    sizeof(sweet_smp_mark[0]));
++			/*
++			 * Periodic progress report: the marker row survives in
++			 * the persistent log even when the phone is rebooted
++			 * before the 10 s timeout.  Slot 0 = reset stub, 2 =
++			 * cpu_data matched, 3 = start_cpu, 4 = MMU on, 7 =
++			 * SweetCPU::initCPU reached.
++			 */
++			if (mach_absolute_time() > next_report) {
++				IOLog("SWEET SMP: wait cpu=%u mpidr=0x%x init=%u "
++				    "sgi=%u mark=%x/%x/%x/%x/%x/%x/%x/%x "
++				    "thread_cpu=%d\n",
++				    i, topology->cpus[i].phys_id,
++				    __atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE),
++				    sweet_cpu_signal_is_enabled(i) ? 1 : 0,
++				    (uint32_t)mark[0], (uint32_t)mark[1],
++				    (uint32_t)mark[2], (uint32_t)mark[3],
++				    (uint32_t)mark[4], (uint32_t)mark[5],
++				    (uint32_t)mark[6], (uint32_t)mark[7],
++				    cpu_number());
++				nanoseconds_to_deadline(500 * NSEC_PER_MSEC, &next_report);
++			}
+ 			if (mach_absolute_time() > deadline) {
+ 				IOLog("SWEET CPU: cpu=%u mpidr=0x%x NOT alive after 10s "
+ 				    "(initialized=%u signal_enabled=%u nudges=%u "
