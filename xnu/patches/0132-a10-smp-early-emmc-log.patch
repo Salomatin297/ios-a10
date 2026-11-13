@@ -1,0 +1,228 @@
+diff --git a/bsd/dev/sweet_emmc.c b/bsd/dev/sweet_emmc.c
+index 584a763..45ffa8b 100644
+--- a/bsd/dev/sweet_emmc.c
++++ b/bsd/dev/sweet_emmc.c
+@@ -1283,11 +1283,24 @@ sweet_emmc_log_flush(void)
+ 		uint32_t off = (uint32_t)(pos % SWEET_EMMC_LOG_SIZE);
+ 		uint32_t blk = off / EMMC_BLOCK_SIZE;
+ 		uint32_t skip = off % EMMC_BLOCK_SIZE;
++		/*
++		 * pos is an absolute console position, not a ring offset.
++		 * block_base is the absolute position of the first byte of
++		 * ring block blk; the old code treated blk * 512 as absolute,
++		 * which broke as soon as total passed the ring size and made
++		 * every later flush restart near the beginning of the log.
++		 */
++		uint64_t block_base = pos - skip;
+ 		uint64_t need = (skip + (total - pos) + EMMC_BLOCK_SIZE - 1) /
+ 		    EMMC_BLOCK_SIZE;
+ 		uint32_t n = (uint32_t)MIN(MIN(need,
+ 		    (uint64_t)(SWEET_EMMC_LOG_BLOCKS - blk)),
+ 		    (uint64_t)(EMMC_MAX_XFER / EMMC_BLOCK_SIZE));
++		uint64_t end = MIN(block_base +
++		    (uint64_t)n * EMMC_BLOCK_SIZE, total);
++		uint64_t copy = block_base;
++		uint64_t dst = 0;
++
+ 		/*
+ 		 * Fill every block that is written with the ring bytes that
+ 		 * belong to it.  The old code copied only the new tail into a
+@@ -1300,23 +1313,17 @@ sweet_emmc_log_flush(void)
+ 		 * and it also hid the panic text of a failed SMP bring-up.
+ 		 */
+ 		bzero(emmc_bounce, n * EMMC_BLOCK_SIZE);
+-		for (uint32_t i = 0; i < n; i++) {
+-			uint64_t block_start = (uint64_t)(blk + i) * EMMC_BLOCK_SIZE;
+-			uint64_t avail = MIN((uint64_t)(blk + i + 1) * EMMC_BLOCK_SIZE,
+-			    total) - block_start;
+-			uint64_t copy = block_start;
+-
+-			if (avail > 0) {
+-				(void)sweet_log_copy(&copy,
+-				    (char *)emmc_bounce + (uint64_t)i * EMMC_BLOCK_SIZE,
+-				    (uint32_t)avail);
+-			}
++		if (copy < window) {
++			/* The leading bytes were already overwritten in the ring. */
++			dst = window - copy;
++			copy = window;
+ 		}
+-		error = emmc_transfer(base + 1 + blk, n, emmc_bounce, true);
+-		pos = (uint64_t)(blk + n) * EMMC_BLOCK_SIZE;
+-		if (pos > total) {
+-			pos = total;
++		if (end > copy) {
++			(void)sweet_log_copy(&copy,
++			    (char *)emmc_bounce + dst, (uint32_t)(end - copy));
+ 		}
++		error = emmc_transfer(base + 1 + blk, n, emmc_bounce, true);
++		pos = block_base + (uint64_t)n * EMMC_BLOCK_SIZE;
+ 	}
+ 	if (!error) {
+ 		struct sweet_emmc_log_header h = {
+@@ -1415,6 +1422,9 @@ sweet_emmc_log_start(void)
+ 	uint32_t on = 1;
+ 	thread_t thread;
+ 
++	if (sweet_emmc_log_enabled) {
++		return;
++	}
+ 	PE_parse_boot_argn("sweetlog", &on, sizeof(on));
+ 	if (!on || !se.writable ||
+ 	    se.partition_sectors < 2 * (uint64_t)SWEET_EMMC_LOG_SECTORS) {
+@@ -1426,8 +1436,38 @@ sweet_emmc_log_start(void)
+ 	}
+ }
+ 
++/*
++ * Synchronous checkpoint used by the SMP bring-up path.  The writer thread
++ * only wakes every 10 ms, and a panic in startAll() stops it before it can
++ * mirror the ring; flushing at each CPU_ON boundary keeps the last console
++ * text (and the panic, via sweet_emmc_log_sync) on the eMMC.
++ */
++void
++sweet_emmc_log_flush_now(const char *tag)
++{
++	int error;
++
++	if (!sweet_emmc_log_enabled || !se.writable) {
++		return;
++	}
++	lck_mtx_lock(&sweet_emmc_lock);
++	error = sweet_emmc_log_flush();
++	lck_mtx_unlock(&sweet_emmc_lock);
++	if (error) {
++		printf("SWEET LOG: %s flush failed (%d)\n", tag, error);
++	}
++}
++
++static bool sweet_emmc_brought_up;
++
++/*
++ * Map the controller, initialize the card and locate the selected GPT
++ * partition.  Split out of sweet_emmc_init() so the SMP bring-up thread can
++ * do it before releasing any secondary CPU: a panic in that window happens
++ * before the block device (and the log writer) exists otherwise.
++ */
+ static int
+-sweet_emmc_init(void)
++sweet_emmc_bringup(void)
+ {
+ 	char partition[64] = "userdata";
+ 	uint32_t rw = 0;
+@@ -1487,6 +1527,51 @@ sweet_emmc_init(void)
+ 		printf("SWEET eMMC: initialization failed: %d\n", error);
+ 		return error;
+ 	}
++	se.writable = (rw == 1);
++	return 0;
++}
++
++/*
++ * Early entry point for iokit/Kernel/arm/SweetCPU.cpp.  Starts the persistent
++ * console log before the first PSCI CPU_ON so an SMP panic is captured even
++ * though the framebuffer console and the regular root-device probe have not
++ * run yet.  Safe to call more than once.
++ */
++int
++sweet_emmc_early_init(void)
++{
++	int error;
++
++	if (sweet_emmc_log_enabled) {
++		return 0;
++	}
++	if (!sweet_emmc_brought_up) {
++		error = sweet_emmc_bringup();
++		if (error != 0) {
++			return error;
++		}
++		sweet_emmc_brought_up = true;
++		printf("SWEET eMMC: early bring-up done, LBA 0x%llx, %s\n",
++		    se.first_sector, se.writable ? "read-write" : "read-only");
++	}
++	sweet_emmc_log_start();
++	return sweet_emmc_log_enabled ? 0 : ENXIO;
++}
++
++static int
++sweet_emmc_init(void)
++{
++	int error;
++
++	if (!sweet_emmc_brought_up) {
++		error = sweet_emmc_bringup();
++		if (error != 0) {
++			return error;
++		}
++		sweet_emmc_brought_up = true;
++	} else {
++		printf("SWEET eMMC: reusing early bring-up\n");
++	}
+ 	se.bmajor = bdevsw_add(-1, &sweet_emmc_bdevsw);
+ 	if (se.bmajor < 0) {
+ 		return ENXIO;
+@@ -1500,8 +1585,6 @@ sweet_emmc_init(void)
+ 	    "emmcroot0");
+ 	devfs_make_node(makedev(se.cmajor, 0), DEVFS_CHAR, UID_ROOT,
+ 	    GID_OPERATOR, 0640, "remmcroot0");
+-	/* Enable writes only after the selected partition has been bounded. */
+-	se.writable = (rw == 1);
+ 	{
+ 		uint32_t wtest = 0;
+ 		PE_parse_boot_argn("emmcwtest", &wtest, sizeof(wtest));
+@@ -1510,8 +1593,8 @@ sweet_emmc_init(void)
+ 		}
+ 	}
+ 	se.ready = true;
+-	printf("SWEET eMMC: \"%s\": LBA 0x%llx, %llu MiB, %s, %u-bit PIO, fifo=%u\n",
+-	    partition, se.first_sector,
++	printf("SWEET eMMC: root: LBA 0x%llx, %llu MiB, %s, %u-bit PIO, fifo=%u\n",
++	    se.first_sector,
+ 	    se.partition_sectors * EMMC_BLOCK_SIZE >> 20,
+ 	    se.writable ? "read-write" : "read-only", se.bus_width,
+ 	    1u << se.fifo_shift);
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index b313df4..71331cc 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -24,6 +24,9 @@
+ 
+ extern "C" void sweet_secondary_entry(void);
+ extern "C" boolean_t sweet_cpu_signal_is_enabled(unsigned int cpu);
++/* bsd/dev/sweet_emmc.c: persistent log, usable before the root device exists. */
++extern "C" int sweet_emmc_early_init(void);
++extern "C" void sweet_emmc_log_flush_now(const char *tag);
+ #if defined(SWEET_GICV2)
+ /* GIC-400 helpers from pe_fiq.c; also used to retry a lost bring-up SGI. */
+ extern "C" void pe_sweet_gic_self_sgi(uint32_t intid);
+@@ -198,6 +201,18 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ 	IOLog("SWEET CPU: requested=%u selected=%u (limit=%u)\n",
+ 	    requested, topology->num_cpus, SWEET_SMP_MAX_CPUS);
+ 
++	/*
++	 * Start the persistent eMMC log before the first CPU_ON.  The writer
++	 * thread normally starts from sweet_emmc_init(), which runs after CPU
++	 * bring-up; a panic in the loop below would otherwise leave no trace
++	 * (the framebuffer console is not up yet either).  The early init is
++	 * safe when the regular root-device probe later reuses it.
++	 */
++	int early = sweet_emmc_early_init();
++	IOLog("SWEET CPU: early eMMC log %s (%d)\n",
++	    early == 0 ? "ready" : "unavailable", early);
++	sweet_emmc_log_flush_now("smp-start");
++
+ 	uint64_t deadline;
+ 	nanoseconds_to_deadline(10 * NSEC_PER_SEC, &deadline);
+ 	while (__atomic_load_n(&sweet_cpus_registered, __ATOMIC_ACQUIRE) != topology->num_cpus) {
+@@ -264,7 +279,10 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ 
+ 		IOLog("SWEET CPU: processor_start cpu=%u mpidr=0x%x from cpu=%d\n",
+ 		    i, topology->cpus[i].phys_id, cpu_number());
++		/* Checkpoint: if CPU_ON wedges the boot core, this line is on disk. */
++		sweet_emmc_log_flush_now("pre-cpu-on");
+ 		kern_return_t kr = processor_start(cpu->machProcessor);
++		sweet_emmc_log_flush_now("post-cpu-on");
+ 		if (kr != KERN_SUCCESS) {
+ 			panic("SWEET CPU: cpu=%u processor_start failed: %d", i, kr);
+ 		}

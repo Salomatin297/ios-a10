@@ -194,6 +194,9 @@ jobs:
           need dxb/xnu/bsd/dev/a10_battery.c 'A10 BATTERY: backlight level %d/255' present '0129 backlight level boot-arg'
           need dxb/xnu/bsd/dev/a10_audio.c 'A10 AUDIO: probe done' present '0130 audio block probe'
           need dxb/xnu/bsd/conf/files 'bsd/dev/a10_audio.c' present '0130 audio driver in the build'
+          need dxb/xnu/bsd/dev/sweet_emmc.c 'sweet_emmc_early_init' present '0132 early eMMC log'
+          need dxb/xnu/bsd/dev/sweet_emmc.c 'block_base is the absolute position' present '0132 ring flush absolute positions'
+          need dxb/xnu/iokit/Kernel/arm/SweetCPU.cpp 'early eMMC log' present '0132 SMP log checkpoint'
           if [ "$fail" -ne 0 ]; then
             echo "::error::A10 port patches did not apply cleanly"
             exit 1
@@ -254,4 +257,13 @@ jobs:
         with:
           name: xnu-kernel
           path: out/
+          if-no-files-found: warn
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: xnu-kernel-only
+          path: |
+            out/kernel.development.sweet
+            out/SHA256SUMS
           if-no-files-found: warn

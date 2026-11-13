@@ -2,6 +2,41 @@
 
 ## >>> A10 PORT (Samsung Galaxy A10, SM-A105F) - active work 2026-11-13 <<<
 
+### >>> UPDATE 2026-11-13 (вечер): приложения перенесены в /Applications, boot probe40d <<<
+
+**Решение по приложениям изменено: миграцию не запускаем.** Прошлый запуск
+`datamigrator` (plist 20H391) удалил staged-бандлы и завис на
+`com.apple.locationd.migrator`; повтор дал бы то же самое. Вместо этого 32
+папки приложений перенесены в каталоге HFS+ из
+`/private/var/staged_system_apps` в `/Applications` — это ровно тот результат,
+который должен был дать SystemAppMigrator, но без запуска миграции и без
+копирования данных:
+
+* 32 записи папок: ключ `(311432, name)` → `(27, name)`;
+* 32 thread-записи: `parentID` 311432 → 27;
+* valence: staged root 32 → 0, `/Applications` 143 → 175;
+* B-дерево пересобрано заново (`work/reparent_staged_apps.py`), выход
+  `work/a10-catalog-apps.bin` (134 217 728 Б, SHA256
+  `46c3e2cf5c29913ab355a6efc26b036b7f1fecbd7cab4d34cca885feadd9c911`),
+  depth 3, root 11138, leaves 11082, used 11139, free 5245, records 663 762.
+* Записано в `mmcblk0p32` по блоку 183714 (32768 блоков, `conv=notrunc,fsync`),
+  чтение обратно совпало по SHA256. Перед записью каталог на устройстве
+  совпадал с `work/a10-catalog-new.bin` (SHA256 `126d6a1a...`).
+
+Данные бандлов уже были восстановлены и помечены занятыми в битмапе; выборочная
+проверка с устройства: `Calculator`, `Weather`, `Music`, `Books` — валидные
+Mach-O arm64 (`cf fa ed fe`, cputype `0x100000c`), `Info.plist` парсятся
+(`com.apple.calculator`, `com.apple.weather`, `com.apple.Music`,
+`com.apple.iBooks`). Миграция остаётся выключенной (`LastSystemVersion=20H392`),
+поэтому ничего не удалит.
+
+**Прошит `dist/boot-a10-probe40d.img`** (4 CPU, ядро 0131 из CI
+`43403485047`, ADT probe40) и устройство перезагружено. Ждём отчёт пользователя:
+появились ли на домашнем экране Calculator, Weather, Music, Notes, Books и
+остальные 27. `IconState.plist` — минимальный шаблон на 2720 Б; SpringBoard
+должен сам дописать новые иконки, если нет — следующий шаг разбор icon state.
+Если приложения видны: прошить probe49 (6 CPU), затем probe50 (8 CPU).
+
 ### >>> UPDATE 2026-11-13: 8 ядер (0128/0129), разбор probe47/48, приложения, яркость <<<
 
 **Что показали probe47/probe48 (пользователь; логов на руках нет):**
