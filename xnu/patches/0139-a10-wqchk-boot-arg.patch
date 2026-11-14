@@ -1,0 +1,35 @@
+diff --git a/osfmk/kern/waitq.c b/osfmk/kern/waitq.c
+--- a/osfmk/kern/waitq.c
++++ b/osfmk/kern/waitq.c
+@@ -656,6 +656,8 @@
+ #endif
+ }
+ 
++static boolean_t sweet_wqchk_enabled = TRUE;
++
+ __startup_func
+ static void
+ waitq_bootstrap(void)
+@@ -663,6 +665,11 @@
+ 	const uint32_t qsz = sizeof(struct waitq);
+ 	vm_offset_t whsize;
+ 	int cpu = 0;
++	int wqchk = 1;
++
++	if (PE_parse_boot_argn("wqchk", &wqchk, sizeof(wqchk))) {
++		sweet_wqchk_enabled = (wqchk != 0);
++	}
+ 
+ 	/*
+ 	 * Determine the amount of memory we're willing to reserve for
+@@ -766,6 +773,10 @@
+ 	long first = -1;
+ 	uint32_t foff = 0;
+ 	uint64_t pa = 0;
++
++	if (!sweet_wqchk_enabled) {
++		return;
++	}
+ 
+ 	if (global_waitqs == &g_boot_waitq || g_num_waitqs == 0 ||
+ 	    g_num_waitqs > 512) {
