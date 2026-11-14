@@ -32,12 +32,16 @@ cpu3=`0x101` (A53), далее A53. `cpus=2` берёт первые два уз
 * probe69 — ядро 0136 (SHA256 `917248dc1cbf142afd48143888a1e614b7a27961b0fa5e7ba7347caed3cbce18`),
   2 ядра A53+A73, keepon; `dist/boot-a10-probe69.img` SHA256
   `AA22278CAA001EC6908FF4016CB2684B05A4B6B53FC2D2FD65B1D43B97F0D5CD`.
-  Прошит 2026-11-14 вечером, ждём отчёт по экрану.
+  **Результат: работает** — пользователь подтвердил экран блокировки,
+  домашний экран и действия. Лог `dist/logs/probe69/a10-sweetlog.txt`
+  (384 781 Б): `cpu0=0x100`, `cpu1=0x0` (A73), `cpu=1 PSCI CPU_ON rc=0`,
+  `cpu=1 mpidr=0x0 came alive; SGI1 OK`, `2/2 CPUs initialized, SGI1 verified`.
+  Это новая рабочая 2-ядерная база: A53 + A73.
 * probe70 — то же ядро 0136, 4 ядра 2×A73+2×A53, keepon + `a10audio=1`;
   `dist/boot-a10-probe70.img` SHA256
   `88CBC4A1C4E3920697E02B58C83040B16BAFCCB21543BCEBEB8B077C9837AD34`.
-  Аудио-проба выполняется на этапе eMMC-root, т.е. только если SMP-подъём
-  дошёл до userland.
+  Прошит 2026-11-14 вечером, ждём отчёт. Аудио-проба выполняется на этапе
+  eMMC-root, т.е. только если SMP-подъём дошёл до userland.
 
 ### >>> UPDATE 2026-11-14 (вечер): probe67 разобран, патч 0138 (чекпоинты таблицы waitq) <<<
 
