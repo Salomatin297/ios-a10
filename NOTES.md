@@ -51,7 +51,35 @@ cpu3=`0x101` (A53), далее A53. `cpus=2` берёт первые два уз
   комбинации A53/A73 пока нестабильны; рабочая база — 2 ядра A53+A73.
 * probe71 = probe69 + `a10audio=1` (2 ядра A53+A73, аудио-проба); образ
   SHA256 `A2EFD0ACD6F56E808C4F953CC360E3136C2DAC87157942FF19EE254FD165B2A7`.
-  Прошит 2026-11-14, ждём лог с `A10 AUDIO:`.
+  **Результат: паника в аудио-пробе, не SMP.** Лог
+  `dist/logs/probe71/a10-sweetlog.txt` (12 413 Б): `Kernel data abort`,
+  `pc 0xfffffff007482a70`, `far 0xfffffff28a1394e4` = `a10_peri + 0x34E4`,
+  ESR `0x96000210` (synchronous external abort, read); строк `A10 AUDIO:`
+  нет. Причина: проба взяла DT-индекс часов `0x133` за смещение регистра
+  и читала `CMU_PERI 0x10010000 + 0x3018 + 4*0x133 = 0x100134E4`, которого
+  в блоке PERI нет. SPEEDY висит на APM, а не на CMU_PERI:
+  APM `0x11c00000` (размер `0x8000`), gate `0x2064` (bit 20 MANUAL,
+  bit 21 CG_VAL), QCH `0x304c` (bit 0 ENABLE, bit 1 REQ).
+  Исправлено в 0130; probe72 = probe69 + исправленный `a10audio=1`.
+
+**AP-прошивка разобрана без полной распаковки** (полная распаковка не помещается):
+`work/ap_extract_vendor.py` потоково достаёт `vendor.img.lz4` из AP tar
+(3,79 ГБ tar, deflate), `work/ap_decompress_vendor.py` → `vendor.img`
+(Android sparse), `work/ap_unsparse.py` → `vendor.raw` (394 МБ ext4),
+`work/ext4tool.py` читает ext4 без mount. Из vendor извлечены:
+аудио (`/firmware/calliope_dram.bin`, `calliope_sram.bin`,
+`AP_AUDIO_SLSI.bin`, `APBargeIn_AUDIO_SLSI.bin`, `/etc/mixer_paths.xml`,
+`mixer_gains.xml`, `audio_board_info.xml`, `abox_debug.xml`,
+`/lib/hw/audio.primary.exynos7884B.so`), Wi-Fi/BT (`/etc/wifi/mx140.bin`,
+`mx140_t.bin`, `mx140_*.hcf`, `/etc/bluetooth/bt_did.conf`, init rc,
+`macloader`), GNSS (`/etc/gnss/*`, `gpsd`), сенсоры
+(`sensors.universal7884B.so`), камера (`/firmware/fimc_is_*`,
+`setfile_*.bin`), `/etc/secnvm/k250a_00000200.img`. Всё в
+`work/ap-extract/vendor-files/`.
+**Важно:** Wi-Fi/BT firmware лежит в `/vendor/etc/wifi`, а не в
+`/vendor/firmware`; в system.img за ним идти не нужно.
+Touch firmware (`tsp_sec/s6d7at0b01_a10.fw`) — только в system.img;
+для него нужен выборочный доступ к `system.img.lz4` (2,05 ГБ).
 
 ### >>> UPDATE 2026-11-14 (вечер): probe67 разобран, патч 0138 (чекпоинты таблицы waitq) <<<
 
