@@ -2,6 +2,53 @@
 
 ## >>> A10 PORT (Samsung Galaxy A10, SM-A105F) - active work 2026-11-13 <<<
 
+### >>> UPDATE 2026-11-14: migration audit, probe64 (0136), HakiOS reference <<<
+
+**Аудит миграции (живой том, TWRP).** Все состояния согласованы на 20H392:
+`com.apple.migration.plist` = `previousBuildVersion/buildVersion/LastSystemVersion
+20H392`; `RoleUserMigration.plist` и `MigrationInfo.plist` = 20H392;
+`mcm_user_migration_status.plist` = 20H392; `root/Library/MobileContainerManager/
+mcm_migration_status.plist` = все пять миграций (Bundle/ACL/DaemonContainer/
+GroupId/CodeSigning) 20H392; `LastBuildInfo.plist` = 20H392. Сентинела
+`/private/var/datamigrator/migrate` в каталоге нет. Старый watchdog-стек
+`stacks+com.apple.datamigrator-1969-12-31-161548.0004.ips` — от прошлой
+загрузки с `prev build 20H391` и плагином `com.apple.locationd.migrator`;
+новых стеков с 20H392 нет. В старом `launchd.log` видно, что datamigrator
+(pid 100) штатно завершился `exit(0)` через 22 с, а зависание было позже,
+в `migrationpluginwrapper`/locationd. Вывод: текущая миграция не должна
+запускать плагины; datamigrator всё ещё exec'ится (3 раза в probe63), но
+это проверка необходимости, а не миграция. Проверять exit-коды будет probe64.
+
+**probe64 = 0136** (`xnu/patches/0136-a10-probe64-diagnostics.patch`):
+* `sweetfb_keepon=1` — `SweetFramebuffer` игнорирует `RequestPowerChange(0)`
+  от backboardd, поэтому экран не гаснет и видно, дойдёт ли SpringBoard до UI;
+* сэмплер: первый сэмпл через 30 с, далее каждые 60 с, 40 сэмплов; в каждом
+  сэмпле печатается `SMP P name[pid] ppid N` для всех процессов — цепочка
+  зависимостей видна по журналу;
+* `exec name[pid] ppid N` и `exit name[pid] ppid N status N` — видно, кто
+  кого запускает и с каким кодом завершается datamigrator/migrationpluginwrapper;
+* cmdline probe64 добавляет `sweetfb_keepon=1` и
+  `sweetsample=SpringBoard,backboardd,datamigrator,locationd,iconservicesagent,MobileGestaltHelper`.
+
+**HakiOS (oosexgang/hakios-xnu-kernel, XNU-8796.121.2, iOS 16.5 userland).**
+Важный внешний ориентир: они запускают **немодифицированный Darwin userland**
+(launchd → backboardd → SpringBoard) на Android-железе и в `userland/mkjobs.py`
+явно **DENY**-ят `datamigrator`, `locationd`, `keybagd`, `backupd`,
+`ReportCrash`, `osanalytics`, `watchdog`, `thermalmonitord` и др., а остальные
+задания запускают on-demand. Это подтверждает, что отключение миграции и
+лишних демонов на уровне launchd — рабочий путь, а не костыль. Их описание
+старта: SpringBoard готов примерно за 10 с на 4 ядрах; на одном ядре дольше,
+но доходит. Их Metal-драйвер — Adreno-специфичный (`hakios-metal`), поэтому
+для Mali-G71 напрямую не подходит; Panfrost (Mali-G71/Bifrost) — отдельный
+долгий путь, не блокер текущей стабильности.
+
+**Следующее:** дождаться CI 0136, собрать probe64, прошить, загрузиться через
+TWRP → Reboot → System, держать экран включённым 10+ минут. Если UI появится —
+зафиксировать однопоточную базу и разобрать цепочку процессов; если нет —
+по стекам сэмплера и exit-кодам datamigrator понять, кто блокирует SpringBoard.
+После этого — отключение `datamigrator`/`locationd` на уровне launchd
+(по образцу HakiOS), затем 2→3→4 ядра.
+
 ### >>> UPDATE 2026-11-13 (ночь): 0132 early eMMC log, probe51-55, все 8 ядер <<<
 
 **Состояние SMP.** probe51 (старое ядро + 8-CPU ADT + `cpus=6`) — Kernel

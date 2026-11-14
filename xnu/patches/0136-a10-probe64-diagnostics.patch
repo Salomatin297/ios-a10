@@ -1,0 +1,111 @@
+diff --git a/bsd/dev/sweet_sample.c b/bsd/dev/sweet_sample.c
+index b40eccd..a5d9299 100644
+--- a/bsd/dev/sweet_sample.c
++++ b/bsd/dev/sweet_sample.c
+@@ -10,7 +10,9 @@
+  * with tools/sweet-crash.py). A thread blocked in a syscall shows the
+  * syscall stub in pc and its caller in lr/bt.
+  *
+- * First sample 90 s after start, then every 120 s, 40 samples at most.
++ * First sample 30 s after start, then every 60 s, 40 samples at most.
++ * Each sample also prints the pid/ppid of every process, so the process
++ * dependency chain can be reconstructed from the log.
+  */
+ #include <sys/param.h>
+ #include <sys/systm.h>
+@@ -51,6 +53,7 @@ sweet_sample_proc(proc_t p, __unused void *arg)
+ {
+ 	char name[32];
+ 	proc_name(proc_pid(p), name, sizeof(name));
++	printf("SMP P %s[%d] ppid %d\n", name, proc_pid(p), p->p_ppid);
+ 	if (sweet_sample_wanted(name)) {
+ 		task_t task = proc_task(p);
+ 		if (task != TASK_NULL) {
+@@ -70,11 +73,11 @@ sweet_sample_thread(__unused void *arg, __unused wait_result_t wr)
+ 	if (sweet_sample_names[0] == '-') {
+ 		return;
+ 	}
+-	(void)tsleep(&chan, PZERO, "sweetsmp", 90 * hz);
++	(void)tsleep(&chan, PZERO, "sweetsmp", 30 * hz);
+ 	for (int i = 0; i < 40; i++) {
+ 		printf("SMP --- sample %d\n", i);
+ 		proc_iterate(PROC_ALLPROCLIST, sweet_sample_proc, NULL, NULL, NULL);
+-		(void)tsleep(&chan, PZERO, "sweetsmp", 120 * hz);
++		(void)tsleep(&chan, PZERO, "sweetsmp", 60 * hz);
+ 	}
+ }
+ 
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 68612db..910e1b6 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -7413,7 +7413,7 @@ process_signature(proc_t p, struct image_params *imgp)
+ 			}
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ 			/* SWEET runs every iOS binary this way: one short line per exec. */
+-			printf("exec %s\n", p->p_name);
++			printf("exec %s[%d] ppid %d\n", p->p_name, p->p_pid, p->p_ppid);
+ #else
+ 			printf("Allowing spawn of iOS binary %s since it has "
+ 			    "com.apple.private.security.no-sandbox entitlement or unentitled_ios_sim_launch "
+diff --git a/bsd/kern/kern_exit.c b/bsd/kern/kern_exit.c
+index fde499c..dd015f6 100644
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -2152,6 +2152,8 @@ proc_exit(proc_t p)
+ 	proc_unlock(p);
+ 	pid = proc_getpid(p);
+ 	exitval = p->p_xstat;
++	/* SWEET: one line per exit, to pair with the exec lines. */
++	printf("exit %s[%d] ppid %d status %d\n", p->p_name, pid, p->p_ppid, exitval);
+ 	KERNEL_DEBUG_CONSTANT_IST(KDEBUG_COMMON,
+ 	    BSDDBG_CODE(DBG_BSD_PROC, BSD_PROC_EXIT) | DBG_FUNC_START,
+ 	    pid, exitval, 0, 0, 0);
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 18a5b98..993f5f5 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -97,6 +97,8 @@ static bool sweet_fb_blink_on = true;
+ static uint32_t sweet_fb_stats;
+ static uint32_t sweet_fb_stats_logged;
+ static bool sweet_fb_bar;
++/* Boot-arg sweetfb_keepon=1: ignore display-off requests from backboardd. */
++static bool sweet_fb_keepon;
+ static uint32_t sweet_fb_fit_copies;
+ static uint32_t sweet_fb_fit_rejects;
+ /* Size the framebuffer reports to userland; HID uses the same space. */
+@@ -247,8 +249,10 @@ AppleCLCD::start(IOService *provider)
+ 		sweet_fb_stats = (uint32_t)stats;
+ 	}
+ 	sweet_fb_bar = PE_parse_boot_argn("sweetfb_bar", &bar, sizeof(bar)) && bar != 0;
+-	IOLog("SWEET FB: fit %d stats %u bar %d\n", sweet_fb_fit, sweet_fb_stats,
+-	    sweet_fb_bar);
++	int keepon = 0;
++	sweet_fb_keepon = PE_parse_boot_argn("sweetfb_keepon", &keepon, sizeof(keepon)) && keepon != 0;
++	IOLog("SWEET FB: fit %d stats %u bar %d keepon %d\n", sweet_fb_fit, sweet_fb_stats,
++	    sweet_fb_bar, sweet_fb_keepon);
+ 	uint32_t blink = 0;
+ 	PE_parse_boot_argn("sweetfb_blink", &blink, sizeof(blink));
+ 	sweet_fb_blink_secs = blink;
+@@ -780,6 +784,12 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 	case kSweetFBRequestPowerChange:
+ 		if (args->scalarInputCount >= 1) {
+ 			bool off = args->scalarInput[0] == 0;
++			char name[32];
++			proc_selfname(name, sizeof(name));
++			if (off && sweet_fb_keepon) {
++				IOLog("SWEET FB: %s display off ignored (keepon)\n", name);
++				break;
++			}
+ 			IOLockLock(fFB->fLock);
+ 			if (off != fFB->fPowerOff) {
+ 				fFB->fPowerOff = off;
+@@ -794,7 +804,7 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 				/* The fade blackened the panel while off; repaint it. */
+ 				fFB->fillTestPattern();
+ 			}
+-			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
++			IOLog("SWEET FB: %s display %s\n", name, off ? "off" : "on");
+ 		}
+ 		break;
+ 	case kSweetFBSwapWait:
