@@ -2,6 +2,58 @@
 
 ## >>> A10 PORT (Samsung Galaxy A10, SM-A105F) - active work 2026-11-13 <<<
 
+### >>> UPDATE 2026-11-14 (позже): probe66 (4 ядра) → паника ticket lock, патч 0137 <<<
+
+**probe66 (`cpus=4`, 0136, keepon) — паника при bring-up CPU3.** Лог
+`dist/logs/probe66/a10-sweetlog.txt` (9.6 КБ) кончается сразу после
+`SWEET CPU: cpu=3 PSCI CPU_ON rc=0` и `SWEET FB: vsync 1`:
+`Invalid HW ticket lock 0xfffffff8bc5926ac <0xcd33848e> lr=0xfffffff0072bc264
+mpidr=0x80000100 tpidr=0x0 outer=b28ade40/0a040196/cd33848e/08090230
+@lock_ticket.c:138`. Паника на CPU0; CPU1 и CPU2 отметились `came alive`,
+CPU3 — нет. Это отдельная SMP-регрессия; 2-ядерная база probe65 работает.
+
+**Анализ адреса.** `wq.wq_q = 0xfffffff8bc5926a8`, `lck = +4`; адрес не
+выровнен на 16 (`&15 = 8`), а любой настоящий `struct waitq` выровнен на 16.
+Значит это не элемент `global_waitqs` и не живой объект — указатель дикий.
+`waitq_irq_safe()` истинно только для `WQT_QUEUE`/`WQT_TURNSTILE`, иначе
+`waitq_get_safeq()` возвращает выровненный элемент таблицы или
+`&ts->ts_waitq`; следовательно мисальность указывает на прямое запирание
+`link->wql_wq` в сайтах 2/3/4 либо на мусорный `waitq_ts` порта в сайте 1.
+Байт типа в панике `0x8e` вместо `LCK_TYPE_TICKET=0x44`; слово флагов по
+дикому адресу `0x0a040196` читается как type=6 (`WQT_SELECT_SET`),
+preposted=1, eventmask `0x50200C`.
+
+**Патч 0137** (`xnu/patches/0137-a10-waitq-bad-lock-diag.patch`, 8.2 КБ):
+* в `waitq_lock_reserve()` добавлен предварительный чек, зеркалящий
+  `hw_lck_ticket_verify()`; при невалидном lock паника печатает waitq, lock,
+  тип/valid/flags, выравнивание, смещение от таблицы, её базу и размер;
+* каждый из четырёх call site'ов (`waitq_pull_thread_locked`,
+  `waitq_set_unlink_all_locked`, `waitq_set_first_prepost`,
+  `wqt_preposts_gc_locked`) кладёт в глобалы site/wq/orig/set/link/thread;
+* helper снимает снимок глобалов, сканирует `global_waitqs` на другие
+  повреждённые элементы и **включает результат в строку паники**
+  (`scan=bad/num first=... ftype=... fflags=...`), чтобы не звать printf
+  перед panic и не потерять строки;
+* в панику добавлены `otype`/`oalign` исходного waitq, `twq`/`tev` текущего
+  треда, `dthr`/`dtid` из call site и `ra=%p/%p`;
+* `waitq_bootstrap()` печатает `SWEET WQ: table=... .. ... num= elem= size=
+  thread_max=`;
+* в `__hw_lck_ticket_invalid_panic` добавлены RA1/RA2.
+Генератор `tools/make_patch_0137.py` собирает `a/` из ванильного
+`ci/xnu-8796-base` (`waitq.c` серия не трогает; `lock_ticket.c` — только
+0133) и проверяет reverse/forward apply. Патч проверен: reverse rc=0,
+apply ok. Маркеры 0137 добавлены в `.github/workflows/xnu.yml`.
+
+**Локальная проверка всей серии** упирается в HFS staging (0031/0041) —
+старая локальная проблема, не связанная с 0137; в CI патчи применяются к
+чистому дереву.
+
+**Следующий шаг:** закоммитить 0137 + NOTES, запушить `gui2` → `a10/main`,
+дождаться CI, скачать `xnu-kernel`, собрать probe67 (`-Cpus 4 -ExtraArgs
+'sweetfb_keepon=1'`), прошить boot, загрузиться через TWRP → Reboot →
+System, снять лог и разобрать `SWEET WQ:`/панику. Если 4 ядра не чинятся
+быстро — вернуть probe65 и заниматься периферией на 2 ядрах.
+
 ### >>> UPDATE 2026-11-14: migration audit, probe64 (0136), HakiOS reference <<<
 
 **Аудит миграции (живой том, TWRP).** Все состояния согласованы на 20H392:
@@ -83,10 +135,30 @@ screen. Пользователь попросил **не проверять 3 я
 * backboardd t1 стоит в `dispatch_group_wait_slow` — возможно, ждёт
   migration/display-группу; t0 в mach_msg (нормальный runloop).
 
-**Следующее:** probe65 = тот же 0136, `cpus=2` (3 ядра не проверяем по
-просьбе пользователя). Прошить, проверить lock screen и разблокировку;
-затем сразу 4 ядра. При необходимости добавить в сэмплер усечённое имя
-`com.apple.datami` и снять стек datamigrator[121].
+**probe65 (`cpus=2`) — РАЗБЛОКИРОВКА РАБОТАЕТ (2026-11-14 ~10:40Z).**
+Пользователь подтвердил: экран блокировки появился, свайп разблокировал
+телефон, рабочий стол открывается, действия выполняются. Всё ещё медленно,
+но функционально. Образ `dist/boot-a10-probe65.img` SHA256
+`15fb4a1c780e4cbd41fe77a404f14c01efd54c265ad7768f909b13d2d80d0a04`.
+Это первая реально рабочая конфигурация: 2 ядра + 0136 + keepon.
+
+**Лог probe65 снят (`dist/logs/probe65/`, 330 КБ, 7 сэмплов).**
+* `SWEET CPU: cpu=1 CPU_ON ... rc=0`, `cpu=1 mpidr=0x101 came alive; SGI1
+  OK`, `2/2 CPUs initialized, SGI1 verified` — второе ядро реально работает.
+* datamigrator теперь завершается штатно на всех запусках: `[99] exit 0`,
+  `[159] exit 0` (в сэмпле 1 он ещё жил, в сэмпле 3 уже вышел), `[226] exit
+  0`, `[283] exit 0`; в конце лога новый `[368]`. То есть «зависший»
+  datamigrator[121] на одном ядре был голоданием по CPU, а не блокировкой.
+* Стек datamigrator[159] снят (сэмплы 1–2): t0 в mach_msg/CFRunLoop, t1 в
+  dispatch — обычное ожидание, не тупик.
+
+**probe66 (`cpus=4`) собран и прошит (2026-11-14 ~10:50Z).** Образ
+`dist/boot-a10-probe66.img` SHA256
+`63dcc3ebd422fcf012d6bf13489a632335d15b2b0c74920fa67454b802e73e1a`.
+Тот же 0136; cmdline `cpus=4 sweetfb_keepon=1 sweetsample=SpringBoard,
+backboardd,com.apple.datami,locationd,iconservicesagent,MobileGestaltHelper`.
+Результат: паника ticket lock при bring-up CPU3 — разбор в верхнем блоке
+«probe66 (4 ядра) → паника ticket lock, патч 0137».
 
 ### >>> UPDATE 2026-11-13 (ночь): 0132 early eMMC log, probe51-55, все 8 ядер <<<
 

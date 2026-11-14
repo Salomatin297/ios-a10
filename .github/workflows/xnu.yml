@@ -203,6 +203,9 @@ jobs:
           need dxb/xnu/iokit/Kernel/arm/SweetFramebuffer.cpp 'sweetfb_keepon' present '0136 display keep-on boot-arg'
           need dxb/xnu/bsd/kern/kern_exec.c 'ppid %d' present '0136 exec pid/ppid'
           need dxb/xnu/bsd/kern/kern_exit.c 'exit %s' present '0136 exit status log'
+          need dxb/xnu/osfmk/kern/waitq.c 'SWEET WQ: bad lock site' present '0137 waitq bad-lock diagnostic'
+          need dxb/xnu/osfmk/kern/waitq.c 'SWEET WQ: table=%p..%p' present '0137 waitq table range'
+          need dxb/xnu/osfmk/kern/lock_ticket.c 'ra1=%p ra2=%p' present '0137 ticket panic return addresses'
           if [ "$fail" -ne 0 ]; then
             echo "::error::A10 port patches did not apply cleanly"
             exit 1

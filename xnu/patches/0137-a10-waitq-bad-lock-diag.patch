@@ -1,0 +1,225 @@
+diff --git a/osfmk/kern/waitq.c b/osfmk/kern/waitq.c
+index 596729c..dcf8593 100644
+--- a/osfmk/kern/waitq.c
++++ b/osfmk/kern/waitq.c
+@@ -57,6 +57,7 @@
+ #include <kern/ast.h>
+ #include <kern/backtrace.h>
+ #include <kern/kern_types.h>
++#include <kern/locks_internal.h>
+ #include <kern/mach_param.h>
+ #include <kern/percpu.h>
+ #include <kern/queue.h>
+@@ -110,6 +111,25 @@ static TUNABLE(uint32_t, waitq_set_unlink_batch, "waitq_set_unlink_batch", 64);
+  */
+ #define WQL_PREPOST_MARKER 1ul
+ 
++/*
++ * A10 SMP bring-up diagnostic.
++ *
++ * waitq_lock_reserve() only knows the waitq it is asked to lock, not the
++ * object its caller is walking, and the panic string is the only record
++ * that reaches the persistent eMMC log.  Each call site stashes its
++ * context here right before the reserve, so the invalid-lock panic can
++ * name the waitq set, the link and the thread involved.
++ *
++ * site: 1 waitq_pull_thread_locked, 2 waitq_set_unlink_all_locked,
++ *       3 waitq_set_first_prepost, 4 wqt_preposts_gc_locked.
++ */
++static uint32_t waitq_diag_site;
++static struct waitq *waitq_diag_wq;
++static struct waitq *waitq_diag_orig;
++static struct waitq_set *waitq_diag_wqset;
++static void *waitq_diag_link;
++static thread_t waitq_diag_thread;
++
+ #if __LP64__
+ /*!
+  * @struct waitq_link_hdr
+@@ -660,6 +680,17 @@ waitq_bootstrap(void)
+ 		waitq_init(&global_waitqs[i], WQT_QUEUE, SYNC_POLICY_FIFO);
+ 	}
+ 
++	/*
++	 * A10 SMP bring-up diagnostic: the waitq hash table is the only
++	 * waitq array allocated from kmem_ptr_range, so a bad interlock
++	 * address in that range is either a table element or a wild
++	 * pointer.  Record the exact range to tell the two apart.
++	 */
++	printf("SWEET WQ: table=%p..%p num=%u elem=%lu size=%lu "
++	    "thread_max=%d\n", global_waitqs,
++	    (void *)((uintptr_t)global_waitqs + whsize), g_num_waitqs,
++	    (unsigned long)qsz, (unsigned long)whsize, thread_max);
++
+ 	waitq_init(&select_conflict_queue, WQT_SELECT, SYNC_POLICY_FIFO);
+ 
+ 	percpu_foreach(setid, select_setid) {
+@@ -747,10 +778,97 @@ waitq_lock_try(waitq_t wq)
+ 	return rc;
+ }
+ 
++/*
++ * A10 SMP bring-up diagnostic.
++ *
++ * hw_lck_ticket_reserve() panics with the embedded lock address only, and
++ * an address inside a bogus waitq says nothing: the waitq itself may be a
++ * stale link target or a wild thread->waitq.  Before that panic fires,
++ * dump the object, the caller context stashed by the call site, and the
++ * state of the global waitq table, because the panic string is the only
++ * output that survives to the persistent eMMC log.
++ */
++static void
++waitq_lock_reserve_diag(waitq_t wq, hw_lck_ticket_t *lck)
++{
++	char name[64];
++	thread_t thr = current_thread();
++	/*
++	 * Snapshot the call-site context before the table scan: the
++	 * globals are not synchronized and another CPU could overwrite
++	 * them while this one is printing.
++	 */
++	uint32_t site = waitq_diag_site;
++	struct waitq *dwq = waitq_diag_wq;
++	struct waitq *orig = waitq_diag_orig;
++	struct waitq_set *set = waitq_diag_wqset;
++	void *link = waitq_diag_link;
++	thread_t dthr = waitq_diag_thread;
++	uint32_t otype = orig ? (*(uint32_t *)orig & 7) : 0;
++	unsigned long oalign = orig ? ((uintptr_t)orig & 15) : 0;
++	uint32_t bad = 0;
++	long first = -1;
++	uint32_t ftype = 0;
++	uint32_t fflags = 0;
++
++	thread_get_thread_name(thr, name);
++	name[sizeof(name) - 1] = '\0';
++
++	/*
++	 * Scan the hash table for other corrupt elements, but fold the
++	 * result into the panic string: printf() before panic() would
++	 * compete for the console and its lines are not guaranteed to
++	 * reach the persistent log.
++	 */
++	if (global_waitqs != NULL && g_num_waitqs > 0 &&
++	    g_num_waitqs <= (1u << 20)) {
++		for (uint32_t i = 0; i < g_num_waitqs; i++) {
++			hw_lck_ticket_t *l = &global_waitqs[i].waitq_interlock;
++
++			if (l->lck_type != LCK_TYPE_TICKET || !l->lck_valid) {
++				if (first < 0) {
++					first = (long)i;
++					ftype = l->lck_type;
++					fflags = *(uint32_t *)&global_waitqs[i];
++				}
++				bad++;
++			}
++		}
++	}
++
++	panic("SWEET WQ: bad lock site=%u wq=%p dwq=%p lck=%p type=%u "
++	    "valid=%u flags=%08x align=%lu off=%ld base=%p num=%u "
++	    "orig=%p otype=%u oalign=%lu set=%p link=%p thr=%p '%s' "
++	    "tid=%llu twq=%p tev=%p dthr=%p dtid=%llu scan=%u/%u "
++	    "first=%ld ftype=%u fflags=%08x ra=%p/%p",
++	    site, wq.wq_q, dwq, lck, lck->lck_type,
++	    lck->lck_valid, *(uint32_t *)wq.wq_q,
++	    (unsigned long)((uintptr_t)wq.wq_q & 15),
++	    (long)((uintptr_t)wq.wq_q - (uintptr_t)global_waitqs),
++	    global_waitqs, g_num_waitqs, orig, otype, oalign, set,
++	    link, thr, name, (unsigned long long)thread_tid(thr),
++	    thr->waitq.wq_q, (void *)(uintptr_t)thr->wait_event,
++	    dthr, (unsigned long long)thread_tid(dthr),
++	    bad, g_num_waitqs, first, ftype, fflags,
++	    __builtin_return_address(0), __builtin_return_address(1));
++}
++
+ bool
+ waitq_lock_reserve(waitq_t wq, uint32_t *ticket)
+ {
+-	return hw_lck_ticket_reserve(&wq.wq_q->waitq_interlock, ticket, &waitq_lck_grp);
++	hw_lck_ticket_t *lck = &wq.wq_q->waitq_interlock;
++
++	/*
++	 * Mirror the check hw_lck_ticket_verify() is about to make, but
++	 * report the waitq and its context first.  A live lock always has
++	 * lck_type == LCK_TYPE_TICKET and lck_valid set, so this branch is
++	 * never taken on a healthy system.
++	 */
++	if (__improbable(lck->lck_type != LCK_TYPE_TICKET || !lck->lck_valid)) {
++		waitq_lock_reserve_diag(wq, lck);
++	}
++
++	return hw_lck_ticket_reserve(lck, ticket, &waitq_lck_grp);
+ }
+ 
+ void
+@@ -1451,6 +1569,12 @@ waitq_pull_thread_locked(waitq_t waitq, thread_t thread)
+ 	 * and if that reservation requires waiting, we are guaranteed
+ 	 * that this waitq can't die until we got our turn!
+ 	 */
++	waitq_diag_site = 1;
++	waitq_diag_wq = safeq;
++	waitq_diag_orig = waitq.wq_q;
++	waitq_diag_wqset = NULL;
++	waitq_diag_link = NULL;
++	waitq_diag_thread = thread;
+ 	if (!waitq_lock_reserve(safeq, &ticket)) {
+ 		thread_unlock(thread);
+ 		waitq_lock_wait(safeq, ticket);
+@@ -1828,6 +1952,12 @@ waitq_set_unlink_all_locked(struct waitq_set *wqset, waitq_link_list_t *free_l)
+ 		link = cqe_element(elt, struct waitq_link, wql_slink);
+ 		wq   = link->wql_wq;
+ 
++		waitq_diag_site = 2;
++		waitq_diag_wq = wq;
++		waitq_diag_orig = wq;
++		waitq_diag_wqset = wqset;
++		waitq_diag_link = link;
++		waitq_diag_thread = NULL;
+ 		if (__improbable(!waitq_lock_reserve(wq, &ticket))) {
+ 			waitq_unlock(wqset);
+ 			waitq_lock_wait(wq, ticket);
+@@ -2015,6 +2145,12 @@ waitq_set_first_prepost(struct waitq_set *wqset, wqs_prepost_flags_t flags)
+ 		link = cqe_element(elt, struct waitq_link, wql_slink);
+ 		wq   = link->wql_wq;
+ 
++		waitq_diag_site = 3;
++		waitq_diag_wq = wq;
++		waitq_diag_orig = wq;
++		waitq_diag_wqset = wqset;
++		waitq_diag_link = link;
++		waitq_diag_thread = NULL;
+ 		if (__improbable(!waitq_lock_reserve(wq, &ticket))) {
+ 			waitq_unlock(wqset);
+ 			waitq_lock_wait(wq, ticket);
+@@ -2597,6 +2733,12 @@ again:
+ 	cqe_foreach_element_safe(link, q, wql_slink) {
+ 		struct waitq *wq = link->wql_wq;
+ 
++		waitq_diag_site = 4;
++		waitq_diag_wq = wq;
++		waitq_diag_orig = wq;
++		waitq_diag_wqset = wqset;
++		waitq_diag_link = link;
++		waitq_diag_thread = NULL;
+ 		if (!waitq_lock_reserve(wq, &ticket)) {
+ 			waitq_unlock(wqset);
+ 			waitq_lock_wait(wq, ticket);
+diff --git a/osfmk/kern/lock_ticket.c b/osfmk/kern/lock_ticket.c
+index ec661ec..6a9ef2b 100644
+--- a/osfmk/kern/lock_ticket.c
++++ b/osfmk/kern/lock_ticket.c
+@@ -129,9 +129,10 @@ __hw_lck_ticket_invalid_panic(hw_lck_ticket_t *lck)
+ 	 * hw_lck_ticket_t (the "tu" field of lck_ticket_t), hence the
+ 	 * four words at lck-8 describe the enclosing lock.
+ 	 */
+-	panic("Invalid HW ticket lock %p <0x%08x> lr=%p mpidr=0x%llx "
+-	    "tpidr=0x%llx outer=%08x/%08x/%08x/%08x", lck, lck->lck_value,
+-	    __builtin_return_address(0),
++	panic("Invalid HW ticket lock %p <0x%08x> lr=%p ra1=%p ra2=%p "
++	    "mpidr=0x%llx tpidr=0x%llx outer=%08x/%08x/%08x/%08x", lck,
++	    lck->lck_value, __builtin_return_address(0),
++	    __builtin_return_address(1), __builtin_return_address(2),
+ 	    (unsigned long long)__builtin_arm_rsr64("MPIDR_EL1"),
+ 	    (unsigned long long)__builtin_arm_rsr64("TPIDR_EL0"),
+ 	    ((const uint32_t *)lck)[-2], ((const uint32_t *)lck)[-1],
