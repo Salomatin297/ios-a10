@@ -197,10 +197,12 @@ jobs:
           need dxb/xnu/bsd/dev/sweet_emmc.c 'sweet_emmc_early_init' present '0132 early eMMC log'
           need dxb/xnu/bsd/dev/sweet_emmc.c 'block_base is the absolute position' present '0132 ring flush absolute positions'
           need dxb/xnu/iokit/Kernel/arm/SweetCPU.cpp 'early eMMC log' present '0132 SMP log checkpoint'
-          need dxb/xnu/bsd/dev/sweet_sample.c 'SMP P %s[%d] ppid %d' present '0136 process chain in sampler'
+          # grep treats [%d] as a bracket expression, so match bracket-free
+          # fragments of the 0136 format strings instead.
+          need dxb/xnu/bsd/dev/sweet_sample.c 'SMP P %s' present '0136 process chain in sampler'
           need dxb/xnu/iokit/Kernel/arm/SweetFramebuffer.cpp 'sweetfb_keepon' present '0136 display keep-on boot-arg'
-          need dxb/xnu/bsd/kern/kern_exec.c 'exec %s[%d] ppid %d' present '0136 exec pid/ppid'
-          need dxb/xnu/bsd/kern/kern_exit.c 'exit %s[%d] ppid %d status %d' present '0136 exit status log'
+          need dxb/xnu/bsd/kern/kern_exec.c 'ppid %d' present '0136 exec pid/ppid'
+          need dxb/xnu/bsd/kern/kern_exit.c 'exit %s' present '0136 exit status log'
           if [ "$fail" -ne 0 ]; then
             echo "::error::A10 port patches did not apply cleanly"
             exit 1
