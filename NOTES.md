@@ -74,6 +74,12 @@ cpu3=`0x101` (A53), далее A53. `cpus=2` берёт первые два уз
   сборка взяла `work/a10-8cpu-smp.adt`, и `cpus=2` выбрал 2×A53
   (0x100+0x101), а не A53+A73. Для probe73: `work/a10-a73-first.adt`
   + `wqchk=0` (новый патч 0139 глушит WQCHK по boot-arg).
+* probe73 — ядро 0139 (CI `43618840975`, SHA256
+  `93d19475142daed5759675848d46eb32431211e8638fe4a28adcd69f581e8385`),
+  ADT `work/a10-a73-first.adt` (cpu0=`0x100`, cpu1=`0x0`), `cpus=2`,
+  `a10audio=1 wqchk=0`; `dist/boot-a10-probe73.img` SHA256
+  `268CD1AE8AFCA4075AC076E60F8126DB15890AF539F4DE90E1D690E35BC6E84D`.
+  Прошит 2026-11-14, ждём загрузку/лог.
 
 **AP-прошивка разобрана без полной распаковки** (полная распаковка не помещается):
 `work/ap_extract_vendor.py` потоково достаёт `vendor.img.lz4` из AP tar
