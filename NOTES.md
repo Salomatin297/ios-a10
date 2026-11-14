@@ -40,8 +40,18 @@ cpu3=`0x101` (A53), далее A53. `cpus=2` берёт первые два уз
 * probe70 — то же ядро 0136, 4 ядра 2×A73+2×A53, keepon + `a10audio=1`;
   `dist/boot-a10-probe70.img` SHA256
   `88CBC4A1C4E3920697E02B58C83040B16BAFCCB21543BCEBEB8B077C9837AD34`.
-  Прошит 2026-11-14 вечером, ждём отчёт. Аудио-проба выполняется на этапе
-  eMMC-root, т.е. только если SMP-подъём дошёл до userland.
+  **Результат: нестабилен.** 1-я загрузка — 4/4 CPUs initialized, userland,
+  затем паника; 2-я — паника сразу + диагональные полосы; 3-я — паника и
+  подсветка погасла. Лог 3-й загрузки `dist/logs/probe70/a10-sweetlog.txt`
+  (9462 Б): `cpu1=0x0` и `cpu2=0x1` came alive, `cpu3=0x101 CPU_ON rc=0`,
+  затем `Trying to clear_wait on a turnstile proxy that hasn't been donated
+  one (waitq: 0xfffffffb1e20c938) @waitq.c:1442`, panic cpu 0; CPU3 не успел
+  `came alive`. Это turnstile-waitq из `kmem_sprayqtn_range`, а не глобальная
+  таблица — та же порча памяти, другой объект. Вывод: 4 ядра в любой
+  комбинации A53/A73 пока нестабильны; рабочая база — 2 ядра A53+A73.
+* probe71 = probe69 + `a10audio=1` (2 ядра A53+A73, аудио-проба); образ
+  SHA256 `A2EFD0ACD6F56E808C4F953CC360E3136C2DAC87157942FF19EE254FD165B2A7`.
+  Прошит 2026-11-14, ждём лог с `A10 AUDIO:`.
 
 ### >>> UPDATE 2026-11-14 (вечер): probe67 разобран, патч 0138 (чекпоинты таблицы waitq) <<<
 
