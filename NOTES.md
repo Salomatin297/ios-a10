@@ -42,12 +42,51 @@ GroupId/CodeSigning) 20H392; `LastBuildInfo.plist` = 20H392. Сентинела
 для Mali-G71 напрямую не подходит; Panfrost (Mali-G71/Bifrost) — отдельный
 долгий путь, не блокер текущей стабильности.
 
-**Следующее:** дождаться CI 0136, собрать probe64, прошить, загрузиться через
-TWRP → Reboot → System, держать экран включённым 10+ минут. Если UI появится —
-зафиксировать однопоточную базу и разобрать цепочку процессов; если нет —
-по стекам сэмплера и exit-кодам datamigrator понять, кто блокирует SpringBoard.
-После этого — отключение `datamigrator`/`locationd` на уровне launchd
-(по образцу HakiOS), затем 2→3→4 ядра.
+**probe64 собран и прошит (2026-11-14 10:21Z).** Ядро из CI `43583954480`
+(коммит `0f3b9ed`; шаг проверки маркеров упал только из-за regex-скобок
+`[%d]`, само ядро собрано с 0136: в логе `Applying patch:
+0136-a10-probe64-diagnostics.patch`). SHA256 ядра
+`917248dc1cbf142afd48143888a1e614b7a27961b0fa5e7ba7347caed3cbce18`;
+образ `dist/boot-a10-probe64.img` SHA256
+`2324a8fba4870e53d98f8a2fc309aaf68c302a27a0a3f0f6a8b48d1510804846`.
+Cmdline проверен в образе: `cpus=1 sweetfb_keepon=1
+sweetsample=SpringBoard,backboardd,datamigrator,locationd,iconservicesagent,MobileGestaltHelper`.
+Маркеры в CI исправлены на bracket-free (`SMP P %s`, `ppid %d`, `exit %s`),
+новый прогон `43584804916` (коммит `5c968e5`).
+
+**РЕЗУЛЬТАТ probe64 (2026-11-14 ~10:23Z): ЭКРАН БЛОКИРОВКИ ПОЯВИЛСЯ.**
+Пользователь подтвердил: загрузка дошла до lock screen, экран не погас
+(`sweetfb_keepon=1` работает). Пройти дальше не удалось — производительности
+одного ядра не хватает на разблокировку. Вывод: в probe63 чёрный экран был
+именно засыпанием дисплея по `RequestPowerChange(0)` от backboardd, а не
+зависанием ядра/SpringBoard. Однопоточная база считается рабочей до lock
+screen. Пользователь попросил **не проверять 3 ядра** (не доверяет нечётным
+конфигурациям; 1 ядро — исключение): следующий шаг 2 ядра, затем 4.
+
+**Лог probe64 снят (`dist/logs/probe64/a10-sweetlog.txt`, 282 КБ, 8 сэмплов).**
+Наблюдения:
+* `SWEET FB: backboardd display off ignored (keepon)` — keepon сработал;
+  позже backboardd сам запросил `display on`, экран оставался живым.
+* `exec com.apple.datamigrator[97] ppid 1` → `exit com.apple.datamigrator[97]
+  ppid 1 status 0` — первая проверка миграции завершилась штатно.
+* Второй `exec com.apple.datamigrator[121]` в сэмплах 2–7 **не завершился**
+  (жив на 7.5-й минуте). Имя в `proc_name` обрезано до `com.apple.datami`,
+  поэтому сэмплер не снял его стек (в `sweetsample` указан полный
+  `datamigrator`). Это кандидат на зависание migration-проверки.
+* Touch работает: при свайпе пользователя драйвер записал 215 событий
+  (`A10 TOUCH: ev ...`), heartbeat `events=0` — это отсутствие касаний.
+* Главный поток SpringBoard в сэмплах 6–7 — в
+  `-[PTSettings initWithDefaultValues]` → `_createChildren` →
+  `setValue:forKey:` → `_NSResolvedSelectorForName` → dyld
+  `_dyld_get_objc_selector`/`__platform_strcmp`. То есть UI не мёртв,
+  а медленно инициализирует PrototypeTools-настройки на одном ядре.
+* backboardd t1 стоит в `dispatch_group_wait_slow` — возможно, ждёт
+  migration/display-группу; t0 в mach_msg (нормальный runloop).
+
+**Следующее:** probe65 = тот же 0136, `cpus=2` (3 ядра не проверяем по
+просьбе пользователя). Прошить, проверить lock screen и разблокировку;
+затем сразу 4 ядра. При необходимости добавить в сэмплер усечённое имя
+`com.apple.datami` и снять стек datamigrator[121].
 
 ### >>> UPDATE 2026-11-13 (ночь): 0132 early eMMC log, probe51-55, все 8 ядер <<<
 
