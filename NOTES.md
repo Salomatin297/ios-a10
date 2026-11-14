@@ -2,6 +2,57 @@
 
 ## >>> A10 PORT (Samsung Galaxy A10, SM-A105F) - active work 2026-11-13 <<<
 
+### >>> UPDATE 2026-11-14 (вечер): probe67 разобран, патч 0138 (чекпоинты таблицы waitq) <<<
+
+**probe67 (`cpus=4`, 0137, keepon) — паника с полной диагностикой.** Лог
+`dist/logs/probe67/a10-sweetlog.txt` (10023 байта). Строка паники:
+`SWEET WQ: bad lock site=1 wq=0xfffffff2b350ff10 ... type=0 valid=0 ...
+align=0 off=12048 base=0xfffffff2b350d000 num=512 orig=0xfffffff2b350e938
+otype=0 oalign=8 ... thr=0xfffffffab2c5fc10 'idle #0' tid=102 ... dthr=...
+dtid=147 scan=504/512 first=6 ftype=0 fflags=00000000
+ra=0xfffffff00730c490/0xfffffff0072d1ccc @waitq.c:853`.
+`ra0` = `_waitq_pull_thread_locked+0x1a0` (site 1, `waitq_lock_reserve`
+inlined), `ra1` = `_thread_timer_expire+0x7c`. Таблица: 512 элементов по
+24 байта, в `kmem_ptr_range`; `orig` = элемент 269, `wq` = элемент 502.
+
+**Что установлено.** Валидны только 8/512 элементов; первый плохой — 6
+(элементы 0..5, 144 байта, целы). Порча не страничная: `4096/24 =
+170.67`, обнуление страниц оставило бы 0, 171 или 342 валидных элемента,
+а не 8. Значит запись побайтовая (или «выжившие» — не то, чем кажутся).
+`sizeof(struct waitq)=24`: флаги(4)+interlock(4)+queue(8)+links(8);
+`waitq_init` обнуляет структуру и пишет `lck_type=0x44`, `lck_valid=1`.
+Таблица аллоцируется 12288 байтами (`KMA_NOFAIL|KMA_KOBJECT|KMA_NOPAGEWAIT|
+KMA_PERMANENT`, без `KMA_SPRAYQTN`), `round_page` доказывает `PAGE_SIZE=4096`.
+`vm_page_bootstrap: 139401` одинаков в probe65/67.
+
+**Гипотеза.** `dtid=147` — вероятно `sweet_emmc_log_thread` (10 мс
+`tsleep(&sweet_emmc_log_chan)`), то есть таблица испортилась не более чем
+за ~10 мс до паники, внутри окна CPU2 CPU_ON. Проверяется чекпоинтами.
+
+**Патч 0138** (`xnu/patches/0138-a10-waitq-table-checkpoints.patch`, 11.1 КБ):
+* `sweet_wq_bad_count()` / `sweet_wq_check(tag)` в `waitq.c`: скан таблицы,
+  число плохих, первый плохой + смещение, 512-битная карта валидных
+  элементов (8 слов), сырые слова элементов 0/5/6, физический адрес таблицы
+  через `mmu_kvtop()`;
+* `waitq_bootstrap()` печатает `pa=` таблицы;
+* чекпоинты: после early eMMC init (`early-emmc`), до/после каждого
+  `processor_start` (`pre-cpu-on`/`post-cpu-on`), при изменении счётчика в
+  цикле handshake (`loop-change`), в начале `SweetCPU::initCPU` на вторичке
+  (`init-cpu`); в периодический отчёт добавлен `wqbad=`;
+* поток персистентного лога проверяет счётчик каждые 10 мс и печатает
+  `SWEET WQCHK: log-tick` при изменении;
+* `cpu_stack_alloc()` печатает физические страницы irq/exception-стеков
+  (`SWEET STACK:`) — проверка теории алиасинга с таблицей.
+Генератор `tools/make_patch_0138.py`: `a/` — снапшот post-0137
+(`work/patchgen-0138/a`), проверен reverse rc=0 / forward apply ok.
+Маркеры 0138 добавлены в `.github/workflows/xnu.yml`.
+
+**Следующий шаг:** закоммитить 0138 + NOTES, запушить, дождаться CI,
+собрать probe68 (`-Cpus 4 -ExtraArgs 'sweetfb_keepon=1 ...'`), прошить,
+загрузиться через TWRP → Reboot → System, снять лог и найти первый
+чекпоинт, где таблица уже плохая. Если починка не быстрая — вернуть
+probe65 (2 ядра) и заниматься периферией.
+
 ### >>> UPDATE 2026-11-14 (позже): probe66 (4 ядра) → паника ticket lock, патч 0137 <<<
 
 **probe66 (`cpus=4`, 0136, keepon) — паника при bring-up CPU3.** Лог

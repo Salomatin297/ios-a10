@@ -1,0 +1,304 @@
+diff --git a/osfmk/kern/waitq.c b/osfmk/kern/waitq.c
+index dcf8593..24614ae 100644
+--- a/osfmk/kern/waitq.c
++++ b/osfmk/kern/waitq.c
+@@ -74,6 +74,11 @@
+ #include <mach/sync_policy.h>
+ #include <vm/vm_kern.h>
+ 
++#if defined(__arm64__)
++/* A10 SMP bring-up diagnostic: mmu_kvtop() names the table's physical page. */
++#include <arm/pmap.h>
++#endif
++
+ #include <sys/kdebug.h>
+ 
+ /*!
+@@ -641,6 +646,16 @@ waitq_wait_possible(thread_t thread)
+ 	       ((thread->state & TH_WAKING) == 0);
+ }
+ 
++static uint64_t
++sweet_wq_table_pa(void)
++{
++#if defined(__arm64__)
++	return (uint64_t)mmu_kvtop((vm_offset_t)global_waitqs);
++#else
++	return 0;
++#endif
++}
++
+ __startup_func
+ static void
+ waitq_bootstrap(void)
+@@ -687,9 +702,10 @@ waitq_bootstrap(void)
+ 	 * pointer.  Record the exact range to tell the two apart.
+ 	 */
+ 	printf("SWEET WQ: table=%p..%p num=%u elem=%lu size=%lu "
+-	    "thread_max=%d\n", global_waitqs,
++	    "thread_max=%d pa=%llx\n", global_waitqs,
+ 	    (void *)((uintptr_t)global_waitqs + whsize), g_num_waitqs,
+-	    (unsigned long)qsz, (unsigned long)whsize, thread_max);
++	    (unsigned long)qsz, (unsigned long)whsize, thread_max,
++	    (unsigned long long)sweet_wq_table_pa());
+ 
+ 	waitq_init(&select_conflict_queue, WQT_SELECT, SYNC_POLICY_FIFO);
+ 
+@@ -701,6 +717,101 @@ waitq_bootstrap(void)
+ STARTUP(MACH_IPC, STARTUP_RANK_FIRST, waitq_bootstrap);
+ 
+ 
++/*
++ * A10 SMP bring-up diagnostic.
++ *
++ * The 4-core panic leaves the whole global waitq hash table zeroed except
++ * the first few elements, although waitq_bootstrap() initializes every
++ * element and the table is never freed.  These helpers are called at the
++ * CPU_ON boundaries (SweetCPU.cpp) and from the persistent-log thread, so
++ * the log shows the first checkpoint at which the table is already bad and
++ * the raw bytes around the first damaged element.
++ *
++ * Only the embedded ticket lock is inspected: lck_type and lck_valid are
++ * written once by waitq_init() and never change afterwards.
++ */
++unsigned int
++sweet_wq_bad_count(void)
++{
++	uint32_t bad = 0;
++
++	if (global_waitqs == &g_boot_waitq || g_num_waitqs == 0 ||
++	    g_num_waitqs > 512) {
++		return 0;
++	}
++	for (uint32_t i = 0; i < g_num_waitqs; i++) {
++		hw_lck_ticket_t *l = &global_waitqs[i].waitq_interlock;
++
++		if (l->lck_type != LCK_TYPE_TICKET || !l->lck_valid) {
++			bad++;
++		}
++	}
++	return bad;
++}
++
++static uint64_t
++sweet_wq_raw(uint32_t index, uint32_t word)
++{
++	if (index >= g_num_waitqs) {
++		return 0;
++	}
++	return ((const volatile uint64_t *)&global_waitqs[index])[word];
++}
++
++void
++sweet_wq_check(const char *tag)
++{
++	uint64_t valid[8] = { 0 };
++	uint32_t bad = 0;
++	long first = -1;
++	uint32_t foff = 0;
++	uint64_t pa = 0;
++
++	if (global_waitqs == &g_boot_waitq || g_num_waitqs == 0 ||
++	    g_num_waitqs > 512) {
++		printf("SWEET WQCHK: %s pre-bootstrap num=%u\n", tag,
++		    g_num_waitqs);
++		return;
++	}
++	for (uint32_t i = 0; i < g_num_waitqs; i++) {
++		hw_lck_ticket_t *l = &global_waitqs[i].waitq_interlock;
++
++		if (l->lck_type == LCK_TYPE_TICKET && l->lck_valid) {
++			valid[i >> 6] |= 1ull << (i & 63);
++		} else {
++			if (first < 0) {
++				first = (long)i;
++				foff = (uint32_t)((uintptr_t)l -
++				    (uintptr_t)global_waitqs);
++			}
++			bad++;
++		}
++	}
++#if defined(__arm64__)
++	if (bad != 0) {
++		pa = sweet_wq_table_pa();
++	}
++#endif
++	printf("SWEET WQCHK: %s bad=%u/%u first=%ld foff=%u pa=%llx "
++	    "valid=%llx,%llx,%llx,%llx,%llx,%llx,%llx,%llx "
++	    "e0=%llx,%llx,%llx e5=%llx,%llx,%llx e6=%llx,%llx,%llx\n",
++	    tag, bad, g_num_waitqs, first, foff, (unsigned long long)pa,
++	    (unsigned long long)valid[0], (unsigned long long)valid[1],
++	    (unsigned long long)valid[2], (unsigned long long)valid[3],
++	    (unsigned long long)valid[4], (unsigned long long)valid[5],
++	    (unsigned long long)valid[6], (unsigned long long)valid[7],
++	    (unsigned long long)sweet_wq_raw(0, 0),
++	    (unsigned long long)sweet_wq_raw(0, 1),
++	    (unsigned long long)sweet_wq_raw(0, 2),
++	    (unsigned long long)sweet_wq_raw(5, 0),
++	    (unsigned long long)sweet_wq_raw(5, 1),
++	    (unsigned long long)sweet_wq_raw(5, 2),
++	    (unsigned long long)sweet_wq_raw(6, 0),
++	    (unsigned long long)sweet_wq_raw(6, 1),
++	    (unsigned long long)sweet_wq_raw(6, 2));
++}
++
++
+ #pragma mark locking
+ 
+ static hw_spin_timeout_status_t
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index ffa5b1d..ed43336 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -27,6 +27,9 @@ extern "C" boolean_t sweet_cpu_signal_is_enabled(unsigned int cpu);
+ /* bsd/dev/sweet_emmc.c: persistent log, usable before the root device exists. */
+ extern "C" int sweet_emmc_early_init(void);
+ extern "C" void sweet_emmc_log_flush_now(const char *tag);
++/* osfmk/kern/waitq.c: global waitq table health, the 4-core panic suspect. */
++extern "C" void sweet_wq_check(const char *tag);
++extern "C" unsigned int sweet_wq_bad_count(void);
+ #if defined(SWEET_GICV2)
+ /* GIC-400 helpers from pe_fiq.c; also used to retry a lost bring-up SGI. */
+ extern "C" void pe_sweet_gic_self_sgi(uint32_t intid);
+@@ -227,6 +230,8 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ 	int early = sweet_emmc_early_init();
+ 	IOLog("SWEET CPU: early eMMC log %s (%d)\n",
+ 	    early == 0 ? "ready" : "unavailable", early);
++	/* Baseline: the table is fully initialized at this point. */
++	sweet_wq_check("early-emmc");
+ 	sweet_emmc_log_flush_now("smp-start");
+ 
+ 	uint64_t deadline;
+@@ -296,8 +301,10 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ 		IOLog("SWEET CPU: processor_start cpu=%u mpidr=0x%x from cpu=%d\n",
+ 		    i, topology->cpus[i].phys_id, cpu_number());
+ 		/* Checkpoint: if CPU_ON wedges the boot core, this line is on disk. */
++		sweet_wq_check("pre-cpu-on");
+ 		sweet_emmc_log_flush_now("pre-cpu-on");
+ 		kern_return_t kr = processor_start(cpu->machProcessor);
++		sweet_wq_check("post-cpu-on");
+ 		sweet_emmc_log_flush_now("post-cpu-on");
+ 		if (kr != KERN_SUCCESS) {
+ 			panic("SWEET CPU: cpu=%u processor_start failed: %d", i, kr);
+@@ -315,6 +322,7 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ 		nanoseconds_to_deadline(100 * NSEC_PER_MSEC, &next_nudge);
+ 		nanoseconds_to_deadline(500 * NSEC_PER_MSEC, &next_on);
+ 		nanoseconds_to_deadline(500 * NSEC_PER_MSEC, &next_report);
++		unsigned int wq_bad = sweet_wq_bad_count();
+ 		while (__atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE) == 0 ||
+ 		    !sweet_cpu_signal_is_enabled(i)) {
+ 			uint64_t *mark = sweet_smp_mark_row(topology->cpus[i].phys_id);
+@@ -325,6 +333,17 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ 			 */
+ 			FlushPoC_DcacheRegion((vm_offset_t)mark,
+ 			    sizeof(sweet_smp_mark[0]));
++			/*
++			 * If the waitq table changes while the secondary is
++			 * running, record the exact checkpoint: the panic
++			 * report alone cannot tell whether the damage happened
++			 * in CPU_ON, in the reset stub or after initCPU.
++			 */
++			unsigned int wq_now = sweet_wq_bad_count();
++			if (wq_now != wq_bad) {
++				wq_bad = wq_now;
++				sweet_wq_check("loop-change");
++			}
+ 			/*
+ 			 * Periodic progress report: the marker row survives in
+ 			 * the persistent log even when the phone is rebooted
+@@ -334,11 +353,12 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ 			 */
+ 			if (mach_absolute_time() > next_report) {
+ 				IOLog("SWEET SMP: wait cpu=%u mpidr=0x%x init=%u "
+-				    "sgi=%u mark=%x/%x/%x/%x/%x/%x/%x/%x "
++				    "sgi=%u wqbad=%u mark=%x/%x/%x/%x/%x/%x/%x/%x "
+ 				    "thread_cpu=%d\n",
+ 				    i, topology->cpus[i].phys_id,
+ 				    __atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE),
+ 				    sweet_cpu_signal_is_enabled(i) ? 1 : 0,
++				    wq_now,
+ 				    (uint32_t)mark[0], (uint32_t)mark[1],
+ 				    (uint32_t)mark[2], (uint32_t)mark[3],
+ 				    (uint32_t)mark[4], (uint32_t)mark[5],
+@@ -490,6 +510,12 @@ SweetCPU::initCPU(bool boot)
+ 	kprintf("SWEET CPU: cpu=%u entered initCPU mpidr=0x%llx EL%llu IRQs=%u\n",
+ 	    getCPUNumber(), __builtin_arm_rsr64("MPIDR_EL1") & 0xffffULL,
+ 	    __builtin_arm_rsr64("CurrentEL") >> 2, ml_get_interrupts_enabled());
++	/*
++	 * The first checkpoint executed by the secondary itself.  If the
++	 * table is bad here but was good at post-cpu-on, the damage happened
++	 * in the reset stub or in arm_init_cpu() before this point.
++	 */
++	sweet_wq_check("init-cpu");
+ 	__atomic_store_n(&initialized, 1, __ATOMIC_RELEASE);
+ }
+ 
+diff --git a/bsd/dev/sweet_emmc.c b/bsd/dev/sweet_emmc.c
+index 45ffa8b..001423d 100644
+--- a/bsd/dev/sweet_emmc.c
++++ b/bsd/dev/sweet_emmc.c
+@@ -34,6 +34,9 @@ extern int hz;
+ /* bsd/dev/sweet_ufs.c: the console ring shared by all SWEET boards. */
+ extern uint32_t sweet_log_copy(uint64_t *pos, char *out, uint32_t max);
+ extern uint64_t sweet_log_position(void);
++/* osfmk/kern/waitq.c: 4-core panic diagnostic, see sweet_wq_check(). */
++extern void sweet_wq_check(const char *tag);
++extern unsigned int sweet_wq_bad_count(void);
+ 
+ #define EMMC_SOC_BASE           0x01000000u
+ #define EMMC_REG_SIZE           0x2000u
+@@ -1385,11 +1388,25 @@ sweet_emmc_log_sync(void)
+ static void
+ sweet_emmc_log_thread(__unused void *arg, __unused wait_result_t wr)
+ {
++	unsigned int wq_bad = sweet_wq_bad_count();
++
+ 	printf("SWEET LOG: A10 console log to the last %u KiB of the partition (LBA 0x%llx)\n",
+ 	    (unsigned)(SWEET_EMMC_LOG_SECTORS * EMMC_BLOCK_SIZE >> 10),
+ 	    se.first_sector + se.partition_sectors - SWEET_EMMC_LOG_SECTORS);
+ 	for (;;) {
+ 		int error;
++		unsigned int wq_now = sweet_wq_bad_count();
++
++		/*
++		 * The 4-core panic finds the global waitq table zeroed.  This
++		 * thread wakes every 10 ms, so a change reported here happened
++		 * in the interval after the previous checkpoint.  Print only
++		 * on a change: the scan itself is cheap, the console is not.
++		 */
++		if (wq_now != wq_bad) {
++			wq_bad = wq_now;
++			sweet_wq_check("log-tick");
++		}
+ 
+ 		(void)tsleep(&sweet_emmc_log_chan, PZERO, "sweetlog",
+ 		    MAX(1, hz / 100));
+diff --git a/osfmk/arm64/cpu.c b/osfmk/arm64/cpu.c
+index b082a10..d362c11 100644
+--- a/osfmk/arm64/cpu.c
++++ b/osfmk/arm64/cpu.c
+@@ -759,6 +759,24 @@ cpu_stack_alloc(cpu_data_t *cpu_data_ptr)
+ 
+ 	cpu_data_ptr->excepstack_top = exc_stack + PAGE_SIZE + EXCEPSTACK_SIZE;
+ 	cpu_data_ptr->excepstackptr = cpu_data_ptr->excepstack_top;
++
++#if defined(SWEET)
++	/*
++	 * A10 SMP bring-up diagnostic: a KMA_ZERO'd 16 KiB stack that aliases
++	 * the 12 KiB waitq hash table would explain the 4-core panic, where
++	 * the table is zeroed between bootstrap and CPU_ON.  Print the stack
++	 * pages and compare them with the SWEET WQCHK physical address.
++	 */
++	kprintf("SWEET STACK: cpu=%d irq=%p/%llx irqdata=%llx "
++	    "exc=%p/%llx excdata=%llx size=%d\n",
++	    (int)cpu_data_ptr->cpu_number, (void *)irq_stack,
++	    (unsigned long long)mmu_kvtop(irq_stack),
++	    (unsigned long long)mmu_kvtop(irq_stack + PAGE_SIZE),
++	    (void *)exc_stack,
++	    (unsigned long long)mmu_kvtop(exc_stack),
++	    (unsigned long long)mmu_kvtop(exc_stack + PAGE_SIZE),
++	    INTSTACK_SIZE);
++#endif
+ }
+ 
+ void

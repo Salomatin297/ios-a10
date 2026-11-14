@@ -206,6 +206,10 @@ jobs:
           need dxb/xnu/osfmk/kern/waitq.c 'SWEET WQ: bad lock site' present '0137 waitq bad-lock diagnostic'
           need dxb/xnu/osfmk/kern/waitq.c 'SWEET WQ: table=%p..%p' present '0137 waitq table range'
           need dxb/xnu/osfmk/kern/lock_ticket.c 'ra1=%p ra2=%p' present '0137 ticket panic return addresses'
+          need dxb/xnu/osfmk/kern/waitq.c 'SWEET WQCHK' present '0138 waitq table checkpoints'
+          need dxb/xnu/iokit/Kernel/arm/SweetCPU.cpp 'sweet_wq_check("pre-cpu-on")' present '0138 CPU_ON checkpoints'
+          need dxb/xnu/bsd/dev/sweet_emmc.c 'sweet_wq_check("log-tick")' present '0138 log-thread watcher'
+          need dxb/xnu/osfmk/arm64/cpu.c 'SWEET STACK' present '0138 stack physical pages'
           if [ "$fail" -ne 0 ]; then
             echo "::error::A10 port patches did not apply cleanly"
             exit 1
