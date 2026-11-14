@@ -61,6 +61,12 @@ cpu3=`0x101` (A53), далее A53. `cpus=2` берёт первые два уз
   APM `0x11c00000` (размер `0x8000`), gate `0x2064` (bit 20 MANUAL,
   bit 21 CG_VAL), QCH `0x304c` (bit 0 ENABLE, bit 1 REQ).
   Исправлено в 0130; probe72 = probe69 + исправленный `a10audio=1`.
+* probe72 — ядро 0130 с исправленной аудио-пробой (APM `0x11c00000`,
+  gate `0x2064`, QCH `0x304c`), CI `43616203988` (kernel SHA256
+  `b8cef71f7ba7e6254ddfeba4fb5d6d31ec5c70f39fa8f60c9fc1f011624c4243`),
+  2 ядра A53+A73 + `a10audio=1`; `dist/boot-a10-probe72.img` SHA256
+  `648B2B0CFACA7388234856138B356B94CF64B14F5CE5A7DFB165076C4E9F4FEF`.
+  Собран 2026-11-14, ждёт прошивки из TWRP.
 
 **AP-прошивка разобрана без полной распаковки** (полная распаковка не помещается):
 `work/ap_extract_vendor.py` потоково достаёт `vendor.img.lz4` из AP tar
