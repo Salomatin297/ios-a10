@@ -1,0 +1,22 @@
+diff --git a/bsd/dev/a10_audio.c b/bsd/dev/a10_audio.c
+index d7d16a8..6163d6f 100644
+--- a/bsd/dev/a10_audio.c
++++ b/bsd/dev/a10_audio.c
+@@ -430,10 +430,13 @@ a10_abox_dump(void)
+ 	    *(volatile uint32_t *)(cmu + A10_CMU_GATE_UAIF3),
+ 	    *(volatile uint32_t *)(cmu + A10_CMU_GATE_CA7),
+ 	    *(volatile uint32_t *)(cmu + A10_CMU_GATE_MCLK));
+-	printf("A10 ABOX: qch abox=%08x dispaud=%08x mailbox=%08x\n",
+-	    *(volatile uint32_t *)(qch + A10_QCH_ABOX),
+-	    *(volatile uint32_t *)(qch + A10_QCH_DISPAUD),
+-	    *(volatile uint32_t *)(qch + A10_QCH_MAILBOX));
++	/*
++	 * QCH_CON_LHM_AXI_D_ABOX_QCH at 0x12063034 aborts while the ABOX
++	 * domain is off (probe75 v4: FAR = qch + 0x3034, ESR 0x96000210).
++	 * Unlike the SPEEDY QCH at 0x304c, this gate lives in the ABOX
++	 * power domain.  The vendor map gives the offsets; skip the block
++	 * until the domain is enabled.
++	 */
+ 	printf("A10 ABOX: sfr id=%08x ver=%08x remap=%08x timer=%08x/%08x "
+ 	    "ca7pc=%08x\n",
+ 	    *(volatile uint32_t *)(abox + 0x0000),

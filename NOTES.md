@@ -102,6 +102,18 @@ initialized, SGI1 verified`**, iOS-путь пошёл дальше, дамп к
   `need_smc = 0x148F0000`). Поэтому в **0142** блок `pd-dispaud`
   убран, остальные блоки дампа остаются.
 
+**probe75 v4 (0142, CI `43716346328`, kernel SHA256 `9149D8E5…`).**
+Образ `dist/boot-a10-probe75.img` SHA256 `BFF5182A…`, прошит, iOS не
+загрузилась. Лог: PMU CA7 тот же (`cfg=1 sts=10010000 opt=0
+magic=3100`), CMU_DISPAUD:
+`pll_aud=a02d0110/0000f300 audif_div=00000000
+uaif_div=00000000/00000000/00000000/00000001`, гейты
+`aclk/uaif0/uaif2/uaif3/ca7/mclk = 00200000`. Следующий блок — QCH
+`0x12063034` — дал **Kernel data abort**, ESR `0x96000210`, FAR
+`0xfffffff077b3a034` (= qch + `0x3034`). В отличие от SPEEDY QCH
+`0x304c`, QCH ABOX живёт в выключенном домене ABOX. Поэтому в **0143**
+блок QCH убран; SFR/SRAM/sysmmu/GIC остаются и читаются после него.
+
 **Наблюдения TWRP:** `pd-dispaud - on` уже на старте; ABOX SFR/SRAM
 читаются до включения клоков ABOX; `ABOX_TIMER0_CTRL1 == 0`, поэтому
 Linux идёт по пути загрузки firmware и падает на `calliope_sram.bin`
@@ -109,16 +121,50 @@ Linux идёт по пути загрузки firmware и падает на `cal
 (`abox_cpu_enable(0)`/`abox_cpu_power(0)`). CMU_DISPAUD в TWRP:
 `audif clock: 24576000`.
 
-**Следующее:** CI 0142, собрать probe75 v4 (`-Adt work\a10-a73-first.adt
+**Следующее:** CI 0143, собрать probe75 v5 (`-Adt work\a10-a73-first.adt
 -ExtraArgs 'a10audio=1 a10audio_diag=1 wqchk=0'`), снять лог из TWRP и
-прочитать CMU_DISPAUD/QCH/ABOX SFR/SRAM/sysmmu/GIC. Затем решить,
+прочитать ABOX SFR/SRAM/sysmmu/GIC (QCH пропущен). Затем решить,
 включать ли клоки ABOX из XNU и можно ли грузить
 `calliope_sram.bin`/`calliope_dram.bin` без SMC; speaker:
 ABOX firmware + UAIF3 + SMA1301. Параллельно проверить `sweetlog=0`.
-**После аудио — Metal через Panfrost** (просьба пользователя
-2026-11-15): изучить перенос Panfrost/AGX-командного потока в XNU и
-минимальный Metal-драйвер для Mali-G71/G52 в A10; начать с
-инвентаризации GPU: `/proc/device-tree/g3d`, CMU_G3D, pd-g3d, sysmmu_g3d.
+**GPU/Mali (инвентарь 2026-11-15).** В TWRP kbase загружен
+(`mali_kbase` r26p0-01eac0, UK 11.27); `gpuinfo` =
+`Mali-G71 2 cores r0p0 0x60A0`, `gpu_status` без fault'ов,
+`core_mask 0x3`, DVFS 676/545/450/343 МГц (`dvfs_table`), ASV voltages
+681/650/612/600 мВ. IRQ: DT JOB/MMU/GPU 158/159/160 -> GIC 190/191/192;
+`/proc/interrupts` показывает 1 прерывание на GIC 190. `mali_trace`:
+RPM resume -> CORE_GPU_SOFT_RESET -> LSI_GPU_IRQ_E 0x100 -> LSI_GPU_OFF,
+т.е. kbase сам инициализирует GPU.
+
+Адреса: `pd-g3d@11c840a0` (cal_id `0xB1380004`, PMU status offset
+`0x40a4`, local power mask `0xf`), CMU_G3D `0x11400000` (PLL_G3D
+`0x0120`, locktime `0x0000`, mux `0x1004`, switch user `0x0100/0x0108`,
+gate GPU `0x2030`, bus `0x2028`, LHS_AXI_D `0x2020`, LHM_AXI `0x2018`,
+AXI2APB `0x2014`, CMU PCLK `0x2004`, SYSREG `0x2034`, XIU `0x2038`,
+RSTNSYNC `0x202c`, div `0x1800`; QCH AGPU `0x3000`, CMU_G3D `0x3004`,
+LHM_AXI_G3DSFR `0x3008`, LHM_AXI_P_G3D `0x300c`, LHS_AXI_D_G3D `0x3010`,
+LHS_AXI_G3DSFR `0x3014`, SYSREG `0x3018`). CORE CMU `0x12000000`:
+CORE_G3D gate `0x2024`, G3D_SWITCH `0x2058`, LHS_AXI_P_G3D `0x20d4`,
+PPCFW_G3D `0x2108/0x210c`, RSTNSYNC_CORE_G3D `0x213c/0x2140`,
+LHM_AXI_D_G3D `0x208c`, PLL users `0x0140/0x0148`; QCH LHM_AXI_D_G3D
+`0x3050`, LHS_AXI_P_G3D `0x3098`, PPCFW_G3D `0x30cc`. `sysmmu_g3d` в
+live DT отсутствует.
+
+`/dev/mem` в TWRP заблокирован (`ENXIO` даже после `mknod`), поэтому
+GPU_ID читается только через kbase `gpuinfo`. Прямой доступ XNU к
+`pd-g3d`/CMU_G3D пока невозможен: домен, как и `pd-dispaud`, управляется
+ACPM/SMC (`cal_id 0xB1380004`), а ACPM в XNU нет.
+
+**Metal через Panfrost — невозможно как заявлено.** Panfrost — это
+Linux DRM-драйвер + Mesa (GLES/Vulkan), он не реализует Metal и не
+исполняет AGX-команды/шейдеры iOS. Чтобы SpringBoard/CA ускорились на
+Mali-G71, нужен либо (а) Metal-драйвер для G71: IOGPU/Metal-интерфейс +
+компилятор AIR->Bifrost, либо (б) замена рендерера iOS на
+Panfrost/Mesa-композитор (это уже не iOS). Оба пути — месяцы/годы, не
+патч. Реалистично: оставить `CA::OGL::SWContext`, оптимизировать
+software-рендер (логи, разрешение, NEON) и заниматься ACPM/audio;
+GPU можно использовать только для собственных экспериментов после
+появления ACPM.
 
 ### >>> UPDATE 2026-11-14 (вечер, A73): загрузочное ядро — A53, ровно 2×A73 невозможны <<<
 
