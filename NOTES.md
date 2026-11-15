@@ -114,6 +114,15 @@ uaif_div=00000000/00000000/00000000/00000001`, гейты
 `0x304c`, QCH ABOX живёт в выключенном домене ABOX. Поэтому в **0143**
 блок QCH убран; SFR/SRAM/sysmmu/GIC остаются и читаются после него.
 
+**probe75 v5 (0143, CI `43718350660`, kernel SHA256 `FCF49083…`).**
+Образ `dist/boot-a10-probe75v5.img` SHA256 `64A3548A…`, прошит, iOS не
+загрузилась. Лог `dist/logs/probe75v5/`: ABOX SFR читается
+(`id=41424f58 ver=01210000 remap=14a00000 ca7pc=b9fef734`), SRAM тоже
+(`tx=08031c08 rx=0000000b mailbox=00000221 first=14000001/10073fe0`),
+затем **panic на `sysmmu + 0x30` (CAPA)**, FAR `0xfffffff0020d2030`,
+ESR `0x96000210`. Значит CAPA/CAPA1 у этого SYSMMU не отображены; в
+**0144** они убраны, а чтения ABOX GIC спрятаны за `a10audio_diag=2`.
+
 **Наблюдения TWRP:** `pd-dispaud - on` уже на старте; ABOX SFR/SRAM
 читаются до включения клоков ABOX; `ABOX_TIMER0_CTRL1 == 0`, поэтому
 Linux идёт по пути загрузки firmware и падает на `calliope_sram.bin`
@@ -121,12 +130,29 @@ Linux идёт по пути загрузки firmware и падает на `cal
 (`abox_cpu_enable(0)`/`abox_cpu_power(0)`). CMU_DISPAUD в TWRP:
 `audif clock: 24576000`.
 
-**Следующее:** CI 0143, собрать probe75 v5 (`-Adt work\a10-a73-first.adt
--ExtraArgs 'a10audio=1 a10audio_diag=1 wqchk=0'`), снять лог из TWRP и
-прочитать ABOX SFR/SRAM/sysmmu/GIC (QCH пропущен). Затем решить,
-включать ли клоки ABOX из XNU и можно ли грузить
-`calliope_sram.bin`/`calliope_dram.bin` без SMC; speaker:
-ABOX firmware + UAIF3 + SMA1301. Параллельно проверить `sweetlog=0`.
+**Следующее (GPU):** CI 0144, probe76
+(`-Adt work\a10-a73-first.adt -ExtraArgs 'a10gpu=1 a10audio=1
+a10audio_diag=1 wqchk=0'`); ждём `A10 GPU: GPU_ID=60a0…`,
+`soft reset completed`, `cores powered`, `WRITE_VALUE job … the Mali ran it`.
+После этого — HeroGPU ioctl ABI поверх `SweetSurface`, Mesa 25.0.7
+Panfrost + EAGL/OSMesa и GL-бэкенд CoreAnimation (как в herolte).
+
+**Следующее (audio):** после GPU — ABOX firmware/CA7, UAIF3 + SMA1301;
+`calliope_sram.bin`/`calliope_dram.bin` без SMC пока не проверялись.
+Параллельно проверить `sweetlog=0`.
+
+
+**GPU/Mali — питание и часы (проверено по vendor-исходникам).**
+`pd-g3d` **не имеет** `need_smc` в live DT (в отличие от `pd-dispaud`),
+поэтому домен включается локально: PMU `0x11C840A0 = 0xF`, ожидание
+`(0x11C840A4 & 0xF) == 0xF` (это ровно `g3d_on[]` из
+`pmucal_local_exynos7885.h`). Рельса `vdd_g3d` — S2MPU08 BUCK5
+(`regulator-always-on`), PMIC не нужен. Гейты: MANUAL `1<<20` = 1,
+CG_VAL `1<<21` = **1** пропускает клок (vendor `ra.c`); QCH ENABLE
+`1<<0` = 1 обходит request-логику. CMU_TOP CORE_G3D gate `0x2024`,
+CMU_G3D PLL `0x0120`, гейты `0x2004..0x2038`, QCH `0x3000..0x3018`.
+
+
 **GPU/Mali (инвентарь 2026-11-15).** В TWRP kbase загружен
 (`mali_kbase` r26p0-01eac0, UK 11.27); `gpuinfo` =
 `Mali-G71 2 cores r0p0 0x60A0`, `gpu_status` без fault'ов,
@@ -152,19 +178,20 @@ live DT отсутствует.
 
 `/dev/mem` в TWRP заблокирован (`ENXIO` даже после `mknod`), поэтому
 GPU_ID читается только через kbase `gpuinfo`. Прямой доступ XNU к
-`pd-g3d`/CMU_G3D пока невозможен: домен, как и `pd-dispaud`, управляется
-ACPM/SMC (`cal_id 0xB1380004`), а ACPM в XNU нет.
+`pd-g3d`/CMU_G3D **возможен**: `pd-g3d` не имеет `need_smc`, домен
+включается локально через PMU `0x40a0/0x40a4` (см. выше); ACPM для
+G3D не нужен.
 
-**Metal через Panfrost — невозможно как заявлено.** Panfrost — это
-Linux DRM-драйвер + Mesa (GLES/Vulkan), он не реализует Metal и не
-исполняет AGX-команды/шейдеры iOS. Чтобы SpringBoard/CA ускорились на
-Mali-G71, нужен либо (а) Metal-драйвер для G71: IOGPU/Metal-интерфейс +
-компилятор AIR->Bifrost, либо (б) замена рендерера iOS на
-Panfrost/Mesa-композитор (это уже не iOS). Оба пути — месяцы/годы, не
-патч. Реалистично: оставить `CA::OGL::SWContext`, оптимизировать
-software-рендер (логи, разрешение, NEON) и заниматься ACPM/audio;
-GPU можно использовать только для собственных экспериментов после
-появления ACPM.
+**Metal напрямую на Panfrost — нет; GLES через Panfrost — да.**
+Panfrost не реализует Metal и не исполняет AGX-команды, поэтому
+SpringBoard не может использовать его как Metal-драйвер. Но в портах
+HakiOS (herolte, A21s) доказано, что Panfrost + Mesa GLES + GL-бэкенд
+CoreAnimation (`CA::OGL::GLContext`) работает на XNU: herolte получает
+`GL_RENDERER = Mali-T880 (Panfrost)`, GL 2.1, а A32 — 21–31 fps против
+10–14 на software. Для A10 реалистичный путь: kernel-сервис HeroGPU
+(ioctl) → Mesa 25.0.7 Panfrost + libdrm-шим → EAGL/OSMesa → GL-бэкенд CA.
+Metal остаётся отдельной задачей (frontend уровня viva-gpu).
+
 
 ### >>> UPDATE 2026-11-14 (вечер, A73): загрузочное ядро — A53, ровно 2×A73 невозможны <<<
 
