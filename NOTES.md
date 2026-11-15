@@ -34,13 +34,17 @@ probe (1.9 с) и не повторяет его. Попытка `unbind`/`bind`
 критична: тач уже работает с прошивкой, залитой загрузчиком/stock.
 
 **probe74 (патч 0140):** в `a10_audio.c` добавлен IP-batcher:
-`SEMA_REL=1`, сброс `CON` bit31, `FSM_UNEXPEN=0x7030E`, `FSM_TXEN=0x11`,
-`FSM_RXFIFO=0x40`, `FSM_CON=1`; на каждое чтение — опкоды
+`SEMA_REL=1`, сброс `CON` bit31, `FSM_UNEXPEN=0x37000E` (timeout-биты,
+RX/TX-ошибки; `0x7030E` — это `INT_ENABLE`, его в `UNEXPEN` писать нельзя),
+`FSM_TXEN=0x11`, `FSM_RXFIFO=0x40`, `FSM_CON=1`; на каждое чтение — опкоды
 `0x0C100400`/`0xFFFF3808`, payload
 `0x30051`/`0x80000101`/`0xFFFFFFFF`/`0x7030E`/`(addr<<7|1<<19)`/`0x77`/`0`,
 START, poll `STATE` bit0, результат в payload slot 5 (`0x1014`). Читаются
 все 256 регистров COD3035X (dev `0x03`) и печатаются рядами по 16 для
-сравнения с ACPM-дампом. CI/образ — заполнить после сборки.
+сравнения с ACPM-дампом. В DT (`speedy@11CE0000`) нет
+`samsung,always-interrupt-high`, поэтому `INT_EN=0x7030E` без
+TX-almost-empty; узел кодека — `cod3035x@03`, `reg=3`, `vdd-supply`
+phandle `0x125` (LDO36). CI/образ — заполнить после сборки.
 
 **Следующее:** собрать probe74 (CI), прошить, сравнить дамп с TWRP;
 затем ABOX: включение `pd-dispaud` (SMC), загрузка firmware из

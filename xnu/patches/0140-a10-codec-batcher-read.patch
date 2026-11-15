@@ -35,7 +35,7 @@ diff --git a/bsd/dev/a10_audio.c b/bsd/dev/a10_audio.c
   */
  #if defined(ARM64_BOARD_CONFIG_SWEET)
  #include <sys/param.h>
-@@ -69,8 +69,46 @@
+@@ -69,8 +69,52 @@
  #define IPBATCHER_CON        0x500u
  #define IPBATCHER_STATE      0x504u
  #define IPBATCHER_INT_EN     0x508u
@@ -77,12 +77,18 @@ diff --git a/bsd/dev/a10_audio.c b/bsd/dev/a10_audio.c
 +#define BATCHER_STATE_DONE    0x00000001u
 +#define BATCHER_STATE_UNEXP   0x00000002u
 +#define BATCHER_ERR_MASK      0x0037000eu
++/*
++ * Bits the batcher treats as "unexpected": the three SPEEDY timeouts, the
++ * three RX bit errors and the two TX line errors.  It must NOT contain the
++ * normal RX FIFO interrupts (bits 8/9) - those are expected during a read.
++ */
++#define BATCHER_FSM_UNEXPEN_MASK 0x0037000eu
 +
 +#define A10_CODEC_SPEEDY_DEV  0x03u
  
  static vm_offset_t a10_apm;
  static vm_offset_t a10_speedy;
-@@ -92,6 +130,12 @@
+@@ -92,6 +136,12 @@
  a10_speedy_read(unsigned off)
  {
  	return *(volatile uint32_t *)(a10_speedy + off);
@@ -95,7 +101,7 @@ diff --git a/bsd/dev/a10_audio.c b/bsd/dev/a10_audio.c
  }
  
  /*
-@@ -115,6 +159,145 @@
+@@ -115,6 +165,145 @@
  	a10_apm_write(A10_APM_SPEEDY_GATE, after);
  	printf("A10 AUDIO: speedy gate %08x -> %08x (now %08x)\n",
  	    before, after, a10_apm_read(A10_APM_SPEEDY_GATE));
@@ -119,7 +125,7 @@ diff --git a/bsd/dev/a10_audio.c b/bsd/dev/a10_audio.c
 +	a10_speedy_write(IPBATCHER_CON, con | 0x80000000u);
 +	a10_speedy_write(IPBATCHER_CON, con & ~0x80000000u);
 +
-+	a10_speedy_write(IPBATCHER_FSM_UNEXPEN, 0x0007030eu);
++	a10_speedy_write(IPBATCHER_FSM_UNEXPEN, BATCHER_FSM_UNEXPEN_MASK);
 +	a10_speedy_write(IPBATCHER_FSM_TXEN, 0x00000011u);
 +	a10_speedy_write(IPBATCHER_FSM_RXFIFO, 0x00000040u);
 +	a10_speedy_write(IPBATCHER_FSM_CON, 0x00000001u);
@@ -241,7 +247,7 @@ diff --git a/bsd/dev/a10_audio.c b/bsd/dev/a10_audio.c
  }
  
  int
-@@ -159,8 +342,12 @@
+@@ -159,8 +348,12 @@
  	    a10_speedy_read(IPBATCHER_INT_EN), a10_speedy_read(IP_FIFO_STATUS),
  	    a10_speedy_read(IP_INT_STATUS));
  
