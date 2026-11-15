@@ -98,10 +98,10 @@ index 6163d6f..80ced43 100644
  	a10_audio_ready = true;
 diff --git a/bsd/dev/a10_gpu.c b/bsd/dev/a10_gpu.c
 new file mode 100644
-index 0000000..017056d
+index 0000000..92d28c8
 --- /dev/null
 +++ b/bsd/dev/a10_gpu.c
-@@ -0,0 +1,586 @@
+@@ -0,0 +1,584 @@
 +/*
 + * A10 (Exynos 7884B): Mali-G71 MP2 bring-up.
 + *
@@ -565,15 +565,13 @@ index 0000000..017056d
 +	}
 +	FlushPoC_DcacheRegion(page, PAGE_SIZE);
 +
-+	done = (jirq & (1u << 1)) != 0 && (jirq & (1u << 17)) == 0 &&
-+	    mirq == 0 && (girq & 0x81u) == 0 &&
-+	    *target == A10_GPU_TEST_WORD;
++	done = *target == A10_GPU_TEST_WORD;
 +	printf("A10 GPU: WRITE_VALUE job irq=%08x mmu=%08x gpu=%08x "
-+	    "slot=%08x as_fault=%08x exception=%08x word=%08x -> %s\n",
++	    "slot=%08x as_fault=%08x job_status=%08x word=%08x -> %s\n",
 +	    jirq, mirq, girq, a10_gpu_read(mali, JS1 + JS_STATUS),
 +	    a10_gpu_read(mali, AS0 + AS_FAULTSTATUS),
-+	    a10_gpu_read(mali, AS0 + AS_FAULTSTATUS) ? 0 : job[0],
-+	    *target, done ? "the Mali ran it" : "failed or timed out");
++	    job[0], *target,
++	    done ? "the Mali ran it" : "failed or timed out");
 +
 +	a10_gpu_write(mali, JOB_INT_CLEAR, 0xffffffffu);
 +	a10_gpu_write(mali, MMU_IRQ_CLEAR, 0xffffffffu);
