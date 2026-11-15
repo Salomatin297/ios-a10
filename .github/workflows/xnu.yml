@@ -213,6 +213,8 @@ jobs:
           need dxb/xnu/osfmk/arm64/cpu.c 'SWEET STACK' present '0138 stack physical pages'
           need dxb/xnu/bsd/dev/a10_gpu.c 'A10 GPU: probe done' present '0144 Mali-G71 probe'
           need dxb/xnu/bsd/dev/a10_gpu.c 'WRITE_VALUE job' present '0144 first Bifrost job'
+          need dxb/xnu/bsd/dev/a10_gpu.c 'a10_gpu_pt_page' present '0146 GPU page tables'
+          need dxb/xnu/bsd/dev/a10_gpu.c '4-level (48-bit VA) job' present '0146 48-bit VA job'
           need dxb/xnu/bsd/dev/sweet_emmc.c 'a10_gpu_init' present '0144 GPU probe hook'
           need dxb/xnu/bsd/conf/files 'bsd/dev/a10_gpu.c' present '0144 GPU driver in the build'
           need dxb/xnu/bsd/dev/a10_audio.c 'A10_MMU_CAPA' absent '0144 SYSMMU CAPA abort removed'

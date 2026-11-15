@@ -1,0 +1,319 @@
+diff --git a/bsd/dev/a10_gpu.c b/bsd/dev/a10_gpu.c
+index 92d28c8..a1f9639 100644
+--- a/bsd/dev/a10_gpu.c
++++ b/bsd/dev/a10_gpu.c
+@@ -13,11 +13,18 @@
+  * The pd-g3d node has no "need_smc" property; unlike pd-dispaud, this
+  * domain is switched locally.
+  *
+- * probe76 (a10gpu=1) powers the domain if S-Boot left it off, forces the
+- * CORE_G3D and CMU_G3D gates on, dumps the clock state, reads GPU_ID, runs
+- * the smallest Mali job there is (WRITE_VALUE through address space 0 in
+- * identity mode -- the same sequence that completed on the A21s G52), and
+- * powers the cores off again.  It is opt-in and changes nothing else.
++ * probe77 (a10gpu=1) powered the domain, forced the CORE_G3D and CMU_G3D
++ * gates on, read GPU_ID 0x60a00002, reset the GPU, powered the cores and
++ * ran the smallest Mali job there is (WRITE_VALUE through address space 0
++ * in identity mode): the word appeared, so the job manager works.
++ *
++ * probe78 adds the GPU's own page tables.  The MMU reports 48 bits of
++ * virtual address and 40 of physical (MMU_FEATURES 0x2830), so a 4 KB
++ * granule takes four levels (bits 47..39, 38..30, 29..21, 20..12) and
++ * INA_BITS = 55 - 48 = 7 in AS_TRANSCFG.  The A21s G52 reports 35 bits
++ * and uses three levels, so the probe builds that shape too and runs the
++ * same job through whichever tables work: one flash, both answers.
++ * It is opt-in and changes nothing else.
+  *
+  * Gate polarity comes from the vendor ra.c: with MANUAL (1 << 20) set,
+  * CG_VAL (1 << 21) = 1 passes the clock.  A QCH with ENABLE (1 << 0) = 1
+@@ -37,6 +44,7 @@
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern uint64_t kvtophys(vm_offset_t);
++extern vm_offset_t phystokv(uint64_t);
+ extern void FlushPoC_DcacheRegion(vm_offset_t, size_t);
+ 
+ /* PMU (SFR_BLOCK(APM, 0x11c00000) is a different block; pd-g3d is here). */
+@@ -138,6 +146,8 @@ extern void FlushPoC_DcacheRegion(vm_offset_t, size_t);
+ #define AS_MEMATTR_HI           0x0cu
+ #define AS_COMMAND              0x18u
+ #define AS_FAULTSTATUS          0x1cu
++#define AS_FAULTADDRESS_LO      0x20u
++#define AS_FAULTADDRESS_HI      0x24u
+ #define AS_STATUS               0x28u
+ #define AS_TRANSCFG_LO          0x30u
+ #define AS_TRANSCFG_HI          0x34u
+@@ -400,21 +410,139 @@ a10_gpu_power_off(vm_offset_t mali)
+ 	    a10_gpu_read(mali, L2_READY));
+ }
+ 
++/*
++ * Address space 0: a translation table at `transtab` (0 with TRANSCFG
++ * ADRMODE_IDENTITY for physical addresses) and the walker configuration
++ * in `transcfg`.  AS_COMMAND_UPDATE broadcasts the two to the MMU, and
++ * AS_STATUS bit 0 stays set until that is done.
++ */
++static bool
++a10_gpu_as0(vm_offset_t mali, uint64_t transtab, uint32_t transcfg)
++{
++	a10_gpu_write(mali, AS0 + AS_TRANSTAB_LO, (uint32_t)transtab);
++	a10_gpu_write(mali, AS0 + AS_TRANSTAB_HI, (uint32_t)(transtab >> 32));
++	a10_gpu_write(mali, AS0 + AS_TRANSCFG_LO, transcfg);
++	a10_gpu_write(mali, AS0 + AS_TRANSCFG_HI, 0);
++	a10_gpu_write(mali, AS0 + AS_MEMATTR_LO, 0x88888888u);
++	a10_gpu_write(mali, AS0 + AS_MEMATTR_HI, 0x88888888u);
++	a10_gpu_write(mali, AS0 + AS_COMMAND, 1);       /* update */
++	if (!a10_gpu_wait(mali, AS0 + AS_STATUS, 1, 0, 50000)) {
++		printf("A10 GPU: AS0 update timeout, status=%08x\n",
++		    a10_gpu_read(mali, AS0 + AS_STATUS));
++		return false;
++	}
++	return true;
++}
++
++/*
++ * The GPU's page tables: ordinary AArch64 stage-1 tables with 4 KB pages
++ * (AS_TRANSCFG ADRMODE 6), the same shape Linux's Panfrost gives this
++ * hardware.  The A10's MMU reports 48 virtual bits and 40 physical
++ * (MMU_FEATURES 0x2830: VA_BITS = 0x30, PA_BITS = 0x28), so four levels
++ * cover it: bits 47..39, 38..30, 29..21, 20..12.  The walker starts at
++ * the level INA_BITS selects (55 - VA bits, as Panfrost computes it).
++ * A21s's G52 reports 35 bits and uses three levels; that shape is built
++ * as a fallback, so one boot says which one this GPU takes.
++ */
++#define PTE_TABLE           3ull
++#define PTE_PAGE            3ull
++#define PTE_AF              (1ull << 10)
++#define PTE_SH_INNER        (3ull << 8)
++#define PTE_AP_RW           (1ull << 6)
++#define PTE_ADDRESS         0x0000fffffffff000ull
++
++#define TRANSCFG_ADRMODE_AARCH64_4K 6u
++#define TRANSCFG_WALK_WB    (TRANSCFG_ADRMODE_AARCH64_4K | (2u << 24) | \
++			    (1u << 30))		/* walks write-back, read-allocate */
++#define TRANSCFG_48BIT      (TRANSCFG_WALK_WB | (7u << 6))   /* 55 - 48 */
++#define TRANSCFG_35BIT      (TRANSCFG_WALK_WB | (20u << 6))  /* 55 - 35 */
++
++#define A10_GPU_TEST_VA     0x00100000ull
++
++struct a10_gpu_pt {
++	uint64_t *top;
++	uint64_t top_phys;
++	unsigned levels;        /* 4 for a 48-bit VA, 3 for a 35-bit one */
++};
++
++static uint64_t *
++a10_gpu_pt_page(uint64_t *phys)
++{
++	vm_offset_t page = 0;
++
++	if (kmem_alloc(kernel_map, &page, PAGE_SIZE,
++	    KMA_KOBJECT | KMA_ZERO | KMA_DATA,
++	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return NULL;
++	}
++	*phys = (uint64_t)kvtophys(page);
++	FlushPoC_DcacheRegion(page, PAGE_SIZE);  /* its zeroes in memory */
++	return (uint64_t *)page;
++}
++
++/* The table below `entry`, made if there is none yet. */
++static uint64_t *
++a10_gpu_pt_below(uint64_t *entry)
++{
++	uint64_t phys;
++	uint64_t *table;
++
++	if (*entry & PTE_TABLE) {
++		return (uint64_t *)phystokv(*entry & PTE_ADDRESS);
++	}
++	table = a10_gpu_pt_page(&phys);
++	if (table == NULL) {
++		return NULL;
++	}
++	*entry = phys | PTE_TABLE;
++	FlushPoC_DcacheRegion((vm_offset_t)entry, sizeof(*entry));
++	return table;
++}
++
++/* One 4 KB page of physical memory at GPU address `gpu`. */
++static bool
++a10_gpu_map(struct a10_gpu_pt *pt, uint64_t gpu, uint64_t phys)
++{
++	uint64_t *table, *entry;
++
++	table = pt->top;
++	if (pt->levels == 4) {
++		table = a10_gpu_pt_below(&table[(gpu >> 39) & 511]);
++		if (table == NULL) {
++			return false;
++		}
++	}
++	table = a10_gpu_pt_below(&table[(gpu >> 30) & 511]);
++	if (table == NULL) {
++		return false;
++	}
++	table = a10_gpu_pt_below(&table[(gpu >> 21) & 511]);
++	if (table == NULL) {
++		return false;
++	}
++	entry = &table[(gpu >> 12) & 511];
++	*entry = (phys & PTE_ADDRESS) | PTE_AF | PTE_SH_INNER | PTE_AP_RW |
++	    PTE_PAGE;
++	FlushPoC_DcacheRegion((vm_offset_t)entry, sizeof(*entry));
++	return true;
++}
++
+ /*
+  * One Bifrost job: a job header saying "write value" at page+0, and its
+- * payload -- where (page+0x800), what kind (6, a 32-bit immediate) and the
+- * value -- at +0x10.  Address space 0 is in identity mode, so the GPU
+- * address of the page is its physical address.  The processor's cache is
+- * flushed before the GPU reads the job and again before the word is read.
++ * payload -- where (gpu+0x800), what kind (6, a 32-bit immediate) and the
++ * value -- at +0x10.  `gpu` is the address the GPU knows the page by: its
++ * physical address in identity mode, or where the tables put it.  The
++ * processor's cache is flushed before the GPU reads the job and again
++ * before the word is read.
+  */
+ static bool
+-a10_gpu_write_value(vm_offset_t mali, uint32_t shader_mask, vm_offset_t page)
++a10_gpu_write_value(vm_offset_t mali, uint32_t shader_mask, vm_offset_t page,
++    uint64_t gpu, uint32_t value)
+ {
+ 	volatile uint32_t *job = (volatile uint32_t *)page;
+ 	volatile uint32_t *target =
+ 	    (volatile uint32_t *)(page + 0x800);
+-	uint64_t gpu = (uint64_t)kvtophys(page);
+-	uint32_t jirq = 0, mirq = 0, girq = 0;
++	uint32_t jirq = 0, mirq = 0, girq = 0, fault;
+ 	unsigned waited;
+ 	bool done;
+ 
+@@ -422,23 +550,11 @@ a10_gpu_write_value(vm_offset_t mali, uint32_t shader_mask, vm_offset_t page)
+ 	job[8] = (uint32_t)(gpu + 0x800);
+ 	job[9] = (uint32_t)((gpu + 0x800) >> 32);
+ 	job[10] = 6;
+-	job[12] = A10_GPU_TEST_WORD;
++	job[12] = value;
++	*target = 0;
+ 	FlushPoC_DcacheRegion(page, PAGE_SIZE);
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ 
+-	a10_gpu_write(mali, AS0 + AS_TRANSTAB_LO, 0);
+-	a10_gpu_write(mali, AS0 + AS_TRANSTAB_HI, 0);
+-	a10_gpu_write(mali, AS0 + AS_TRANSCFG_LO, 2);   /* identity */
+-	a10_gpu_write(mali, AS0 + AS_TRANSCFG_HI, 0);
+-	a10_gpu_write(mali, AS0 + AS_MEMATTR_LO, 0x88888888u);
+-	a10_gpu_write(mali, AS0 + AS_MEMATTR_HI, 0x88888888u);
+-	a10_gpu_write(mali, AS0 + AS_COMMAND, 1);       /* update */
+-	if (!a10_gpu_wait(mali, AS0 + AS_STATUS, 1, 0, 50000)) {
+-		printf("A10 GPU: AS0 update timeout, status=%08x\n",
+-		    a10_gpu_read(mali, AS0 + AS_STATUS));
+-		return false;
+-	}
+-
+ 	a10_gpu_write(mali, JOB_INT_MASK, 0);
+ 	a10_gpu_write(mali, JOB_INT_CLEAR, 0xffffffffu);
+ 	a10_gpu_write(mali, MMU_IRQ_CLEAR, 0xffffffffu);
+@@ -461,11 +577,15 @@ a10_gpu_write_value(vm_offset_t mali, uint32_t shader_mask, vm_offset_t page)
+ 	}
+ 	FlushPoC_DcacheRegion(page, PAGE_SIZE);
+ 
+-	done = *target == A10_GPU_TEST_WORD;
++	fault = a10_gpu_read(mali, AS0 + AS_FAULTSTATUS);
++	done = *target == value;
+ 	printf("A10 GPU: WRITE_VALUE job irq=%08x mmu=%08x gpu=%08x "
+-	    "slot=%08x as_fault=%08x job_status=%08x word=%08x -> %s\n",
++	    "slot=%08x as_fault=%08x fault=%08x%08x job_status=%08x "
++	    "word=%08x -> %s\n",
+ 	    jirq, mirq, girq, a10_gpu_read(mali, JS1 + JS_STATUS),
+-	    a10_gpu_read(mali, AS0 + AS_FAULTSTATUS),
++	    fault,
++	    fault ? a10_gpu_read(mali, AS0 + AS_FAULTADDRESS_HI) : 0,
++	    fault ? a10_gpu_read(mali, AS0 + AS_FAULTADDRESS_LO) : 0,
+ 	    job[0], *target,
+ 	    done ? "the Mali ran it" : "failed or timed out");
+ 
+@@ -480,7 +600,8 @@ a10_gpu_probe(void)
+ {
+ 	vm_offset_t pmu, top, g3d, mali, page = 0;
+ 	uint32_t id, pll, product, shader_mask = 0;
+-	bool powered, job_ok = false;
++	struct a10_gpu_pt pt48, pt35;
++	bool powered, job_ok = false, job48 = false, job35 = false;
+ 
+ 	pmu = ml_io_map(A10_PMU_PA, A10_PMU_SIZE);
+ 	if (pmu == 0) {
+@@ -545,15 +666,68 @@ a10_gpu_probe(void)
+ 		printf("A10 GPU: no page for the test job\n");
+ 		goto out;
+ 	}
+-	job_ok = a10_gpu_write_value(mali, shader_mask, page);
++
++	/* Control: identity mode, the address the GPU sees is the physical one. */
++	if (a10_gpu_as0(mali, 0, 2)) {
++		job_ok = a10_gpu_write_value(mali, shader_mask, page,
++		    (uint64_t)kvtophys(page), A10_GPU_TEST_WORD);
++		printf("A10 GPU: identity job %s\n",
++		    job_ok ? "ran" : "did not run");
++	}
++
++	/* The shape Panfrost uses on a 48-bit VA MMU: four levels. */
++	bzero(&pt48, sizeof(pt48));
++	pt48.levels = 4;
++	pt48.top = a10_gpu_pt_page(&pt48.top_phys);
++	if (pt48.top != NULL &&
++	    a10_gpu_map(&pt48, A10_GPU_TEST_VA, (uint64_t)kvtophys(page))) {
++		printf("A10 GPU: 4-level tables top=%08x%08x transcfg=%08x\n",
++		    (uint32_t)(pt48.top_phys >> 32), (uint32_t)pt48.top_phys,
++		    TRANSCFG_48BIT);
++		if (a10_gpu_as0(mali, pt48.top_phys, TRANSCFG_48BIT)) {
++			job48 = a10_gpu_write_value(mali, shader_mask, page,
++			    A10_GPU_TEST_VA, A10_GPU_TEST_WORD + 1);
++			printf("A10 GPU: 4-level (48-bit VA) job %s\n",
++			    job48 ? "ran" : "did not run");
++		}
++	} else {
++		printf("A10 GPU: 4-level tables not built\n");
++	}
++
++	/* The A21s G52 shape: 35 bits of VA, three levels. */
++	if (!job48) {
++		bzero(&pt35, sizeof(pt35));
++		pt35.levels = 3;
++		pt35.top = a10_gpu_pt_page(&pt35.top_phys);
++		if (pt35.top != NULL &&
++		    a10_gpu_map(&pt35, A10_GPU_TEST_VA,
++		    (uint64_t)kvtophys(page))) {
++			printf("A10 GPU: 3-level tables top=%08x%08x "
++			    "transcfg=%08x\n",
++			    (uint32_t)(pt35.top_phys >> 32),
++			    (uint32_t)pt35.top_phys, TRANSCFG_35BIT);
++			if (a10_gpu_as0(mali, pt35.top_phys,
++			    TRANSCFG_35BIT)) {
++				job35 = a10_gpu_write_value(mali,
++				    shader_mask, page, A10_GPU_TEST_VA,
++				    A10_GPU_TEST_WORD + 2);
++				printf("A10 GPU: 3-level (35-bit VA) job "
++				    "%s\n", job35 ? "ran" : "did not run");
++			}
++		} else {
++			printf("A10 GPU: 3-level tables not built\n");
++		}
++	}
+ 
+ out:
+ 	a10_gpu_power_off(mali);
+ 	if (page != 0) {
+ 		kmem_free(kernel_map, page, PAGE_SIZE);
+ 	}
+-	printf("A10 GPU: probe done, job %s\n",
+-	    job_ok ? "ran" : "did not run");
++	printf("A10 GPU: probe done, identity %s, 48-bit %s, 35-bit %s\n",
++	    job_ok ? "ran" : "did not run",
++	    job48 ? "ran" : "did not run",
++	    job35 ? "ran" : "did not run");
+ }
+ 
+ static void
