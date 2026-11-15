@@ -63,8 +63,34 @@ SpringBoard). То есть запись данных в eMMC шла, а обн�
 блоки кольца целиком. Причина (R1 на первом секторе области лога)
 пока не исправлена; на probe74 не влияет.
 
-**Следующее:** ABOX: включение `pd-dispaud` (SMC), загрузка firmware из
-iOS-раздела, UAIF/RDMA. Параллельно проверить `sweetlog=0` для скорости.
+**SMA1301, не TFA98xx (проверено по live DT и dmesg TWRP).** В реальном
+DT A10 (`live_fdt.txt`) спикерный усилитель — `sma1301@1e`
+(`siliconmitus,sma1301`) на i2c9 (`0x13860000`), узла `tfa98xx` нет;
+TWRP грузит `sma1301 9-001e`, `sma1301-amplifier <-> UAIF3 mapping ok`.
+Усилителю не нужен firmware-файл: это обычный I2C+I2S amp. Прежняя
+запись про TFA98xx относилась к общему DT a7y18lte/jackpot2lte, не к A10.
+
+**probe75 (патч 0141):** read-only инвентарь ABOX за `a10audio_diag=1`:
+PMU CA7 `0x2520/24/28`, `pd-dispaud` `0x4020..3C`, CMU_DISPAUD
+`PLL_AUD 0x160`, делители `0x1800/181C..1828`, гейты
+`0x200C/2014/2018/201C/2024/2070`, QCH `0x3034/3090/30B0`, ABOX SFR
+`0x14A50000` (`id/ver/remap/timer0/ca7pc`), SRAM `0x14B00000`
+(IPC/mailbox/bootargs), sysmmu_abox `0x14A30000`, ABOX GIC
+`0x14AF1000/2000`. После дампа кодека `SPEEDY_INT_ENABLE` гасится
+(`0x7030E` -> 0), чтобы не оставлять pending level.
+
+**Наблюдения TWRP:** `pd-dispaud - on` уже на старте; ABOX SFR/SRAM
+читаются до включения клоков ABOX; `ABOX_TIMER0_CTRL1 == 0`, поэтому
+Linux идёт по пути загрузки firmware и падает на `calliope_sram.bin`
+(в TWRP нет `/vendor/firmware`). CA7 при этом остаётся выключенным
+(`abox_cpu_enable(0)`/`abox_cpu_power(0)`). CMU_DISPAUD в TWRP:
+`audif clock: 24576000`.
+
+**Следующее:** собрать probe75 (CI), прошить с
+`a10audio=1 a10audio_diag=1`, снять лог из TWRP; по дампу решить,
+включены ли `pd-dispaud` и клоки ABOX, и можно ли грузить
+`calliope_sram.bin`/`calliope_dram.bin` без SMC. Затем speaker:
+ABOX firmware + UAIF3 + SMA1301. Параллельно проверить `sweetlog=0`.
 **После аудио — Metal через Panfrost** (просьба пользователя
 2026-11-15): изучить перенос Panfrost/AGX-командного потока в XNU и
 минимальный Metal-драйвер для Mali-G71/G52 в A10; начать с

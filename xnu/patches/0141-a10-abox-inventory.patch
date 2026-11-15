@@ -1,0 +1,223 @@
+diff --git a/bsd/dev/a10_audio.c b/bsd/dev/a10_audio.c
+index f83eca3..0dace3d 100644
+--- a/bsd/dev/a10_audio.c
++++ b/bsd/dev/a10_audio.c
+@@ -116,6 +116,76 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ 
+ #define A10_CODEC_SPEEDY_DEV  0x03u
+ 
++/*
++ * probe75: read-only inventory of everything the speaker path needs.  The
++ * ABOX and the display share pd-dispaud, so the domain is expected to be on
++ * while XNU keeps the panel alive; the question is whether the ABOX clocks,
++ * SRAM and firmware survived the bootloader.  TWRP reads the same registers
++ * before it enables any ABOX clock, so plain reads are safe.
++ */
++#define A10_PMU_PA             0x11c80000u
++#define A10_PMU_SIZE           0x10000u
++#define A10_PMU_ABOX_CA7_CFG   0x2520u
++#define A10_PMU_ABOX_CA7_STS   0x2524u
++#define A10_PMU_ABOX_CA7_OPT   0x2528u
++#define A10_PMU_PD_DISPAUD     0x4020u
++#define A10_PMU_ABOX_MAGIC     0x0814u
++
++#define A10_CMU_DISPAUD_PA     0x14800000u
++#define A10_CMU_DISPAUD_SIZE   0x8000u
++#define A10_CMU_PLL_AUD0       0x0160u
++#define A10_CMU_PLL_AUD1       0x0164u
++#define A10_CMU_AUDIF_DIV      0x1800u
++#define A10_CMU_UAIF0_DIV      0x181cu
++#define A10_CMU_UAIF1_DIV      0x1820u
++#define A10_CMU_UAIF2_DIV      0x1824u
++#define A10_CMU_UAIF3_DIV      0x1828u
++#define A10_CMU_GATE_ACLK      0x200cu
++#define A10_CMU_GATE_UAIF0     0x2014u
++#define A10_CMU_GATE_UAIF2     0x2018u
++#define A10_CMU_GATE_UAIF3     0x201cu
++#define A10_CMU_GATE_CA7       0x2024u
++#define A10_CMU_GATE_MCLK      0x2070u
++
++#define A10_QCH_PA             0x12060000u
++#define A10_QCH_SIZE           0x4000u
++#define A10_QCH_ABOX           0x3034u
++#define A10_QCH_DISPAUD        0x3090u
++#define A10_QCH_MAILBOX        0x30b0u
++
++#define A10_ABOX_PA            0x14a50000u
++#define A10_ABOX_SIZE          0x10000u
++#define A10_ABOX_REMAP_ADDR    0x0028u
++#define A10_ABOX_TIMER0_CTRL0  0x0600u
++#define A10_ABOX_TIMER0_CTRL1  0x0604u
++#define A10_ABOX_CA7_PC        0x2c3cu
++
++#define A10_ABOX_SRAM_PA       0x14b00000u
++#define A10_ABOX_SRAM_SIZE     0x28000u
++#define A10_ABOX_BOOTARGS      0x22e00u
++#define A10_ABOX_IPC_TX        0x22000u
++#define A10_ABOX_IPC_RX        0x22300u
++#define A10_ABOX_MAILBOX       0x22600u
++
++#define A10_SYSMMU_ABOX_PA     0x14a30000u
++#define A10_SYSMMU_ABOX_SIZE   0x9000u
++#define A10_MMU_CTRL           0x000u
++#define A10_MMU_CFG            0x004u
++#define A10_MMU_STATUS         0x008u
++#define A10_MMU_PT_BASE_PPN    0x00cu
++#define A10_MMU_CAPA           0x030u
++#define A10_MMU_VERSION        0x034u
++#define A10_MMU_CAPA1          0x038u
++#define A10_MMU_INT_STATUS     0x060u
++#define A10_MMU_FAULT_AR_ADDR  0x070u
++#define A10_MMU_FAULT_AR_INFO  0x078u
++#define A10_MMU_FAULT_AW_ADDR  0x080u
++#define A10_MMU_FAULT_AW_INFO  0x088u
++
++#define A10_ABOX_GICD_PA       0x14af1000u
++#define A10_ABOX_GICC_PA       0x14af2000u
++#define A10_ABOX_GIC_SIZE      0x1000u
++
+ static vm_offset_t a10_apm;
+ static vm_offset_t a10_speedy;
+ static bool a10_audio_ready;
+@@ -306,10 +376,118 @@ a10_codec_dump(void)
+ 	}
+ }
+ 
++static void
++a10_abox_dump(void)
++{
++	vm_offset_t pmu, cmu, qch, abox, smmu, gicd, gicc, sram;
++	char bootargs[65];
++	unsigned int i;
++
++	pmu = ml_io_map(A10_PMU_PA, A10_PMU_SIZE);
++	cmu = ml_io_map(A10_CMU_DISPAUD_PA, A10_CMU_DISPAUD_SIZE);
++	qch = ml_io_map(A10_QCH_PA, A10_QCH_SIZE);
++	abox = ml_io_map(A10_ABOX_PA, A10_ABOX_SIZE);
++	smmu = ml_io_map(A10_SYSMMU_ABOX_PA, A10_SYSMMU_ABOX_SIZE);
++	gicd = ml_io_map(A10_ABOX_GICD_PA, A10_ABOX_GIC_SIZE);
++	gicc = ml_io_map(A10_ABOX_GICC_PA, A10_ABOX_GIC_SIZE);
++	sram = ml_io_map(A10_ABOX_SRAM_PA, A10_ABOX_SRAM_SIZE);
++	if (!pmu || !cmu || !qch || !abox || !smmu || !gicd || !gicc || !sram) {
++		printf("A10 ABOX: map failed pmu=%lx cmu=%lx qch=%lx abox=%lx "
++		    "smmu=%lx gicd=%lx gicc=%lx sram=%lx\n",
++		    (unsigned long)pmu, (unsigned long)cmu, (unsigned long)qch,
++		    (unsigned long)abox, (unsigned long)smmu,
++		    (unsigned long)gicd, (unsigned long)gicc,
++		    (unsigned long)sram);
++		return;
++	}
++
++	printf("A10 ABOX: pmu ca7 cfg=%08x sts=%08x opt=%08x magic=%08x\n",
++	    *(volatile uint32_t *)(pmu + A10_PMU_ABOX_CA7_CFG),
++	    *(volatile uint32_t *)(pmu + A10_PMU_ABOX_CA7_STS),
++	    *(volatile uint32_t *)(pmu + A10_PMU_ABOX_CA7_OPT),
++	    *(volatile uint32_t *)(pmu + A10_PMU_ABOX_MAGIC));
++	printf("A10 ABOX: pd-dispaud %08x %08x %08x %08x %08x %08x %08x "
++	    "%08x\n",
++	    *(volatile uint32_t *)(pmu + A10_PMU_PD_DISPAUD + 0x00),
++	    *(volatile uint32_t *)(pmu + A10_PMU_PD_DISPAUD + 0x04),
++	    *(volatile uint32_t *)(pmu + A10_PMU_PD_DISPAUD + 0x08),
++	    *(volatile uint32_t *)(pmu + A10_PMU_PD_DISPAUD + 0x0c),
++	    *(volatile uint32_t *)(pmu + A10_PMU_PD_DISPAUD + 0x10),
++	    *(volatile uint32_t *)(pmu + A10_PMU_PD_DISPAUD + 0x14),
++	    *(volatile uint32_t *)(pmu + A10_PMU_PD_DISPAUD + 0x18),
++	    *(volatile uint32_t *)(pmu + A10_PMU_PD_DISPAUD + 0x1c));
++	printf("A10 ABOX: cmu pll_aud=%08x/%08x audif_div=%08x "
++	    "uaif_div=%08x/%08x/%08x/%08x\n",
++	    *(volatile uint32_t *)(cmu + A10_CMU_PLL_AUD0),
++	    *(volatile uint32_t *)(cmu + A10_CMU_PLL_AUD1),
++	    *(volatile uint32_t *)(cmu + A10_CMU_AUDIF_DIV),
++	    *(volatile uint32_t *)(cmu + A10_CMU_UAIF0_DIV),
++	    *(volatile uint32_t *)(cmu + A10_CMU_UAIF1_DIV),
++	    *(volatile uint32_t *)(cmu + A10_CMU_UAIF2_DIV),
++	    *(volatile uint32_t *)(cmu + A10_CMU_UAIF3_DIV));
++	printf("A10 ABOX: cmu gates aclk=%08x uaif0=%08x uaif2=%08x "
++	    "uaif3=%08x ca7=%08x mclk=%08x\n",
++	    *(volatile uint32_t *)(cmu + A10_CMU_GATE_ACLK),
++	    *(volatile uint32_t *)(cmu + A10_CMU_GATE_UAIF0),
++	    *(volatile uint32_t *)(cmu + A10_CMU_GATE_UAIF2),
++	    *(volatile uint32_t *)(cmu + A10_CMU_GATE_UAIF3),
++	    *(volatile uint32_t *)(cmu + A10_CMU_GATE_CA7),
++	    *(volatile uint32_t *)(cmu + A10_CMU_GATE_MCLK));
++	printf("A10 ABOX: qch abox=%08x dispaud=%08x mailbox=%08x\n",
++	    *(volatile uint32_t *)(qch + A10_QCH_ABOX),
++	    *(volatile uint32_t *)(qch + A10_QCH_DISPAUD),
++	    *(volatile uint32_t *)(qch + A10_QCH_MAILBOX));
++	printf("A10 ABOX: sfr id=%08x ver=%08x remap=%08x timer=%08x/%08x "
++	    "ca7pc=%08x\n",
++	    *(volatile uint32_t *)(abox + 0x0000),
++	    *(volatile uint32_t *)(abox + 0x0004),
++	    *(volatile uint32_t *)(abox + A10_ABOX_REMAP_ADDR),
++	    *(volatile uint32_t *)(abox + A10_ABOX_TIMER0_CTRL0),
++	    *(volatile uint32_t *)(abox + A10_ABOX_TIMER0_CTRL1),
++	    *(volatile uint32_t *)(abox + A10_ABOX_CA7_PC));
++	printf("A10 ABOX: sram ipc tx=%08x rx=%08x mailbox=%08x "
++	    "first=%08x/%08x\n",
++	    *(volatile uint32_t *)(sram + A10_ABOX_IPC_TX),
++	    *(volatile uint32_t *)(sram + A10_ABOX_IPC_RX),
++	    *(volatile uint32_t *)(sram + A10_ABOX_MAILBOX),
++	    *(volatile uint32_t *)(sram + 0x0000),
++	    *(volatile uint32_t *)(sram + 0x0004));
++	printf("A10 ABOX: smmu ctrl=%08x cfg=%08x status=%08x pt=%08x "
++	    "ver=%08x capa=%08x/%08x int=%08x\n",
++	    *(volatile uint32_t *)(smmu + A10_MMU_CTRL),
++	    *(volatile uint32_t *)(smmu + A10_MMU_CFG),
++	    *(volatile uint32_t *)(smmu + A10_MMU_STATUS),
++	    *(volatile uint32_t *)(smmu + A10_MMU_PT_BASE_PPN),
++	    *(volatile uint32_t *)(smmu + A10_MMU_VERSION),
++	    *(volatile uint32_t *)(smmu + A10_MMU_CAPA),
++	    *(volatile uint32_t *)(smmu + A10_MMU_CAPA1),
++	    *(volatile uint32_t *)(smmu + A10_MMU_INT_STATUS));
++	printf("A10 ABOX: smmu fault ar=%08x/%08x aw=%08x/%08x\n",
++	    *(volatile uint32_t *)(smmu + A10_MMU_FAULT_AR_ADDR),
++	    *(volatile uint32_t *)(smmu + A10_MMU_FAULT_AR_INFO),
++	    *(volatile uint32_t *)(smmu + A10_MMU_FAULT_AW_ADDR),
++	    *(volatile uint32_t *)(smmu + A10_MMU_FAULT_AW_INFO));
++	printf("A10 ABOX: gicd ctlr=%08x type=%08x en0=%08x gicc "
++	    "ctlr=%08x pmr=%08x status=%08x\n",
++	    *(volatile uint32_t *)(gicd + 0x000),
++	    *(volatile uint32_t *)(gicd + 0x004),
++	    *(volatile uint32_t *)(gicd + 0x100),
++	    *(volatile uint32_t *)(gicc + 0x000),
++	    *(volatile uint32_t *)(gicc + 0x004),
++	    *(volatile uint32_t *)(gicc + 0x02c));
++
++	for (i = 0; i < 64; i++) {
++		bootargs[i] = *(volatile uint8_t *)(sram + A10_ABOX_BOOTARGS + i);
++	}
++	bootargs[64] = 0;
++	printf("A10 ABOX: bootargs '%s'\n", bootargs);
++}
++
+ int
+ a10_audio_init(void)
+ {
+ 	int enabled = 0;
++	int diag = 0;
+ 
+ 	if (!PE_parse_boot_argn("a10audio", &enabled, sizeof(enabled)) ||
+ 	    enabled != 1) {
+@@ -352,6 +530,22 @@ a10_audio_init(void)
+ 		a10_codec_dump();
+ 	}
+ 
++	/*
++	 * The codec dump leaves SPEEDY_INT_ENABLE at 0x7030e (the batch program
++	 * writes it on every transaction).  XNU only routes the virtual timer
++	 * and the IPI SGI, so this cannot storm the CPU today, but a later
++	 * SPEEDY driver would inherit a pending level.  Put the controller
++	 * back into a quiet state.
++	 */
++	a10_speedy_write(SPEEDY_INT_ENABLE, 0);
++	a10_speedy_write(SPEEDY_INT_STATUS, 0xffffffffu);
++	a10_speedy_write(IPBATCHER_INT_EN, 0);
++
++	if (PE_parse_boot_argn("a10audio_diag", &diag, sizeof(diag)) &&
++	    diag == 1) {
++		a10_abox_dump();
++	}
++
+ 	a10_audio_ready = true;
+ 	printf("A10 AUDIO: probe done (APM gate + SPEEDY + codec dump)\n");
+ 	return 0;
