@@ -123,6 +123,22 @@ uaif_div=00000000/00000000/00000000/00000001`, гейты
 ESR `0x96000210`. Значит CAPA/CAPA1 у этого SYSMMU не отображены; в
 **0144** они убраны, а чтения ABOX GIC спрятаны за `a10audio_diag=2`.
 
+**probe76 (0144, CI `43728716011`, kernel SHA256 `6957A526…`).**
+Образ `dist/boot-a10-probe76.img` SHA256 `1A7A9F6C…`, прошит, iOS не
+загрузилась: **panic в `a10_audio_init+0x6f0`**, ESR `0x96000210`,
+FAR `0xfffffff2cbb2c080` — это `sysmmu + 0x80`, регистр AW-fault.
+ABOX-дамп при этом полностью отработал (CAPA больше не читается):
+`sfr id=41424f58 ver=01210000 remap=14a00000 ca7pc=b9ff773c`,
+`sram tx=08031c08 rx=0000000b mailbox=00000221 first=14000001/10073fe0`,
+`smmu ctrl=00000004 cfg=00020000 status=00000000 pt=00000000
+ver=7040000f int=00000000`. Версия `7040000f` — это **SYSMMU v7**
+(major = `(ver >> 17) >> 11` = 7): у v7 одна пара fault-регистров
+`0x070/0x078` (`REG_FAULT_ADDR`/`REG_FAULT_TRANS_INFO`), а пары
+`0x080/0x088` из v5 нет — её чтение и дало abort. В **0145** fault-дамп
+сделан версия-зависимым и спрятан за `a10audio_diag=2`; GPU-проба в
+probe76 не успела запуститься (поток ждёт 3 с, а panic случился в
+rootdev-хуке раньше).
+
 **Наблюдения TWRP:** `pd-dispaud - on` уже на старте; ABOX SFR/SRAM
 читаются до включения клоков ABOX; `ABOX_TIMER0_CTRL1 == 0`, поэтому
 Linux идёт по пути загрузки firmware и падает на `calliope_sram.bin`
@@ -130,7 +146,7 @@ Linux идёт по пути загрузки firmware и падает на `cal
 (`abox_cpu_enable(0)`/`abox_cpu_power(0)`). CMU_DISPAUD в TWRP:
 `audif clock: 24576000`.
 
-**Следующее (GPU):** CI 0144, probe76
+**Следующее (GPU):** CI 0145, probe77
 (`-Adt work\a10-a73-first.adt -ExtraArgs 'a10gpu=1 a10audio=1
 a10audio_diag=1 wqchk=0'`); ждём `A10 GPU: GPU_ID=60a0…`,
 `soft reset completed`, `cores powered`, `WRITE_VALUE job … the Mali ran it`.
