@@ -79,6 +79,29 @@ PMU CA7 `0x2520/24/28`, `pd-dispaud` `0x4020..3C`, CMU_DISPAUD
 `0x14AF1000/2000`. После дампа кодека `SPEEDY_INT_ENABLE` гасится
 (`0x7030E` -> 0), чтобы не оставлять pending level.
 
+**probe75 на телефоне (2026-11-15).** Первые две попытки паниковали на
+чекпоинте 0138 `sweet_wq_check("post-cpu-on")`:
+`Console I/O from interrupt-disabled context @serial_console.c:168`.
+Причина — не ADT, а сам чекпоинт: probe73/74 собирались с `wqchk=0`
+(патч 0139), а `build_probe_smp.ps1` его по умолчанию не добавляет.
+Кроме того, первый образ был собран с дефолтным `a10-8cpu-smp.adt`
+(2×A53 `0x100`+`0x101`); правильный ADT — `work/a10-a73-first.adt`
+(`0x100` + `0x0`). С `wqchk=0` и A73: **`SWEET CPU: 2/2 CPUs
+initialized, SGI1 verified`**, iOS-путь пошёл дальше, дамп кодека
+повторился, затем ABOX-дамп:
+
+* `A10 ABOX: pmu ca7 cfg=00000001 sts=10010000 opt=00000000
+  magic=00003100` — домен/локальное питание CA7 включены, CA7 в
+  STANDBYWFI, но CPU выключен (`opt` bit15 = 0), magic не
+  `0xAB0CAB0C`; firmware не загружена.
+* Следующее чтение `pd-dispaud` (`0x11c84020 + 0x0c`) дало
+  **Kernel data abort**, ESR `0x96000210` (synchronous external abort,
+  read), FAR `0xfffffff8aa94402c`. Прямой доступ к `0x11c84020` на A10
+  невозможен, хотя syscon в DT заявлен как `0x11c80000`/`0x10000`;
+  доменом управляет ACPM/SMC (`cal_id 0xB1380000`,
+  `need_smc = 0x148F0000`). Поэтому в **0142** блок `pd-dispaud`
+  убран, остальные блоки дампа остаются.
+
 **Наблюдения TWRP:** `pd-dispaud - on` уже на старте; ABOX SFR/SRAM
 читаются до включения клоков ABOX; `ABOX_TIMER0_CTRL1 == 0`, поэтому
 Linux идёт по пути загрузки firmware и падает на `calliope_sram.bin`
@@ -86,10 +109,11 @@ Linux идёт по пути загрузки firmware и падает на `cal
 (`abox_cpu_enable(0)`/`abox_cpu_power(0)`). CMU_DISPAUD в TWRP:
 `audif clock: 24576000`.
 
-**Следующее:** собрать probe75 (CI), прошить с
-`a10audio=1 a10audio_diag=1`, снять лог из TWRP; по дампу решить,
-включены ли `pd-dispaud` и клоки ABOX, и можно ли грузить
-`calliope_sram.bin`/`calliope_dram.bin` без SMC. Затем speaker:
+**Следующее:** CI 0142, собрать probe75 v4 (`-Adt work\a10-a73-first.adt
+-ExtraArgs 'a10audio=1 a10audio_diag=1 wqchk=0'`), снять лог из TWRP и
+прочитать CMU_DISPAUD/QCH/ABOX SFR/SRAM/sysmmu/GIC. Затем решить,
+включать ли клоки ABOX из XNU и можно ли грузить
+`calliope_sram.bin`/`calliope_dram.bin` без SMC; speaker:
 ABOX firmware + UAIF3 + SMA1301. Параллельно проверить `sweetlog=0`.
 **После аудио — Metal через Panfrost** (просьба пользователя
 2026-11-15): изучить перенос Panfrost/AGX-командного потока в XNU и

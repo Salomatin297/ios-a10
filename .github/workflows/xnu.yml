@@ -193,7 +193,7 @@ jobs:
           need dxb/xnu/iokit/Kernel/arm/SweetCPU.cpp 'Report the progress of every secondary' present '0128 SMP bring-up diagnostics'
           need dxb/xnu/bsd/dev/a10_battery.c 'A10 BATTERY: backlight level %d/255' present '0129 backlight level boot-arg'
           need dxb/xnu/bsd/dev/a10_audio.c 'A10 AUDIO: probe done' present '0130 audio block probe'
-          need dxb/xnu/bsd/dev/a10_audio.c 'A10 ABOX: pd-dispaud' present '0141 ABOX inventory'
+          need dxb/xnu/bsd/dev/a10_audio.c 'A10 ABOX: pmu ca7' present '0141 ABOX inventory'
           need dxb/xnu/bsd/conf/files 'bsd/dev/a10_audio.c' present '0130 audio driver in the build'
           need dxb/xnu/bsd/dev/sweet_emmc.c 'sweet_emmc_early_init' present '0132 early eMMC log'
           need dxb/xnu/bsd/dev/sweet_emmc.c 'block_base is the absolute position' present '0132 ring flush absolute positions'

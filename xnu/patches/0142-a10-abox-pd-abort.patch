@@ -1,0 +1,37 @@
+diff --git a/bsd/dev/a10_audio.c b/bsd/dev/a10_audio.c
+index 0dace3d..d7d16a8 100644
+--- a/bsd/dev/a10_audio.c
++++ b/bsd/dev/a10_audio.c
+@@ -128,7 +128,6 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ #define A10_PMU_ABOX_CA7_CFG   0x2520u
+ #define A10_PMU_ABOX_CA7_STS   0x2524u
+ #define A10_PMU_ABOX_CA7_OPT   0x2528u
+-#define A10_PMU_PD_DISPAUD     0x4020u
+ #define A10_PMU_ABOX_MAGIC     0x0814u
+ 
+ #define A10_CMU_DISPAUD_PA     0x14800000u
+@@ -406,16 +405,14 @@ a10_abox_dump(void)
+ 	    *(volatile uint32_t *)(pmu + A10_PMU_ABOX_CA7_STS),
+ 	    *(volatile uint32_t *)(pmu + A10_PMU_ABOX_CA7_OPT),
+ 	    *(volatile uint32_t *)(pmu + A10_PMU_ABOX_MAGIC));
+-	printf("A10 ABOX: pd-dispaud %08x %08x %08x %08x %08x %08x %08x "
+-	    "%08x\n",
+-	    *(volatile uint32_t *)(pmu + A10_PMU_PD_DISPAUD + 0x00),
+-	    *(volatile uint32_t *)(pmu + A10_PMU_PD_DISPAUD + 0x04),
+-	    *(volatile uint32_t *)(pmu + A10_PMU_PD_DISPAUD + 0x08),
+-	    *(volatile uint32_t *)(pmu + A10_PMU_PD_DISPAUD + 0x0c),
+-	    *(volatile uint32_t *)(pmu + A10_PMU_PD_DISPAUD + 0x10),
+-	    *(volatile uint32_t *)(pmu + A10_PMU_PD_DISPAUD + 0x14),
+-	    *(volatile uint32_t *)(pmu + A10_PMU_PD_DISPAUD + 0x18),
+-	    *(volatile uint32_t *)(pmu + A10_PMU_PD_DISPAUD + 0x1c));
++	/*
++	 * pd-dispaud lives at 0x11c84020, but a read there raises a
++	 * synchronous external abort on the A10 (probe75: FAR ...402c,
++	 * ESR 0x96000210) even though the PMU syscon spans 64 KiB.  The
++	 * domain is controlled through ACPM/SMC (cal_id 0xB1380000), so
++	 * it cannot be sampled directly; probe75 stops at the CA7 PMU
++	 * registers, which are readable.
++	 */
+ 	printf("A10 ABOX: cmu pll_aud=%08x/%08x audif_div=%08x "
+ 	    "uaif_div=%08x/%08x/%08x/%08x\n",
+ 	    *(volatile uint32_t *)(cmu + A10_CMU_PLL_AUD0),
