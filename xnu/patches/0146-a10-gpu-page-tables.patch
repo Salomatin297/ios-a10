@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/a10_gpu.c b/bsd/dev/a10_gpu.c
-index 92d28c8..a1f9639 100644
+index 92d28c8..8e76c85 100644
 --- a/bsd/dev/a10_gpu.c
 +++ b/bsd/dev/a10_gpu.c
 @@ -13,11 +13,18 @@
@@ -43,7 +43,7 @@ index 92d28c8..a1f9639 100644
  #define AS_STATUS               0x28u
  #define AS_TRANSCFG_LO          0x30u
  #define AS_TRANSCFG_HI          0x34u
-@@ -400,21 +410,139 @@ a10_gpu_power_off(vm_offset_t mali)
+@@ -400,21 +410,142 @@ a10_gpu_power_off(vm_offset_t mali)
  	    a10_gpu_read(mali, L2_READY));
  }
  
@@ -148,8 +148,11 @@ index 92d28c8..a1f9639 100644
 +		if (table == NULL) {
 +			return false;
 +		}
++		table = a10_gpu_pt_below(&table[(gpu >> 30) & 511]);
++	} else {
++		/* 35 bits of VA: the top table has 32 entries, bits 34..30. */
++		table = a10_gpu_pt_below(&table[(gpu >> 30) & 31]);
 +	}
-+	table = a10_gpu_pt_below(&table[(gpu >> 30) & 511]);
 +	if (table == NULL) {
 +		return false;
 +	}
@@ -190,7 +193,7 @@ index 92d28c8..a1f9639 100644
  	unsigned waited;
  	bool done;
  
-@@ -422,23 +550,11 @@ a10_gpu_write_value(vm_offset_t mali, uint32_t shader_mask, vm_offset_t page)
+@@ -422,23 +553,11 @@ a10_gpu_write_value(vm_offset_t mali, uint32_t shader_mask, vm_offset_t page)
  	job[8] = (uint32_t)(gpu + 0x800);
  	job[9] = (uint32_t)((gpu + 0x800) >> 32);
  	job[10] = 6;
@@ -216,7 +219,7 @@ index 92d28c8..a1f9639 100644
  	a10_gpu_write(mali, JOB_INT_MASK, 0);
  	a10_gpu_write(mali, JOB_INT_CLEAR, 0xffffffffu);
  	a10_gpu_write(mali, MMU_IRQ_CLEAR, 0xffffffffu);
-@@ -461,11 +577,15 @@ a10_gpu_write_value(vm_offset_t mali, uint32_t shader_mask, vm_offset_t page)
+@@ -461,11 +580,15 @@ a10_gpu_write_value(vm_offset_t mali, uint32_t shader_mask, vm_offset_t page)
  	}
  	FlushPoC_DcacheRegion(page, PAGE_SIZE);
  
@@ -235,7 +238,7 @@ index 92d28c8..a1f9639 100644
  	    job[0], *target,
  	    done ? "the Mali ran it" : "failed or timed out");
  
-@@ -480,7 +600,8 @@ a10_gpu_probe(void)
+@@ -480,7 +603,8 @@ a10_gpu_probe(void)
  {
  	vm_offset_t pmu, top, g3d, mali, page = 0;
  	uint32_t id, pll, product, shader_mask = 0;
@@ -245,7 +248,7 @@ index 92d28c8..a1f9639 100644
  
  	pmu = ml_io_map(A10_PMU_PA, A10_PMU_SIZE);
  	if (pmu == 0) {
-@@ -545,15 +666,68 @@ a10_gpu_probe(void)
+@@ -545,15 +669,68 @@ a10_gpu_probe(void)
  		printf("A10 GPU: no page for the test job\n");
  		goto out;
  	}
