@@ -211,6 +211,11 @@ jobs:
           need dxb/xnu/iokit/Kernel/arm/SweetCPU.cpp 'sweet_wq_check("pre-cpu-on")' present '0138 CPU_ON checkpoints'
           need dxb/xnu/bsd/dev/sweet_emmc.c 'sweet_wq_check("log-tick")' present '0138 log-thread watcher'
           need dxb/xnu/osfmk/arm64/cpu.c 'SWEET STACK' present '0138 stack physical pages'
+          need dxb/xnu/bsd/dev/a10_gpu.c 'A10 GPU: probe done' present '0144 Mali-G71 probe'
+          need dxb/xnu/bsd/dev/a10_gpu.c 'WRITE_VALUE job' present '0144 first Bifrost job'
+          need dxb/xnu/bsd/dev/sweet_emmc.c 'a10_gpu_init' present '0144 GPU probe hook'
+          need dxb/xnu/bsd/conf/files 'bsd/dev/a10_gpu.c' present '0144 GPU driver in the build'
+          need dxb/xnu/bsd/dev/a10_audio.c 'A10_MMU_CAPA' absent '0144 SYSMMU CAPA abort removed'
           if [ "$fail" -ne 0 ]; then
             echo "::error::A10 port patches did not apply cleanly"
             exit 1

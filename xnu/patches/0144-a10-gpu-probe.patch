@@ -1,0 +1,708 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index a0ce61c..31f7302 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -113,6 +113,7 @@ bsd/dev/a10_keys.c			standard
+ bsd/dev/a10_battery.c			standard
+ bsd/dev/a10_touch.c			standard
+ bsd/dev/a10_audio.c			standard
++bsd/dev/a10_gpu.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+diff --git a/bsd/dev/a10_audio.c b/bsd/dev/a10_audio.c
+index 6163d6f..80ced43 100644
+--- a/bsd/dev/a10_audio.c
++++ b/bsd/dev/a10_audio.c
+@@ -172,9 +172,13 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ #define A10_MMU_CFG            0x004u
+ #define A10_MMU_STATUS         0x008u
+ #define A10_MMU_PT_BASE_PPN    0x00cu
+-#define A10_MMU_CAPA           0x030u
++/*
++ * CAPA (0x030) and CAPA1 (0x038) are not mapped in this SYSMMU instance:
++ * probe75 v5 took a synchronous external abort (ESR 0x96000210) at
++ * sysmmu + 0x30 before iOS could boot.  Only the registers Linux reads
++ * unconditionally are touched here.
++ */
+ #define A10_MMU_VERSION        0x034u
+-#define A10_MMU_CAPA1          0x038u
+ #define A10_MMU_INT_STATUS     0x060u
+ #define A10_MMU_FAULT_AR_ADDR  0x070u
+ #define A10_MMU_FAULT_AR_INFO  0x078u
+@@ -376,7 +380,7 @@ a10_codec_dump(void)
+ }
+ 
+ static void
+-a10_abox_dump(void)
++a10_abox_dump(int level)
+ {
+ 	vm_offset_t pmu, cmu, qch, abox, smmu, gicd, gicc, sram;
+ 	char bootargs[65];
+@@ -453,28 +457,34 @@ a10_abox_dump(void)
+ 	    *(volatile uint32_t *)(sram + 0x0000),
+ 	    *(volatile uint32_t *)(sram + 0x0004));
+ 	printf("A10 ABOX: smmu ctrl=%08x cfg=%08x status=%08x pt=%08x "
+-	    "ver=%08x capa=%08x/%08x int=%08x\n",
++	    "ver=%08x int=%08x\n",
+ 	    *(volatile uint32_t *)(smmu + A10_MMU_CTRL),
+ 	    *(volatile uint32_t *)(smmu + A10_MMU_CFG),
+ 	    *(volatile uint32_t *)(smmu + A10_MMU_STATUS),
+ 	    *(volatile uint32_t *)(smmu + A10_MMU_PT_BASE_PPN),
+ 	    *(volatile uint32_t *)(smmu + A10_MMU_VERSION),
+-	    *(volatile uint32_t *)(smmu + A10_MMU_CAPA),
+-	    *(volatile uint32_t *)(smmu + A10_MMU_CAPA1),
+ 	    *(volatile uint32_t *)(smmu + A10_MMU_INT_STATUS));
+ 	printf("A10 ABOX: smmu fault ar=%08x/%08x aw=%08x/%08x\n",
+ 	    *(volatile uint32_t *)(smmu + A10_MMU_FAULT_AR_ADDR),
+ 	    *(volatile uint32_t *)(smmu + A10_MMU_FAULT_AR_INFO),
+ 	    *(volatile uint32_t *)(smmu + A10_MMU_FAULT_AW_ADDR),
+ 	    *(volatile uint32_t *)(smmu + A10_MMU_FAULT_AW_INFO));
+-	printf("A10 ABOX: gicd ctlr=%08x type=%08x en0=%08x gicc "
+-	    "ctlr=%08x pmr=%08x status=%08x\n",
+-	    *(volatile uint32_t *)(gicd + 0x000),
+-	    *(volatile uint32_t *)(gicd + 0x004),
+-	    *(volatile uint32_t *)(gicd + 0x100),
+-	    *(volatile uint32_t *)(gicc + 0x000),
+-	    *(volatile uint32_t *)(gicc + 0x004),
+-	    *(volatile uint32_t *)(gicc + 0x02c));
++	/*
++	 * The ABOX GIC lives in the same unclocked block as the SYSMMU.
++	 * Its registers were never sampled on hardware yet, so keep them
++	 * behind a10audio_diag=2 instead of risking another abort on the
++	 * boot path.
++	 */
++	if (level >= 2) {
++		printf("A10 ABOX: gicd ctlr=%08x type=%08x en0=%08x gicc "
++		    "ctlr=%08x pmr=%08x status=%08x\n",
++		    *(volatile uint32_t *)(gicd + 0x000),
++		    *(volatile uint32_t *)(gicd + 0x004),
++		    *(volatile uint32_t *)(gicd + 0x100),
++		    *(volatile uint32_t *)(gicc + 0x000),
++		    *(volatile uint32_t *)(gicc + 0x004),
++		    *(volatile uint32_t *)(gicc + 0x02c));
++	}
+ 
+ 	for (i = 0; i < 64; i++) {
+ 		bootargs[i] = *(volatile uint8_t *)(sram + A10_ABOX_BOOTARGS + i);
+@@ -542,8 +552,8 @@ a10_audio_init(void)
+ 	a10_speedy_write(IPBATCHER_INT_EN, 0);
+ 
+ 	if (PE_parse_boot_argn("a10audio_diag", &diag, sizeof(diag)) &&
+-	    diag == 1) {
+-		a10_abox_dump();
++	    diag >= 1) {
++		a10_abox_dump(diag);
+ 	}
+ 
+ 	a10_audio_ready = true;
+diff --git a/bsd/dev/a10_gpu.c b/bsd/dev/a10_gpu.c
+new file mode 100644
+index 0000000..017056d
+--- /dev/null
++++ b/bsd/dev/a10_gpu.c
+@@ -0,0 +1,586 @@
++/*
++ * A10 (Exynos 7884B): Mali-G71 MP2 bring-up.
++ *
++ * The A10's GPU is a Bifrost Mali-G71 MP2 at 0x11500000 (GPU_ID 0x60A0),
++ * with its clock controller CMU_G3D at 0x11400000, the top-level
++ * CORE_G3D gate in CMU_TOP at 0x12060000, and the local power domain
++ * pd-g3d in the PMU at 0x11c840a0 (status 0x40a4, mask 0xf).
++ *
++ * The vendor kernel powers the domain with two PMU accesses (g3d_on[] in
++ * pmucal_local_exynos7885.h): write 0xf to 0x40a0, then poll 0x40a4 until
++ * the low nibble is 0xf.  The GPU rail (S2MPU08 BUCK5, "vdd_g3d") is
++ * regulator-always-on in the live device tree, so no PMIC work is needed.
++ * The pd-g3d node has no "need_smc" property; unlike pd-dispaud, this
++ * domain is switched locally.
++ *
++ * probe76 (a10gpu=1) powers the domain if S-Boot left it off, forces the
++ * CORE_G3D and CMU_G3D gates on, dumps the clock state, reads GPU_ID, runs
++ * the smallest Mali job there is (WRITE_VALUE through address space 0 in
++ * identity mode -- the same sequence that completed on the A21s G52), and
++ * powers the cores off again.  It is opt-in and changes nothing else.
++ *
++ * Gate polarity comes from the vendor ra.c: with MANUAL (1 << 20) set,
++ * CG_VAL (1 << 21) = 1 passes the clock.  A QCH with ENABLE (1 << 0) = 1
++ * skips the automatic request logic and leaves the clock on.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <mach/vm_statistics.h>
++#include <pexpert/pexpert.h>
++#include <vm/vm_kern.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern uint64_t kvtophys(vm_offset_t);
++extern void FlushPoC_DcacheRegion(vm_offset_t, size_t);
++
++/* PMU (SFR_BLOCK(APM, 0x11c00000) is a different block; pd-g3d is here). */
++#define A10_PMU_PA              0x11c80000u
++#define A10_PMU_SIZE            0x10000u
++#define A10_PMU_G3D_CONF        0x40a0u
++#define A10_PMU_G3D_STAT        0x40a4u
++#define A10_PMU_G3D_OPT         0x40a8u
++
++/* CMU_TOP (SFR_BLOCK(CMU, 0x12060000, 0x8000)). */
++#define A10_CMU_TOP_PA          0x12060000u
++#define A10_CMU_TOP_SIZE        0x8000u
++#define A10_TOP_CORE_G3D_MUX    0x101cu
++#define A10_TOP_CORE_G3D_DIV    0x1824u
++#define A10_TOP_CORE_G3D_GATE   0x2024u
++
++/* CMU_G3D (SFR_BLOCK(G3D, 0x11400000, 0x8000)). */
++#define A10_CMU_G3D_PA          0x11400000u
++#define A10_CMU_G3D_SIZE        0x8000u
++#define A10_G3D_PLL_CON0        0x0120u
++#define A10_G3D_MUX_USER        0x0100u
++#define A10_G3D_MUX_BUSD        0x1004u
++#define A10_G3D_DIV             0x1800u
++#define A10_G3D_GATE_PCLK       0x2004u
++#define A10_G3D_GATE_AXI2APB    0x2014u
++#define A10_G3D_GATE_LHM_SFR    0x2018u
++#define A10_G3D_GATE_LHM_P      0x201cu
++#define A10_G3D_GATE_LHS_D      0x2020u
++#define A10_G3D_GATE_LHS_SFR    0x2024u
++#define A10_G3D_GATE_BUSD       0x2028u
++#define A10_G3D_GATE_BUSP       0x202cu
++#define A10_G3D_GATE_GPU        0x2030u
++#define A10_G3D_GATE_SYSREG     0x2034u
++#define A10_G3D_GATE_XIU        0x2038u
++#define A10_G3D_QCH_AGPU        0x3000u
++#define A10_G3D_QCH_CMU         0x3004u
++#define A10_G3D_QCH_LHM_SFR     0x3008u
++#define A10_G3D_QCH_LHM_P       0x300cu
++#define A10_G3D_QCH_LHS_D       0x3010u
++#define A10_G3D_QCH_LHS_SFR     0x3014u
++#define A10_G3D_QCH_SYSREG      0x3018u
++
++#define A10_GATE_MANUAL         (1u << 20)
++#define A10_GATE_CG_VAL         (1u << 21)
++#define A10_QCH_ENABLE          (1u << 0)
++#define A10_QCH_REQ             (1u << 1)
++
++/* Mali-G71 register block (Linux panfrost_regs.h). */
++#define A10_GPU_PA              0x11500000u
++#define A10_GPU_SIZE            0x5000u
++
++#define GPU_ID                  0x000u
++#define GPU_L2_FEATURES         0x004u
++#define GPU_TILER_FEATURES      0x00cu
++#define GPU_MEM_FEATURES        0x010u
++#define GPU_MMU_FEATURES        0x014u
++#define GPU_AS_PRESENT          0x018u
++#define GPU_JS_PRESENT          0x01cu
++#define GPU_INT_RAWSTAT         0x020u
++#define GPU_INT_CLEAR           0x024u
++#define GPU_INT_MASK            0x028u
++#define GPU_CMD                 0x030u
++#define GPU_STATUS              0x034u
++#define GPU_FAULT_ADDR          0x080u
++#define GPU_FAULT_STATUS        0x084u
++#define SHADER_PRESENT          0x100u
++#define TILER_PRESENT           0x110u
++#define L2_PRESENT              0x120u
++#define SHADER_READY            0x140u
++#define TILER_READY             0x150u
++#define L2_READY                0x160u
++#define SHADER_PWRON            0x180u
++#define TILER_PWRON             0x190u
++#define L2_PWRON                0x1a0u
++#define SHADER_PWROFF           0x1c0u
++#define TILER_PWROFF            0x1d0u
++#define L2_PWROFF               0x1e0u
++#define IRQ_RESET_COMPLETED     (1u << 8)
++
++#define JOB_INT_RAWSTAT         0x1000u
++#define JOB_INT_CLEAR           0x1004u
++#define JOB_INT_MASK            0x1008u
++#define JS1                     0x1880u
++#define JS_HEAD_NEXT_LO         0x40u
++#define JS_HEAD_NEXT_HI         0x44u
++#define JS_AFFINITY_NEXT_LO     0x50u
++#define JS_AFFINITY_NEXT_HI     0x54u
++#define JS_CONFIG_NEXT          0x58u
++#define JS_COMMAND_NEXT         0x60u
++#define JS_STATUS               0x24u
++#define JS_CONFIG               ((3u << 8) | (3u << 12) | (8u << 16))
++
++#define MMU_IRQ_RAWSTAT         0x2000u
++#define MMU_IRQ_CLEAR           0x2004u
++#define AS0                     0x2400u
++#define AS_TRANSTAB_LO          0x00u
++#define AS_TRANSTAB_HI          0x04u
++#define AS_MEMATTR_LO           0x08u
++#define AS_MEMATTR_HI           0x0cu
++#define AS_COMMAND              0x18u
++#define AS_FAULTSTATUS          0x1cu
++#define AS_STATUS               0x28u
++#define AS_TRANSCFG_LO          0x30u
++#define AS_TRANSCFG_HI          0x34u
++
++#define A10_GPU_TEST_WORD       0xc0ffee01u
++
++static inline uint32_t
++a10_gpu_read(vm_offset_t base, uint32_t off)
++{
++	uint32_t val;
++
++	val = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return val;
++}
++
++static inline void
++a10_gpu_write(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile ("dsb osh" ::: "memory");
++}
++
++static bool
++a10_gpu_wait(vm_offset_t base, uint32_t off, uint32_t mask, uint32_t want,
++    unsigned timeout_us)
++{
++	unsigned waited;
++
++	for (waited = 0; waited < timeout_us; waited += 10) {
++		if ((a10_gpu_read(base, off) & mask) == want) {
++			return true;
++		}
++		delay(10);
++	}
++	return (a10_gpu_read(base, off) & mask) == want;
++}
++
++static int a10_gpu_sleep_token;
++
++static void
++a10_gpu_sleep_ms(unsigned ms)
++{
++	uint64_t deadline;
++
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&a10_gpu_sleep_token, THREAD_UNINT,
++	    deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++/*
++ * g3d_on[] in pmucal_local_exynos7885.h: the local power domain is switched
++ * by PMU 0x40a0 and reports in 0x40a4.  Keep every other configuration bit.
++ */
++static bool
++a10_gpu_domain_on(vm_offset_t pmu)
++{
++	uint32_t conf, stat, opt;
++	unsigned waited;
++
++	conf = a10_gpu_read(pmu, A10_PMU_G3D_CONF);
++	stat = a10_gpu_read(pmu, A10_PMU_G3D_STAT);
++	opt = a10_gpu_read(pmu, A10_PMU_G3D_OPT);
++	printf("A10 GPU: pmu g3d conf=%08x status=%08x option=%08x\n",
++	    conf, stat, opt);
++	if ((stat & 0xfu) == 0xfu) {
++		printf("A10 GPU: pd-g3d already on\n");
++		return true;
++	}
++
++	a10_gpu_write(pmu, A10_PMU_G3D_CONF, conf | 0xfu);
++	for (waited = 0; waited < 100; waited++) {
++		stat = a10_gpu_read(pmu, A10_PMU_G3D_STAT);
++		if ((stat & 0xfu) == 0xfu) {
++			break;
++		}
++		delay(1000);
++	}
++	printf("A10 GPU: pd-g3d power status=%08x after %u ms\n", stat, waited);
++	return (stat & 0xfu) == 0xfu;
++}
++
++/*
++ * The vendor ra_set_gate()/ra_req_enable_qch() semantics: MANUAL=1 makes
++ * CG_VAL the switch, CG_VAL=1 passes the clock; QCH ENABLE=1 skips the
++ * request machinery.  Only bits that force a clock on are written.
++ */
++static void
++a10_gpu_clock_on(vm_offset_t top, vm_offset_t g3d)
++{
++	static const uint16_t gates[] = {
++		A10_G3D_GATE_PCLK, A10_G3D_GATE_AXI2APB,
++		A10_G3D_GATE_LHM_SFR, A10_G3D_GATE_LHM_P,
++		A10_G3D_GATE_LHS_D, A10_G3D_GATE_LHS_SFR,
++		A10_G3D_GATE_BUSD, A10_G3D_GATE_BUSP,
++		A10_G3D_GATE_GPU, A10_G3D_GATE_SYSREG,
++		A10_G3D_GATE_XIU,
++	};
++	static const uint16_t qch[] = {
++		A10_G3D_QCH_AGPU, A10_G3D_QCH_CMU,
++		A10_G3D_QCH_LHM_SFR, A10_G3D_QCH_LHM_P,
++		A10_G3D_QCH_LHS_D, A10_G3D_QCH_LHS_SFR,
++		A10_G3D_QCH_SYSREG,
++	};
++	uint32_t before, after;
++	unsigned i;
++
++	before = a10_gpu_read(top, A10_TOP_CORE_G3D_GATE);
++	after = before | A10_GATE_MANUAL | A10_GATE_CG_VAL;
++	a10_gpu_write(top, A10_TOP_CORE_G3D_GATE, after);
++	printf("A10 GPU: top core_g3d gate %08x -> %08x (now %08x)\n",
++	    before, after, a10_gpu_read(top, A10_TOP_CORE_G3D_GATE));
++
++	for (i = 0; i < sizeof(gates) / sizeof(gates[0]); i++) {
++		before = a10_gpu_read(g3d, gates[i]);
++		a10_gpu_write(g3d, gates[i],
++		    before | A10_GATE_MANUAL | A10_GATE_CG_VAL);
++	}
++	for (i = 0; i < sizeof(qch) / sizeof(qch[0]); i++) {
++		before = a10_gpu_read(g3d, qch[i]);
++		a10_gpu_write(g3d, qch[i],
++		    before | A10_QCH_ENABLE | A10_QCH_REQ);
++	}
++	printf("A10 GPU: cmu_g3d gates and qch forced on\n");
++}
++
++static void
++a10_gpu_dump_clock(vm_offset_t top, vm_offset_t g3d)
++{
++	printf("A10 GPU: top mux=%08x div=%08x gate=%08x\n",
++	    a10_gpu_read(top, A10_TOP_CORE_G3D_MUX),
++	    a10_gpu_read(top, A10_TOP_CORE_G3D_DIV),
++	    a10_gpu_read(top, A10_TOP_CORE_G3D_GATE));
++	printf("A10 GPU: g3d pll=%08x mux_user=%08x mux_busd=%08x div=%08x\n",
++	    a10_gpu_read(g3d, A10_G3D_PLL_CON0),
++	    a10_gpu_read(g3d, A10_G3D_MUX_USER),
++	    a10_gpu_read(g3d, A10_G3D_MUX_BUSD),
++	    a10_gpu_read(g3d, A10_G3D_DIV));
++	printf("A10 GPU: g3d gates %08x %08x %08x %08x %08x %08x "
++	    "%08x %08x %08x %08x %08x\n",
++	    a10_gpu_read(g3d, A10_G3D_GATE_PCLK),
++	    a10_gpu_read(g3d, A10_G3D_GATE_AXI2APB),
++	    a10_gpu_read(g3d, A10_G3D_GATE_LHM_SFR),
++	    a10_gpu_read(g3d, A10_G3D_GATE_LHM_P),
++	    a10_gpu_read(g3d, A10_G3D_GATE_LHS_D),
++	    a10_gpu_read(g3d, A10_G3D_GATE_LHS_SFR),
++	    a10_gpu_read(g3d, A10_G3D_GATE_BUSD),
++	    a10_gpu_read(g3d, A10_G3D_GATE_BUSP),
++	    a10_gpu_read(g3d, A10_G3D_GATE_GPU),
++	    a10_gpu_read(g3d, A10_G3D_GATE_SYSREG),
++	    a10_gpu_read(g3d, A10_G3D_GATE_XIU));
++	printf("A10 GPU: g3d qch %08x %08x %08x %08x %08x %08x %08x\n",
++	    a10_gpu_read(g3d, A10_G3D_QCH_AGPU),
++	    a10_gpu_read(g3d, A10_G3D_QCH_CMU),
++	    a10_gpu_read(g3d, A10_G3D_QCH_LHM_SFR),
++	    a10_gpu_read(g3d, A10_G3D_QCH_LHM_P),
++	    a10_gpu_read(g3d, A10_G3D_QCH_LHS_D),
++	    a10_gpu_read(g3d, A10_G3D_QCH_LHS_SFR),
++	    a10_gpu_read(g3d, A10_G3D_QCH_SYSREG));
++}
++
++static void
++a10_gpu_dump_gpu(vm_offset_t mali)
++{
++	printf("A10 GPU: features l2=%08x tiler=%08x mem=%08x mmu=%08x "
++	    "as=%08x js=%08x\n",
++	    a10_gpu_read(mali, GPU_L2_FEATURES),
++	    a10_gpu_read(mali, GPU_TILER_FEATURES),
++	    a10_gpu_read(mali, GPU_MEM_FEATURES),
++	    a10_gpu_read(mali, GPU_MMU_FEATURES),
++	    a10_gpu_read(mali, GPU_AS_PRESENT),
++	    a10_gpu_read(mali, GPU_JS_PRESENT));
++	printf("A10 GPU: status=%08x irq=%08x present shader=%08x tiler=%08x "
++	    "l2=%08x ready shader=%08x tiler=%08x l2=%08x\n",
++	    a10_gpu_read(mali, GPU_STATUS),
++	    a10_gpu_read(mali, GPU_INT_RAWSTAT),
++	    a10_gpu_read(mali, SHADER_PRESENT),
++	    a10_gpu_read(mali, TILER_PRESENT),
++	    a10_gpu_read(mali, L2_PRESENT),
++	    a10_gpu_read(mali, SHADER_READY),
++	    a10_gpu_read(mali, TILER_READY),
++	    a10_gpu_read(mali, L2_READY));
++}
++
++static bool
++a10_gpu_reset(vm_offset_t mali)
++{
++	a10_gpu_write(mali, GPU_INT_MASK, 0);
++	a10_gpu_write(mali, GPU_INT_CLEAR, 0xffffffffu);
++	a10_gpu_write(mali, GPU_CMD, 1);
++	if (!a10_gpu_wait(mali, GPU_INT_RAWSTAT, IRQ_RESET_COMPLETED,
++	    IRQ_RESET_COMPLETED, 100000)) {
++		printf("A10 GPU: soft reset timeout, rawstat=%08x status=%08x\n",
++		    a10_gpu_read(mali, GPU_INT_RAWSTAT),
++		    a10_gpu_read(mali, GPU_STATUS));
++		return false;
++	}
++	a10_gpu_write(mali, GPU_INT_CLEAR, 0xffffffffu);
++	printf("A10 GPU: soft reset completed\n");
++	return true;
++}
++
++static bool
++a10_gpu_power_cores(vm_offset_t mali, uint32_t *shader_mask)
++{
++	uint32_t l2, tiler, shader;
++
++	l2 = a10_gpu_read(mali, L2_PRESENT);
++	tiler = a10_gpu_read(mali, TILER_PRESENT);
++	shader = a10_gpu_read(mali, SHADER_PRESENT);
++	printf("A10 GPU: present shader=%08x tiler=%08x l2=%08x\n",
++	    shader, tiler, l2);
++	if (l2 == 0 || tiler == 0 || shader == 0) {
++		return false;
++	}
++
++	a10_gpu_write(mali, L2_PWRON, l2);
++	if (!a10_gpu_wait(mali, L2_READY, l2, l2, 50000)) {
++		printf("A10 GPU: L2 did not power up, ready=%08x\n",
++		    a10_gpu_read(mali, L2_READY));
++		return false;
++	}
++	a10_gpu_write(mali, TILER_PWRON, tiler);
++	if (!a10_gpu_wait(mali, TILER_READY, tiler, tiler, 50000)) {
++		printf("A10 GPU: tiler did not power up, ready=%08x\n",
++		    a10_gpu_read(mali, TILER_READY));
++		return false;
++	}
++	a10_gpu_write(mali, SHADER_PWRON, shader);
++	if (!a10_gpu_wait(mali, SHADER_READY, shader, shader, 50000)) {
++		printf("A10 GPU: shaders did not power up, ready=%08x\n",
++		    a10_gpu_read(mali, SHADER_READY));
++		return false;
++	}
++	printf("A10 GPU: cores powered, ready shader=%08x tiler=%08x l2=%08x\n",
++	    a10_gpu_read(mali, SHADER_READY),
++	    a10_gpu_read(mali, TILER_READY),
++	    a10_gpu_read(mali, L2_READY));
++	*shader_mask = shader;
++	return true;
++}
++
++static void
++a10_gpu_power_off(vm_offset_t mali)
++{
++	uint32_t mask;
++
++	mask = a10_gpu_read(mali, TILER_READY);
++	a10_gpu_write(mali, TILER_PWROFF, mask);
++	mask = a10_gpu_read(mali, SHADER_READY);
++	a10_gpu_write(mali, SHADER_PWROFF, mask);
++	mask = a10_gpu_read(mali, L2_READY);
++	a10_gpu_write(mali, L2_PWROFF, mask);
++	printf("A10 GPU: cores powered off, ready shader=%08x tiler=%08x "
++	    "l2=%08x\n",
++	    a10_gpu_read(mali, SHADER_READY),
++	    a10_gpu_read(mali, TILER_READY),
++	    a10_gpu_read(mali, L2_READY));
++}
++
++/*
++ * One Bifrost job: a job header saying "write value" at page+0, and its
++ * payload -- where (page+0x800), what kind (6, a 32-bit immediate) and the
++ * value -- at +0x10.  Address space 0 is in identity mode, so the GPU
++ * address of the page is its physical address.  The processor's cache is
++ * flushed before the GPU reads the job and again before the word is read.
++ */
++static bool
++a10_gpu_write_value(vm_offset_t mali, uint32_t shader_mask, vm_offset_t page)
++{
++	volatile uint32_t *job = (volatile uint32_t *)page;
++	volatile uint32_t *target =
++	    (volatile uint32_t *)(page + 0x800);
++	uint64_t gpu = (uint64_t)kvtophys(page);
++	uint32_t jirq = 0, mirq = 0, girq = 0;
++	unsigned waited;
++	bool done;
++
++	job[4] = (2u << 1) | 1u | (1u << 16);
++	job[8] = (uint32_t)(gpu + 0x800);
++	job[9] = (uint32_t)((gpu + 0x800) >> 32);
++	job[10] = 6;
++	job[12] = A10_GPU_TEST_WORD;
++	FlushPoC_DcacheRegion(page, PAGE_SIZE);
++	__asm__ volatile ("dsb sy" ::: "memory");
++
++	a10_gpu_write(mali, AS0 + AS_TRANSTAB_LO, 0);
++	a10_gpu_write(mali, AS0 + AS_TRANSTAB_HI, 0);
++	a10_gpu_write(mali, AS0 + AS_TRANSCFG_LO, 2);   /* identity */
++	a10_gpu_write(mali, AS0 + AS_TRANSCFG_HI, 0);
++	a10_gpu_write(mali, AS0 + AS_MEMATTR_LO, 0x88888888u);
++	a10_gpu_write(mali, AS0 + AS_MEMATTR_HI, 0x88888888u);
++	a10_gpu_write(mali, AS0 + AS_COMMAND, 1);       /* update */
++	if (!a10_gpu_wait(mali, AS0 + AS_STATUS, 1, 0, 50000)) {
++		printf("A10 GPU: AS0 update timeout, status=%08x\n",
++		    a10_gpu_read(mali, AS0 + AS_STATUS));
++		return false;
++	}
++
++	a10_gpu_write(mali, JOB_INT_MASK, 0);
++	a10_gpu_write(mali, JOB_INT_CLEAR, 0xffffffffu);
++	a10_gpu_write(mali, MMU_IRQ_CLEAR, 0xffffffffu);
++	a10_gpu_write(mali, JS1 + JS_HEAD_NEXT_LO, (uint32_t)gpu);
++	a10_gpu_write(mali, JS1 + JS_HEAD_NEXT_HI, (uint32_t)(gpu >> 32));
++	a10_gpu_write(mali, JS1 + JS_AFFINITY_NEXT_LO, shader_mask);
++	a10_gpu_write(mali, JS1 + JS_AFFINITY_NEXT_HI, 0);
++	a10_gpu_write(mali, JS1 + JS_CONFIG_NEXT, JS_CONFIG);
++	a10_gpu_write(mali, JS1 + JS_COMMAND_NEXT, 1);  /* start */
++
++	for (waited = 0; waited < 10000; waited++) {
++		jirq = a10_gpu_read(mali, JOB_INT_RAWSTAT);
++		mirq = a10_gpu_read(mali, MMU_IRQ_RAWSTAT);
++		girq = a10_gpu_read(mali, GPU_INT_RAWSTAT);
++		if ((jirq & ((1u << 1) | (1u << 17))) || mirq ||
++		    (girq & 0x81u)) {
++			break;
++		}
++		delay(10);
++	}
++	FlushPoC_DcacheRegion(page, PAGE_SIZE);
++
++	done = (jirq & (1u << 1)) != 0 && (jirq & (1u << 17)) == 0 &&
++	    mirq == 0 && (girq & 0x81u) == 0 &&
++	    *target == A10_GPU_TEST_WORD;
++	printf("A10 GPU: WRITE_VALUE job irq=%08x mmu=%08x gpu=%08x "
++	    "slot=%08x as_fault=%08x exception=%08x word=%08x -> %s\n",
++	    jirq, mirq, girq, a10_gpu_read(mali, JS1 + JS_STATUS),
++	    a10_gpu_read(mali, AS0 + AS_FAULTSTATUS),
++	    a10_gpu_read(mali, AS0 + AS_FAULTSTATUS) ? 0 : job[0],
++	    *target, done ? "the Mali ran it" : "failed or timed out");
++
++	a10_gpu_write(mali, JOB_INT_CLEAR, 0xffffffffu);
++	a10_gpu_write(mali, MMU_IRQ_CLEAR, 0xffffffffu);
++	a10_gpu_write(mali, GPU_INT_CLEAR, 0xffffffffu);
++	return done;
++}
++
++static void
++a10_gpu_probe(void)
++{
++	vm_offset_t pmu, top, g3d, mali, page = 0;
++	uint32_t id, pll, product, shader_mask = 0;
++	bool powered, job_ok = false;
++
++	pmu = ml_io_map(A10_PMU_PA, A10_PMU_SIZE);
++	if (pmu == 0) {
++		printf("A10 GPU: cannot map the PMU\n");
++		return;
++	}
++	powered = a10_gpu_domain_on(pmu);
++	if (!powered) {
++		printf("A10 GPU: pd-g3d did not come up; stopped\n");
++		return;
++	}
++
++	top = ml_io_map(A10_CMU_TOP_PA, A10_CMU_TOP_SIZE);
++	g3d = ml_io_map(A10_CMU_G3D_PA, A10_CMU_G3D_SIZE);
++	mali = ml_io_map(A10_GPU_PA, A10_GPU_SIZE);
++	if (top == 0 || g3d == 0 || mali == 0) {
++		printf("A10 GPU: map failed top=%lx g3d=%lx mali=%lx\n",
++		    (unsigned long)top, (unsigned long)g3d,
++		    (unsigned long)mali);
++		return;
++	}
++
++	a10_gpu_dump_clock(top, g3d);
++	a10_gpu_clock_on(top, g3d);
++	a10_gpu_dump_clock(top, g3d);
++
++	/*
++	 * Do not touch the Mali if its PLL is not running: an unclocked
++	 * AXI block can hang the bus on the first read.  S-Boot normally
++	 * hands over with PLL_G3D enabled and locked (TWRP read GPU_ID and
++	 * took a job interrupt), so this is a guard, not the expected path.
++	 */
++	pll = a10_gpu_read(g3d, A10_G3D_PLL_CON0);
++	if ((pll & ((1u << 31) | (1u << 29))) !=
++	    ((1u << 31) | (1u << 29))) {
++		printf("A10 GPU: PLL_G3D not enabled/locked (%08x); "
++		    "no GPU register access\n", pll);
++		return;
++	}
++
++	id = a10_gpu_read(mali, GPU_ID);
++	product = id >> 16;
++	printf("A10 GPU: GPU_ID=%08x product=%04x (0x60a0 = Mali-G71)\n",
++	    id, product);
++	if (product != 0x60a0u) {
++		printf("A10 GPU: not a Mali-G71 or its clock is not running; "
++		    "no GPU writes\n");
++		return;
++	}
++
++	a10_gpu_dump_gpu(mali);
++	if (!a10_gpu_reset(mali)) {
++		return;
++	}
++	if (!a10_gpu_power_cores(mali, &shader_mask)) {
++		goto out;
++	}
++
++	if (kmem_alloc(kernel_map, &page, PAGE_SIZE,
++	    KMA_KOBJECT | KMA_ZERO | KMA_DATA,
++	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("A10 GPU: no page for the test job\n");
++		goto out;
++	}
++	job_ok = a10_gpu_write_value(mali, shader_mask, page);
++
++out:
++	a10_gpu_power_off(mali);
++	if (page != 0) {
++		kmem_free(kernel_map, page, PAGE_SIZE);
++	}
++	printf("A10 GPU: probe done, job %s\n",
++	    job_ok ? "ran" : "did not run");
++}
++
++static void
++a10_gpu_thread(__unused void *arg, __unused wait_result_t result)
++{
++	/* Let the boot settle and the persistent log come up. */
++	a10_gpu_sleep_ms(3000);
++	a10_gpu_probe();
++}
++
++int
++a10_gpu_init(void)
++{
++	int enabled = 0;
++	thread_t thread;
++
++	if (!PE_parse_boot_argn("a10gpu", &enabled, sizeof(enabled)) ||
++	    enabled != 1) {
++		return ENXIO;
++	}
++	printf("A10 GPU: probe enabled\n");
++	if (kernel_thread_start(a10_gpu_thread, NULL, &thread) ==
++	    KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++	return 0;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_emmc.c b/bsd/dev/sweet_emmc.c
+index 001423d..a3da095 100644
+--- a/bsd/dev/sweet_emmc.c
++++ b/bsd/dev/sweet_emmc.c
+@@ -1636,10 +1636,13 @@ sweet_emmc_rootdev(dev_t *dev)
+ 	extern void a10_keys_init(void);
+ 	extern void a10_touch_init(void);
+ 	extern int a10_audio_init(void);
++	extern int a10_gpu_init(void);
+ 
+ 	a10_keys_init();
+ 	/* Audio block probe (SPEEDY + ABOX + codec); opt-in via a10audio=1. */
+ 	(void)a10_audio_init();
++	/* Mali-G71 power/clock/ID/job probe; opt-in via a10gpu=1. */
++	(void)a10_gpu_init();
+ 	a10_touch_init();
+ 	if (!se.ready) {
+ 		int error = sweet_emmc_init();
