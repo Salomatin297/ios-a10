@@ -1,0 +1,40 @@
+diff --git a/bsd/dev/a10_audio.c b/bsd/dev/a10_audio.c
+index 80ced43..fc07424 100644
+--- a/bsd/dev/a10_audio.c
++++ b/bsd/dev/a10_audio.c
+@@ -464,11 +464,30 @@ a10_abox_dump(int level)
+ 	    *(volatile uint32_t *)(smmu + A10_MMU_PT_BASE_PPN),
+ 	    *(volatile uint32_t *)(smmu + A10_MMU_VERSION),
+ 	    *(volatile uint32_t *)(smmu + A10_MMU_INT_STATUS));
+-	printf("A10 ABOX: smmu fault ar=%08x/%08x aw=%08x/%08x\n",
+-	    *(volatile uint32_t *)(smmu + A10_MMU_FAULT_AR_ADDR),
+-	    *(volatile uint32_t *)(smmu + A10_MMU_FAULT_AR_INFO),
+-	    *(volatile uint32_t *)(smmu + A10_MMU_FAULT_AW_ADDR),
+-	    *(volatile uint32_t *)(smmu + A10_MMU_FAULT_AW_INFO));
++	/*
++	 * This is a v7 SYSMMU (ver 0x7040000f, major = (ver >> 17) >> 11).
++	 * v7 keeps a single fault pair at 0x070/0x078; the v5 AW pair at
++	 * 0x080/0x088 is not implemented and probe76 took a synchronous
++	 * external abort (ESR 0x96000210) reading it.  The fault registers
++	 * are only sampled on a fault by the vendor driver, so keep them
++	 * behind a10audio_diag=2: the ABOX block is unclocked at this point.
++	 */
++	if (level >= 2) {
++		uint32_t ver = *(volatile uint32_t *)(smmu + A10_MMU_VERSION);
++		unsigned int major = ((ver >> 17) & 0x7fffu) >> 11;
++
++		printf("A10 ABOX: smmu v%u fault ar=%08x/%08x\n", major,
++		    *(volatile uint32_t *)(smmu + A10_MMU_FAULT_AR_ADDR),
++		    *(volatile uint32_t *)(smmu + A10_MMU_FAULT_AR_INFO));
++		if (major < 7) {
++			printf("A10 ABOX: smmu v%u fault aw=%08x/%08x\n",
++			    major,
++			    *(volatile uint32_t *)(smmu +
++			    A10_MMU_FAULT_AW_ADDR),
++			    *(volatile uint32_t *)(smmu +
++			    A10_MMU_FAULT_AW_INFO));
++		}
++	}
+ 	/*
+ 	 * The ABOX GIC lives in the same unclocked block as the SYSMMU.
+ 	 * Its registers were never sampled on hardware yet, so keep them
