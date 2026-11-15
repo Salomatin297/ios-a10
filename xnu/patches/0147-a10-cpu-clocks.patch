@@ -1,0 +1,82 @@
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -208,6 +208,70 @@
+ 		thread_deallocate(thread);
+ 	}
+ 	return true;
++}
++
++/*
++ * XNU has no cpufreq driver for this SoC: nothing in the kernel ever writes
++ * CPUCL0/CPUCL1/CPUCL2, so both clusters run for the whole session at the
++ * rate S-Boot left in their PLLs.  Print that rate -- 26 MHz * M / (P << S),
++ * the vendor's cmucal formula -- with the switch divider, because a cluster
++ * left in a low DVFS step would explain a slow userland far better than any
++ * missing GPU work, and it is the first number to look at before touching
++ * DVFS or the core count.
++ */
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++
++#define SWEET_CMU_TOP_PA   0x12060000u
++#define SWEET_CMU_TOP_SIZE 0x2000u
++#define SWEET_CPUCL0_PA    0x10900000u
++#define SWEET_CPUCL1_PA    0x10800000u
++#define SWEET_CPUCL2_PA    0x10a00000u
++#define SWEET_CPUCL_SIZE   0x2000u
++
++static void
++sweet_cpu_cluster(const char *name, vm_offset_t cmu_top, vm_offset_t pll,
++    uint32_t pll_con0, uint32_t div_off)
++{
++	uint32_t con = 0, div = 0;
++	uint64_t m, p, s, mhz = 0;
++
++	if (pll != 0) {
++		con = *(volatile uint32_t *)(pll + pll_con0);
++	}
++	if (cmu_top != 0) {
++		div = *(volatile uint32_t *)(cmu_top + div_off);
++	}
++	m = (con >> 16) & 0x3ff;
++	p = (con >> 8) & 0x3f;
++	s = con & 0x7;
++	if (m != 0 && p != 0) {
++		mhz = (26000000ull * m) / (p << s) / 1000000ull;
++	}
++	IOLog("SWEET CPU: %s pll_con0=%08x m=%llu p=%llu s=%llu -> %llu MHz, "
++	    "switch div=%08x%s\n",
++	    name, con, m, p, s, mhz, div,
++	    (con & (1u << 31)) ? "" : " (PLL OFF)");
++}
++
++static void
++sweet_cpu_dump_clocks(void)
++{
++	vm_offset_t top, cl0, cl1, cl2;
++
++	top = ml_io_map(SWEET_CMU_TOP_PA, SWEET_CMU_TOP_SIZE);
++	cl0 = ml_io_map(SWEET_CPUCL0_PA, SWEET_CPUCL_SIZE);
++	cl1 = ml_io_map(SWEET_CPUCL1_PA, SWEET_CPUCL_SIZE);
++	cl2 = ml_io_map(SWEET_CPUCL2_PA, SWEET_CPUCL_SIZE);
++	if (top == 0 || cl0 == 0 || cl1 == 0 || cl2 == 0) {
++		IOLog("SWEET CPU: clocks not mapped top=%lx cl0=%lx cl1=%lx "
++		    "cl2=%lx\n", (unsigned long)top, (unsigned long)cl0,
++		    (unsigned long)cl1, (unsigned long)cl2);
++		return;
++	}
++	/* CPUCL0 is the A73 pair, CPUCL1 and CPUCL2 the two A53 pairs. */
++	sweet_cpu_cluster("cpucl0 A73", top, cl0, 0x140, 0x182c);
++	sweet_cpu_cluster("cpucl1 A53", top, cl1, 0x120, 0x1830);
++	sweet_cpu_cluster("cpucl2 A53", top, cl2, 0x120, 0x1834);
+ }
+ 
+ /* Do not wait in a nub's start(): matching can be asynchronous or serialized. */
+@@ -477,6 +541,7 @@
+ 	ml_set_max_cpus(topology->max_cpu_id + 1);
+ 	IOLog("SWEET CPU: %u/%u CPUs initialized, SGI1 verified\n",
+ 	    topology->num_cpus, topology->num_cpus);
++	sweet_cpu_dump_clocks();
+ 	thread_terminate(current_thread());
+ }
+ 

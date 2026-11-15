@@ -1,0 +1,158 @@
+diff --git a/bsd/dev/a10_gpu.c b/bsd/dev/a10_gpu.c
+--- a/bsd/dev/a10_gpu.c
++++ b/bsd/dev/a10_gpu.c
+@@ -18,12 +18,23 @@
+  * ran the smallest Mali job there is (WRITE_VALUE through address space 0
+  * in identity mode): the word appeared, so the job manager works.
+  *
+- * probe78 adds the GPU's own page tables.  The MMU reports 48 bits of
++ * probe78 added the GPU's own page tables.  The MMU reports 48 bits of
+  * virtual address and 40 of physical (MMU_FEATURES 0x2830), so a 4 KB
+  * granule takes four levels (bits 47..39, 38..30, 29..21, 20..12) and
+- * INA_BITS = 55 - 48 = 7 in AS_TRANSCFG.  The A21s G52 reports 35 bits
+- * and uses three levels, so the probe builds that shape too and runs the
+- * same job through whichever tables work: one flash, both answers.
++ * INA_BITS = 55 - 48 = 7 in AS_TRANSCFG.  Both the 48-bit and the A21s
++ * G52's 35-bit shape then failed with JS_STATUS 0x58, DATA_INVALID_FAULT,
++ * and no MMU fault at all.
++ *
++ * probe79 fixes the entry encoding: Mali's AArch64 walker is not quite
++ * the ARMv8 one.  kbase (mali_kbase_mmu_mode_aarch64.c) flags a valid
++ * entry at levels 0-2 with 0b01 (ENTRY_IS_ATE_L02) and a page at level 3
++ * with 0b11 (ENTRY_IS_ATE_L3); probe78 wrote 0b11 for the tables too, so
++ * the walker stopped at the first table entry and the job reported bad
++ * data.  It also prints the job header's first_incomplete_task and
++ * fault_pointer, the GPU fault registers (0x03c, not 0x080), all three
++ * job slot statuses and the JS state, and tries uncached walks if the
++ * cached ones still fail.
++ *
+  * It is opt-in and changes nothing else.
+  *
+  * Gate polarity comes from the vendor ra.c: with MANUAL (1 << 20) set,
+@@ -108,8 +119,9 @@
+ #define GPU_INT_MASK            0x028u
+ #define GPU_CMD                 0x030u
+ #define GPU_STATUS              0x034u
+-#define GPU_FAULT_ADDR          0x080u
+-#define GPU_FAULT_STATUS        0x084u
++#define GPU_FAULT_STATUS        0x03cu
++#define GPU_FAULT_ADDRESS_LO    0x040u
++#define GPU_FAULT_ADDRESS_HI    0x044u
+ #define SHADER_PRESENT          0x100u
+ #define TILER_PRESENT           0x110u
+ #define L2_PRESENT              0x120u
+@@ -127,7 +139,10 @@
+ #define JOB_INT_RAWSTAT         0x1000u
+ #define JOB_INT_CLEAR           0x1004u
+ #define JOB_INT_MASK            0x1008u
++#define JOB_INT_JS_STATE        0x1010u
++#define JS0                     0x1800u
+ #define JS1                     0x1880u
++#define JS2                     0x1900u
+ #define JS_HEAD_NEXT_LO         0x40u
+ #define JS_HEAD_NEXT_HI         0x44u
+ #define JS_AFFINITY_NEXT_LO     0x50u
+@@ -444,7 +459,14 @@
+  * A21s's G52 reports 35 bits and uses three levels; that shape is built
+  * as a fallback, so one boot says which one this GPU takes.
+  */
+-#define PTE_TABLE           3ull
++/*
++ * Mali's AArch64 walker uses bit 1 as "this is a level-3 page" rather than
++ * as the ARMv8 table bit: kbase writes 0b01 for a valid entry at levels
++ * 0-2 (ENTRY_IS_ATE_L02) and 0b11 for a page at level 3 (ENTRY_IS_ATE_L3),
++ * and treats 0b10 as invalid.  Probe78 wrote 0b11 for both, so the walker
++ * refused the very first table entry.
++ */
++#define PTE_TABLE           1ull
+ #define PTE_PAGE            3ull
+ #define PTE_AF              (1ull << 10)
+ #define PTE_SH_INNER        (3ull << 8)
+@@ -456,6 +478,9 @@
+ 			    (1u << 30))		/* walks write-back, read-allocate */
+ #define TRANSCFG_48BIT      (TRANSCFG_WALK_WB | (7u << 6))   /* 55 - 48 */
+ #define TRANSCFG_35BIT      (TRANSCFG_WALK_WB | (20u << 6))  /* 55 - 35 */
++/* Walks that read the tables uncached, as the A21s driver learned to do. */
++#define TRANSCFG_WALK_NC    (TRANSCFG_ADRMODE_AARCH64_4K | (1u << 24))
++#define TRANSCFG_48BIT_NC   (TRANSCFG_WALK_NC | (7u << 6))
+ 
+ #define A10_GPU_TEST_VA     0x00100000ull
+ 
+@@ -487,7 +512,7 @@
+ 	uint64_t phys;
+ 	uint64_t *table;
+ 
+-	if (*entry & PTE_TABLE) {
++	if (*entry & 1) {
+ 		return (uint64_t *)phystokv(*entry & PTE_ADDRESS);
+ 	}
+ 	table = a10_gpu_pt_page(&phys);
+@@ -592,6 +617,24 @@
+ 	    job[0], *target,
+ 	    done ? "the Mali ran it" : "failed or timed out");
+ 
++	if (!done) {
++		printf("A10 GPU: job head status=%08x task=%08x "
++		    "fault_ptr=%08x%08x next=%08x%08x\n",
++		    job[0], job[1], job[3], job[2], job[7], job[6]);
++		printf("A10 GPU: js0=%08x js1=%08x js2=%08x jsstate=%08x "
++		    "gpu_fault=%08x gpu_addr=%08x%08x mmu_irq=%08x "
++		    "as_status=%08x\n",
++		    a10_gpu_read(mali, JS0 + JS_STATUS),
++		    a10_gpu_read(mali, JS1 + JS_STATUS),
++		    a10_gpu_read(mali, JS2 + JS_STATUS),
++		    a10_gpu_read(mali, JOB_INT_JS_STATE),
++		    a10_gpu_read(mali, GPU_FAULT_STATUS),
++		    a10_gpu_read(mali, GPU_FAULT_ADDRESS_HI),
++		    a10_gpu_read(mali, GPU_FAULT_ADDRESS_LO),
++		    a10_gpu_read(mali, MMU_IRQ_RAWSTAT),
++		    a10_gpu_read(mali, AS0 + AS_STATUS));
++	}
++
+ 	a10_gpu_write(mali, JOB_INT_CLEAR, 0xffffffffu);
+ 	a10_gpu_write(mali, MMU_IRQ_CLEAR, 0xffffffffu);
+ 	a10_gpu_write(mali, GPU_INT_CLEAR, 0xffffffffu);
+@@ -604,7 +647,8 @@
+ 	vm_offset_t pmu, top, g3d, mali, page = 0;
+ 	uint32_t id, pll, product, shader_mask = 0;
+ 	struct a10_gpu_pt pt48, pt35;
+-	bool powered, job_ok = false, job48 = false, job35 = false;
++	bool powered, job_ok = false, job48 = false, job48nc = false;
++	bool job35 = false;
+ 
+ 	pmu = ml_io_map(A10_PMU_PA, A10_PMU_SIZE);
+ 	if (pmu == 0) {
+@@ -693,12 +737,19 @@
+ 			printf("A10 GPU: 4-level (48-bit VA) job %s\n",
+ 			    job48 ? "ran" : "did not run");
+ 		}
++		if (!job48 &&
++		    a10_gpu_as0(mali, pt48.top_phys, TRANSCFG_48BIT_NC)) {
++			job48nc = a10_gpu_write_value(mali, shader_mask, page,
++			    A10_GPU_TEST_VA, A10_GPU_TEST_WORD + 3);
++			printf("A10 GPU: 4-level, uncached walks job %s\n",
++			    job48nc ? "ran" : "did not run");
++		}
+ 	} else {
+ 		printf("A10 GPU: 4-level tables not built\n");
+ 	}
+ 
+ 	/* The A21s G52 shape: 35 bits of VA, three levels. */
+-	if (!job48) {
++	if (!job48 && !job48nc) {
+ 		bzero(&pt35, sizeof(pt35));
+ 		pt35.levels = 3;
+ 		pt35.top = a10_gpu_pt_page(&pt35.top_phys);
+@@ -727,9 +778,11 @@
+ 	if (page != 0) {
+ 		kmem_free(kernel_map, page, PAGE_SIZE);
+ 	}
+-	printf("A10 GPU: probe done, identity %s, 48-bit %s, 35-bit %s\n",
++	printf("A10 GPU: probe done, identity %s, 48-bit %s, uncached %s, "
++	    "35-bit %s\n",
+ 	    job_ok ? "ran" : "did not run",
+ 	    job48 ? "ran" : "did not run",
++	    job48nc ? "ran" : "did not run",
+ 	    job35 ? "ran" : "did not run");
+ }
+ 
