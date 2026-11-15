@@ -1,0 +1,257 @@
+diff --git a/bsd/dev/a10_audio.c b/bsd/dev/a10_audio.c
+--- a/bsd/dev/a10_audio.c
++++ b/bsd/dev/a10_audio.c
+@@ -1,5 +1,5 @@
+ /*
+- * A10 (Exynos 7884B): audio block bring-up, step 1 (diagnostics only).
++ * A10 (Exynos 7884B): audio block bring-up.
+  *
+  * The A10 audio path is not an I2S plus a simple codec:
+  *
+@@ -12,16 +12,16 @@
+  *                         device 0x03.
+  *   CODEC    COD3035X    headphone/speaker codec, reached through SPEEDY.
+  *
+- * This file only probes: it opens the SPEEDY clock through the APM block,
+- * maps SPEEDY and dumps its registers (including the IP batcher state).
+- * Nothing is configured, no DMA is started and no interrupt is claimed, so
+- * it cannot disturb the running system.  The point is to learn whether the
+- * audio hardware answers at all, which decides whether the next steps (codec
+- * programming, then an "AOP audio" IOKit service for the stock
+- * AppleAOPAudioPlugin HAL) are worth building.
+- *
+- * Enabled with the boot argument a10audio=1; off by default so the SMP
+- * probes are unaffected.
++ * probe73 (a10audio=1) only opened the SPEEDY clock through the APM block and
++ * dumped the SPEEDY/batcher registers.  probe74 adds a real transaction: the
++ * IP batcher is programmed exactly like i2c-speedy.c does it and the whole
++ * COD3035X register file is read back, so the values can be compared with the
++ * ACPM dump taken from TWRP.  This proves that XNU can talk to the codec
++ * without ACPM; the next step is the codec init sequence and ABOX firmware.
++ *
++ * Nothing is configured and no interrupt is claimed; the batcher is left idle
++ * and the codec registers are only read.  Enabled with a10audio=1, off by
++ * default so the SMP probes are unaffected.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -69,8 +69,46 @@
+ #define IPBATCHER_CON        0x500u
+ #define IPBATCHER_STATE      0x504u
+ #define IPBATCHER_INT_EN     0x508u
++#define IPBATCHER_FSM_UNEXPEN 0x50cu
++#define IPBATCHER_FSM_TXEN   0x510u
++#define IPBATCHER_FSM_RXFIFO 0x514u
++#define IPBATCHER_FSM_CON    0x518u
+ #define IP_FIFO_STATUS       0x51cu
+ #define IP_INT_STATUS        0x520u
++#define IPBATCHER_SEMA_REL   0x200u
++#define BATCHER_OPCODE       0x600u
++#define BATCHER_PAYLOAD      0x1000u
++
++/*
++ * The batcher consumes opcodes in 4-byte words.  For one random byte read
++ * the driver emits, in order:
++ *
++ *   opcode 0x00 (SPEEDY_CTRL)        payload 0x00030051
++ *   opcode 0x04 (SPEEDY_FIFO_CTRL)   payload 0x80000101
++ *   opcode 0x10 (SPEEDY_INT_STATUS)  payload 0xffffffff
++ *   opcode 0x0c (SPEEDY_INT_ENABLE)  payload 0x0007030e
++ *   opcode 0x08 (SPEEDY_CMD)         payload (addr12 << 7) | (1 << 19)
++ *   opcode 0x38 (SPEEDY_RX_DATA)     payload 0x77 (overwritten by the IP)
++ *   opcode 0xff (end of program)     payload 0x00
++ *
++ * so the two opcode words are 0x0c100400 and 0xffff3808, and the received
++ * byte lands in payload slot 5 (0x1014).
++ */
++#define BATCHER_OPCODE0       0x0c100400u
++#define BATCHER_OPCODE1       0xffff3808u
++#define BATCHER_PAYLOAD_CTRL  0x00030051u
++#define BATCHER_PAYLOAD_FIFO  0x80000101u
++#define BATCHER_PAYLOAD_INTCLR 0xffffffffu
++#define BATCHER_PAYLOAD_INTEN 0x0007030eu
++#define BATCHER_RX_SLOT       0x14u
++
++#define BATCHER_CON_ENABLE    0x00000003u /* BATCHER_ENABLE | DEDICATED_APB */
++#define BATCHER_CON_START     0x00000013u /* + START_BATCHER */
++#define BATCHER_STATE_DONE    0x00000001u
++#define BATCHER_STATE_UNEXP   0x00000002u
++#define BATCHER_ERR_MASK      0x0037000eu
++
++#define A10_CODEC_SPEEDY_DEV  0x03u
+ 
+ static vm_offset_t a10_apm;
+ static vm_offset_t a10_speedy;
+@@ -92,6 +130,12 @@
+ a10_speedy_read(unsigned off)
+ {
+ 	return *(volatile uint32_t *)(a10_speedy + off);
++}
++
++static inline void
++a10_speedy_write(unsigned off, uint32_t val)
++{
++	*(volatile uint32_t *)(a10_speedy + off) = val;
+ }
+ 
+ /*
+@@ -115,6 +159,145 @@
+ 	a10_apm_write(A10_APM_SPEEDY_GATE, after);
+ 	printf("A10 AUDIO: speedy gate %08x -> %08x (now %08x)\n",
+ 	    before, after, a10_apm_read(A10_APM_SPEEDY_GATE));
++}
++
++/*
++ * Batcher bring-up, copied from exynos_speedy_probe()/program_batcher_fsm():
++ * release the semaphore, pulse the batcher reset, select the status bits the
++ * FSM watches, then wait until the FSM is idle or in its init state.
++ */
++static int
++a10_batcher_init(void)
++{
++	uint32_t con, state = 0;
++	int i;
++
++	a10_speedy_write(SPEEDY_INT_STATUS, 0xffffffffu);
++	a10_speedy_write(IPBATCHER_SEMA_REL, 1);
++
++	con = a10_speedy_read(IPBATCHER_CON);
++	a10_speedy_write(IPBATCHER_CON, con | 0x80000000u);
++	a10_speedy_write(IPBATCHER_CON, con & ~0x80000000u);
++
++	a10_speedy_write(IPBATCHER_FSM_UNEXPEN, 0x0007030eu);
++	a10_speedy_write(IPBATCHER_FSM_TXEN, 0x00000011u);
++	a10_speedy_write(IPBATCHER_FSM_RXFIFO, 0x00000040u);
++	a10_speedy_write(IPBATCHER_FSM_CON, 0x00000001u);
++
++	for (i = 0; i < 10000; i++) {
++		state = a10_speedy_read(IPBATCHER_STATE);
++		if (state & ((1u << 3) | (1u << 4))) {
++			return 0;
++		}
++		delay(10);
++	}
++
++	printf("A10 CODEC: batcher not idle, state=%08x con=%08x\n",
++	    state, a10_speedy_read(IPBATCHER_CON));
++	return ETIMEDOUT;
++}
++
++/*
++ * One random-access byte read of a COD3035X register.  The 12-bit SPEEDY
++ * address is (device << 8) | register; random access is bit 19 of the CMD
++ * payload, direction read is bit 20 = 0.
++ */
++static int
++a10_codec_read(uint8_t reg, uint8_t *out)
++{
++	uint32_t cmd, state = 0, intsts;
++	int i, rc = 0;
++
++	a10_speedy_write(IPBATCHER_CON, 0);
++	a10_speedy_write(IPBATCHER_CON, BATCHER_CON_ENABLE);
++
++	a10_speedy_write(BATCHER_OPCODE + 0x0, BATCHER_OPCODE0);
++	a10_speedy_write(BATCHER_OPCODE + 0x4, BATCHER_OPCODE1);
++
++	a10_speedy_write(BATCHER_PAYLOAD + 0x00, BATCHER_PAYLOAD_CTRL);
++	a10_speedy_write(BATCHER_PAYLOAD + 0x04, BATCHER_PAYLOAD_FIFO);
++	a10_speedy_write(BATCHER_PAYLOAD + 0x08, BATCHER_PAYLOAD_INTCLR);
++	a10_speedy_write(BATCHER_PAYLOAD + 0x0c, BATCHER_PAYLOAD_INTEN);
++
++	cmd = (((uint32_t)A10_CODEC_SPEEDY_DEV << 8) | (uint32_t)reg) << 7;
++	cmd |= (1u << 19);		/* ACCESS_RANDOM */
++	a10_speedy_write(BATCHER_PAYLOAD + 0x10, cmd);
++	a10_speedy_write(BATCHER_PAYLOAD + 0x14, 0x77);
++	a10_speedy_write(BATCHER_PAYLOAD + 0x18, 0x00);
++
++	a10_speedy_write(IPBATCHER_INT_EN, 1);
++	a10_speedy_write(IPBATCHER_CON, BATCHER_CON_START);
++
++	for (i = 0; i < 50000; i++) {
++		state = a10_speedy_read(IPBATCHER_STATE);
++		if (state & (BATCHER_STATE_DONE | BATCHER_STATE_UNEXP)) {
++			break;
++		}
++		delay(10);
++	}
++	a10_speedy_write(IPBATCHER_INT_EN, 0);
++
++	intsts = a10_speedy_read(IP_INT_STATUS);
++	if (!(state & BATCHER_STATE_DONE)) {
++		printf("A10 CODEC: reg %02x timeout state=%08x int=%08x\n",
++		    reg, state, intsts);
++		rc = ETIMEDOUT;
++	} else if (intsts & BATCHER_ERR_MASK) {
++		printf("A10 CODEC: reg %02x error state=%08x int=%08x\n",
++		    reg, state, intsts);
++		rc = EIO;
++	}
++
++	if (state & BATCHER_STATE_DONE) {
++		a10_speedy_write(IPBATCHER_STATE, state | BATCHER_STATE_DONE);
++	}
++	if (rc == 0) {
++		*out = (uint8_t)a10_speedy_read(BATCHER_PAYLOAD +
++		    BATCHER_RX_SLOT);
++	}
++	a10_speedy_write(IPBATCHER_CON, 0);
++	return rc;
++}
++
++/*
++ * Read the whole COD3035X register file and print it in the same 16-byte
++ * rows as the TWRP codec_speedy dump, so the two can be diffed directly.
++ */
++static void
++a10_codec_dump(void)
++{
++	char line[80];
++	uint8_t val;
++	unsigned reg, i;
++	int n, rc, failures = 0;
++
++	printf("A10 CODEC: COD3035X via SPEEDY batcher (dev %02x)\n",
++	    A10_CODEC_SPEEDY_DEV);
++
++	for (reg = 0; reg < 256; reg += 16) {
++		n = snprintf(line, sizeof(line), "A10 CODEC: %02x:", reg);
++		for (i = 0; i < 16; i++) {
++			val = 0xee;
++			rc = a10_codec_read((uint8_t)(reg + i), &val);
++			if (rc != 0) {
++				failures++;
++				n += snprintf(line + n, sizeof(line) - n,
++				    " ??");
++				if (failures >= 4) {
++					break;
++				}
++			} else {
++				n += snprintf(line + n, sizeof(line) - n,
++				    " %02x", val);
++			}
++		}
++		printf("%s\n", line);
++		if (failures >= 4) {
++			printf("A10 CODEC: dump stopped after %d errors\n",
++			    failures);
++			break;
++		}
++	}
+ }
+ 
+ int
+@@ -159,8 +342,12 @@
+ 	    a10_speedy_read(IPBATCHER_INT_EN), a10_speedy_read(IP_FIFO_STATUS),
+ 	    a10_speedy_read(IP_INT_STATUS));
+ 
++	if (a10_batcher_init() == 0) {
++		a10_codec_dump();
++	}
++
+ 	a10_audio_ready = true;
+-	printf("A10 AUDIO: probe done (APM gate + SPEEDY registers)\n");
++	printf("A10 AUDIO: probe done (APM gate + SPEEDY + codec dump)\n");
+ 	return 0;
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */

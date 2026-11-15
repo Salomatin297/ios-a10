@@ -2,6 +2,50 @@
 
 ## >>> A10 PORT (Samsung Galaxy A10, SM-A105F) - active work 2026-11-13 <<<
 
+### >>> UPDATE 2026-11-15: probe73 в работе, кодек жив, ABOX требует прошивку до probe <<<
+
+**probe73 снят (TWRP):** `dist/logs/probe73/a10-sweetlog.txt` (541 846 Б,
+seq=3804). `2/2 CPUs` (A53 `0x100` + A73 `0x0`), SGI1 verified, паники нет.
+`A10 AUDIO`: qch `003f0002`→`003f0003`, gate `00200000`→`00300000`;
+SPEEDY `ctrl=00000001 fifo_ctrl=00001111 cmd=00088300 int_en=0007030e
+int_status=00000010`; `fifo_status=00000040 pkt_gap=0000000f timeout=0000ffff
+ctrl_status=00000202`; batcher `con=00000000 state=00100008 int_en=00000000
+fifo=00000000 int_status=00000000`.
+
+**Кодек COD3035X жив.** В TWRP через `/sys/class/codec_speedy/codec_sysfs`
+(ACPM, адрес `0x07`) снят полный дамп 256 регистров; ключевые: `0x3D=D7`,
+`0x44=FF`, `0x84=BE`, `0x8D..0x8F=C0`, `0x9A=01`, `0xA6=42`, `0xB0=A0`,
+`0xBE=60`. Кодек уже инициализирован и питается (LDO36, always-on),
+поэтому для XNU достаточно доступа к SPEEDY: для чтения регистров
+инициализация кодекa не нужна.
+
+**ABOX:** firmware `calliope_sram.bin`/`calliope_dram.bin` из vendor.img
+положены в `/vendor/firmware` в TWRP, но драйвер уже сделал запрос при
+probe (1.9 с) и не повторяет его. Попытка `unbind`/`bind` драйвера
+`samsung-abox` привела к панике ядра (pstore `dmesg-ramoops-0`, reboot);
+`/vendor` в TWRP — tmpfs, после перезагрузки firmware снова нет.
+Вывод: в TWRP ABOX не перепроверить; firmware надо грузить в XNU
+самостоятельно (recovery трогать нельзя).
+
+**Touch firmware:** в TWRP `sec_ts` загружает `tsp_sec/s6d7at0b01_a10.fw`
+(120 144 Б) на 2.26 с, до запуска init; в ramdisk и на разделах system/vendor
+файла нет (system/vendor на телефоне пустые, только `lost+found`). Вероятно,
+прошивка встроена в ядро TWRP (`CONFIG_EXTRA_FIRMWARE`). Для XNU она не
+критична: тач уже работает с прошивкой, залитой загрузчиком/stock.
+
+**probe74 (патч 0140):** в `a10_audio.c` добавлен IP-batcher:
+`SEMA_REL=1`, сброс `CON` bit31, `FSM_UNEXPEN=0x7030E`, `FSM_TXEN=0x11`,
+`FSM_RXFIFO=0x40`, `FSM_CON=1`; на каждое чтение — опкоды
+`0x0C100400`/`0xFFFF3808`, payload
+`0x30051`/`0x80000101`/`0xFFFFFFFF`/`0x7030E`/`(addr<<7|1<<19)`/`0x77`/`0`,
+START, poll `STATE` bit0, результат в payload slot 5 (`0x1014`). Читаются
+все 256 регистров COD3035X (dev `0x03`) и печатаются рядами по 16 для
+сравнения с ACPM-дампом. CI/образ — заполнить после сборки.
+
+**Следующее:** собрать probe74 (CI), прошить, сравнить дамп с TWRP;
+затем ABOX: включение `pd-dispaud` (SMC), загрузка firmware из
+iOS-раздела, UAIF/RDMA. Параллельно проверить `sweetlog=0` для скорости.
+
 ### >>> UPDATE 2026-11-14 (вечер, A73): загрузочное ядро — A53, ровно 2×A73 невозможны <<<
 
 **Проверено по логу probe65:** рабочие 2 ядра — это A53 `0x100`/`0x101`
