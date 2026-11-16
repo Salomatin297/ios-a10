@@ -1,9 +1,9 @@
 diff --git a/iokit/Kernel/arm/SweetMali.cpp b/iokit/Kernel/arm/SweetMali.cpp
 new file mode 100644
-index 0000000..3cc7ef1
+index 0000000..5c10138
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetMali.cpp
-@@ -0,0 +1,1318 @@
+@@ -0,0 +1,1319 @@
 +/*
 + * SweetMali for the A10 (Exynos 7884B): a kernel driver for the Mali-G71 MP2
 + * at 0x11500000, shaped after Linux panfrost (drivers/gpu/drm/panfrost) and
@@ -323,8 +323,8 @@ index 0000000..3cc7ef1
 +		return NULL;
 +	}
 +	if (kmem_alloc(kernel_map, &page, PAGE_SIZE,
-+	    KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) !=
-+	    KERN_SUCCESS) {
++	    (kma_flags_t)(KMA_KOBJECT | KMA_ZERO | KMA_DATA),
++	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
 +		return NULL;
 +	}
 +	*pa = (uint64_t)kvtophys(page);
@@ -445,7 +445,7 @@ index 0000000..3cc7ef1
 +mmu_setup(void)
 +{
 +	for (unsigned as = 0; as < 8; as++) {
-+		vm_offset_t base = AS(0, 0) + as * 0x40;
++		uint32_t base = (uint32_t)(AS(0, 0) + as * 0x40);
 +
 +		if (!poll(g_gpu, base + AS_STATUS, 1, 0, 50)) {
 +			continue;
@@ -802,7 +802,7 @@ index 0000000..3cc7ef1
 +	}
 +	thread_deallocate(th);
 +	g_q_on = true;
-+	IOLog("SWEET MALI: job queue on (%u entries)\n", MALI_QLEN);
++	IOLog("SWEET MALI: job queue on (%u entries)\n", (unsigned)MALI_QLEN);
 +}
 +
 +/* ---- buffer objects ------------------------------------------------------ */
@@ -959,7 +959,8 @@ index 0000000..3cc7ef1
 +	dc_civac(mem, 16384);
 +	uint32_t got = *(uint32_t *)(void *)(mem + 0x800);
 +	IOLog("SWEET MALI: self-test job at gpu 0x%llx: 0x%x in %llu us, "
-+	    "header 0x%x, word 0x%08x -> %s\n", bo->gpuVA, r, us, w[0], got,
++	    "header 0x%x, word 0x%08x -> %s\n", bo->gpuVA, (unsigned)r, us, w[0],
++	    got,
 +	    (r == kIOReturnSuccess && got == value) ? "THE GPU RAN IT" :
 +	    "FAILED");
 +	bo->release();
