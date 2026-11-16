@@ -221,6 +221,11 @@ jobs:
           need dxb/xnu/bsd/dev/a10_audio.c 'smmu v%u fault ar' present '0145 SYSMMU v7 fault registers'
           need dxb/xnu/bsd/dev/a10_touch.c 'a10_touch_wait_app_mode' present '0156 touch bring-up waits for app mode'
           need dxb/xnu/bsd/dev/a10_touch.c 'SEC_TS_CMD_SET_TOUCHFUNC' present '0156 touch function mask before sense-on'
+          need dxb/xnu/config/MASTER.arm64.sweet 'vm_pressure_events jetsam memorystatus' present '0157 jetsam in VM_BASE'
+          need dxb/xnu/bsd/kern/kern_memorystatus.c 'A10 JETSAM: on' present '0157 A10 jetsam override'
+          need dxb/xnu/iokit/Kernel/arm/SweetMali.cpp 'SweetMali published' present '0158 A10 Mali driver'
+          need dxb/xnu/iokit/conf/files.arm64 'SweetMali.cpp' present '0158 Mali driver in the build'
+          need dxb/xnu/iokit/Kernel/arm/SweetSurface.cpp 'sweet_mali_publish' present '0158 Mali driver published'
           if [ "$fail" -ne 0 ]; then
             echo "::error::A10 port patches did not apply cleanly"
             exit 1

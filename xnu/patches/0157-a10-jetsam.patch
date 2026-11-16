@@ -1,0 +1,76 @@
+diff --git a/bsd/kern/kern_memorystatus.c b/bsd/kern/kern_memorystatus.c
+index 1750d3a..fcf8842 100644
+--- a/bsd/kern/kern_memorystatus.c
++++ b/bsd/kern/kern_memorystatus.c
+@@ -45,6 +45,9 @@
+ #include <mach/host_priv.h>
+ #include <mach/mach_host.h>
+ #include <pexpert/pexpert.h>
++#if defined(__arm64__)
++#include <pexpert/arm64/board_config.h>     /* A10: ARM64_BOARD_CONFIG_SWEET */
++#endif
+ #include <sys/coalition.h>
+ #include <sys/kern_event.h>
+ #include <sys/proc.h>
+@@ -1358,6 +1361,26 @@ memorystatus_init(void)
+ 		    memorystatus_jetsam_proc_size_panic);
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * A10: this userland is an iPhone X (3 GB) build and the phone has
++	 * 2 GB, so the per-process high-water limits are too generous and
++	 * kill the wrong things.  Band-based low-memory jetsam stays on:
++	 * without it launchd's SET_JETSAM_HIGH_WATER_MARK returns EINVAL,
++	 * nothing reclaims memory, and with no writable swap volume the VM
++	 * can only drop file pages (the log shows "Failed to open swap file
++	 * 2" and repeated full eMMC re-reads).  sweet_memlimits=1 restores
++	 * the per-process limits.
++	 */
++	{
++		int limits = 0;
++		PE_parse_boot_argn("sweet_memlimits", &limits, sizeof(limits));
++		memorystatus_highwater_enabled = limits ? 1 : 0;
++		printf("A10 JETSAM: on, per-process memory limits %s\n",
++		    limits ? "on" : "off (sweet_memlimits=0)");
++	}
++#endif
++
+ 	/* Apply overrides */
+ 	if (!PE_parse_boot_argn("kern.jetsam_delta", &delta_percentage, sizeof(delta_percentage))) {
+ 		PE_get_default("kern.jetsam_delta", &delta_percentage, sizeof(delta_percentage));
+diff --git a/config/MASTER.arm64.sweet b/config/MASTER.arm64.sweet
+index e305f0d..316fa86 100644
+--- a/config/MASTER.arm64.sweet
++++ b/config/MASTER.arm64.sweet
+@@ -77,7 +77,7 @@
+ #  SCHED_RELEASE =  [ SCHED_BASE ]
+ #  SCHED_DEV =      [ SCHED_BASE ]
+ #  SCHED_DEBUG =    [ SCHED_BASE config_sched_grrr config_sched_proto ]
+-#  VM_BASE =        [ vm_pressure_events memorystatus config_code_decryption encrypted_swap config_deferred_reclaim ]
++#  VM_BASE =        [ vm_pressure_events jetsam memorystatus config_code_decryption encrypted_swap config_deferred_reclaim ]
+ #  VM_RELEASE =     [ VM_BASE ]
+ #  VM_DEV =         [ VM_BASE dynamic_codesigning pgzalloc ]
+ #  VM_DEBUG =       [ VM_BASE dynamic_codesigning pgzalloc ]
+diff --git a/osfmk/vm/vm_compressor_backing_store.c b/osfmk/vm/vm_compressor_backing_store.c
+index a645750..e3fa7b6 100644
+--- a/osfmk/vm/vm_compressor_backing_store.c
++++ b/osfmk/vm/vm_compressor_backing_store.c
+@@ -420,6 +420,17 @@ vm_swap_decrypt(c_segment_t c_seg)
+ uint64_t compressed_swap_chunk_size, vm_swapfile_hiwater_segs, swapfile_reclaim_threshold_segs, swapfile_reclam_minimum_segs;
+ extern bool memorystatus_swap_all_apps;
+ 
++#if CONFIG_JETSAM && !defined(VM_MAX_SWAP_FILE_SWAP_ENABLED_NUM)
++/*
++ * A10: CONFIG_JETSAM on a macOS-target build (MASTER.arm64.sweet); these
++ * come from the !XNU_TARGET_OS_OSX block above.  App swap is never enabled
++ * here, but the code below still has to compile.
++ */
++#define VM_MAX_SWAP_FILE_SWAP_ENABLED_NUM VM_MAX_SWAP_FILE_NUM
++#define VM_MIN_SWAP_FILE_SWAP_ENABLED_NUM VM_MAX_SWAP_FILE_NUM
++#define VM_SWAP_MIN_VOLUME_CAPACITY (128ULL * (1ULL << 30))
++#endif
++
+ void
+ vm_compressor_swap_init_swap_file_limit(void)
+ {

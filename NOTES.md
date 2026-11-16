@@ -1512,3 +1512,43 @@ What it took today (in order): 0058 HID services (Apple IOHIDFamily-1915 user cl
      cpu_init, before arm_vm_init.
   5. panic hook at top of panic_trap_to_debugger: va_copy + _doprnt(fmt, &copy, sweet_early_putc, 16).
   Verify with tools/xnu-cc.py (compile+symbols) and patch-order simulation before the single CI run.
+
+## Status 2026-11-16 late: probe81 GPU shapes, touch, jetsam, SweetMali
+
+- probe81 (a10gpu=1 a10audio=1 a10audio_diag=1 a10prof=15): **all six GPU table
+  shapes ran** (stock AArch64, stock + PTW outer-shareable, Panfrost AArch64
+  INA 7, Mali LPAE attr 0/1, A21s three-level), each followed by a successful
+  identity control job.  The loader leaves AS0..AS3 unmapped (transtab 0,
+  transcfg 0), so every shape is written into all four spaces and the GPU is
+  reset before each: a faulted Bifrost slot stays faulted.  Chosen format for
+  the driver: the stock kbase one, TRANSTAB = bare table PA, TRANSCFG
+  0x02000006, MEMATTR 0x8d888f88, tables phys|0x403, leaves phys|0x743.
+- probe81 profiler: 11776 ticks over 2 CPUs, top CPU SpringBoard 1955,
+  kernel_task 1488, locationd 548, backboardd 529; the system is not CPU
+  saturated, so latency/serialisation and the missing GPU offload dominate.
+  Panel copy is 3-6 ms per present, not the limiter (many 10 s windows show 0
+  swaps on a static screen).
+- probe81 touch: the 0156 bring-up works (ID `ac 7a 70 ff ff`, boot status 20,
+  SET_TOUCHFUNCTION 61 00, sense-on), then the bit-banged bus fails under app
+  launch load and the driver power-cycles.  One MOVE event was parsed; the IC
+  queue had 63 stale events.  0156 adds preemption-protected transactions; if
+  it still loses the bus the next step is the HSI2C controller
+  (hsi2c@13930000, USI mode 0x10032000 <- 3, 400 kHz), not more bit-banging.
+- 0157 (jetsam): MASTER.arm64.sweet is MacOSX-based and its VM_BASE had no
+  jetsam, so launchd's SET_JETSAM_HIGH_WATER_MARK returned EINVAL, nothing
+  reclaimed memory and with no writable swap volume the VM only dropped file
+  pages.  0157 adds `jetsam` to VM_BASE, the macOS-target swap-file macros in
+  vm_compressor_backing_store.c and an A10 override that keeps band-based
+  jetsam on with the iPhone X per-process high-water limits off
+  (`sweet_memlimits=1` restores them).
+- 0158 (SweetMali): the a510f Mali driver ported to the G71 -- pd-g3d through
+  PMU 0x40a0/0x40a4, CMU_TOP/CMU_G3D gates and QCH, soft reset, 4-level
+  AArch64 tables in the stock kbase format, 64 KB-granule VA allocator with
+  the 16 MiB shader window, BOs from IOBufferMemoryDescriptor mapped
+  write-combined into the client, queued submits (selector 17) with a worker
+  thread, selector 18 waits, panfrost GET_PARAM values, WRITE_VALUE self-test.
+  Opt-in: `sweetmali=1`.  Next: Mesa 26.2.4 panfrost + sweet_drm_pan.c +
+  the sailfish EAGL shim, delivered as a dyld insert into backboardd.
+- CI note: a push cancels the queued/running build (concurrency group), so
+  patches are pushed one batch at a time and the artifact is downloaded before
+  the next push.

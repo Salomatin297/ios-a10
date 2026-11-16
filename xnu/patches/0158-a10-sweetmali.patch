@@ -1,0 +1,1362 @@
+diff --git a/iokit/Kernel/arm/SweetMali.cpp b/iokit/Kernel/arm/SweetMali.cpp
+new file mode 100644
+index 0000000..3cc7ef1
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetMali.cpp
+@@ -0,0 +1,1318 @@
++/*
++ * SweetMali for the A10 (Exynos 7884B): a kernel driver for the Mali-G71 MP2
++ * at 0x11500000, shaped after Linux panfrost (drivers/gpu/drm/panfrost) and
++ * after the a510f SweetMali that proved the same design on XNU with a
++ * Mali-T720.  Mesa's panfrost driver talks to it through the DRM emulation
++ * in sweet_drm_pan.c (user space, selectors 10-18).
++ *
++ * Hardware facts come from probe77/probe79/probe81 (bsd/dev/a10_gpu.c):
++ *   GPU_ID 0x60a00002 (Bifrost G71), 2 shader cores (SHADER_PRESENT 3),
++ *   1 tiler, 1 L2, 3 job slots, 8 address spaces, MMU_FEATURES 0x2830
++ *   (48-bit VA, 40-bit PA), the pd-g3d local power domain in the PMU at
++ *   0x11c840a0 (status 0x40a4), CMU_G3D at 0x11400000, the CORE_G3D gate in
++ *   CMU_TOP at 0x12060000.
++ *
++ * The MMU format is the stock Samsung kbase one for this exact GPU, the
++ * shape probe81 proved: 4-level AArch64 4K tables, table entry phys|0x403,
++ * leaf phys|0x743, TRANSTAB = the bare table PA, TRANSCFG = 0x02000006
++ * (ADRMODE_AARCH64_4K | PTW_MEMATTR_WRITE_BACK), MEMATTR = 0x8d888f88.
++ *
++ * Jobs: one address space (AS0) for every client.  Submits are queued
++ * (selector 17) and run in order by a worker thread, so the CPU builds the
++ * next render pass while the GPU runs the current one; selector 13 is the
++ * synchronous path.  A failing job is hard-stopped and the GPU reset.
++ */
++
++#include <pexpert/arm64/board_config.h>
++
++#if defined(ARM64_BOARD_CONFIG_SWEET) && defined(SWEET_GICV2)
++
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/IOLocks.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
++#include <IOKit/IOMemoryDescriptor.h>
++#include <libkern/c++/OSArray.h>
++#include <libkern/c++/OSNumber.h>
++#include <pexpert/pexpert.h>
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <string.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <mach/vm_statistics.h>
++#include <vm/vm_kern.h>
++#include <IOKit/system.h>
++#include <sys/proc.h>
++
++#include "SweetSurface.h"
++
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern "C" uint64_t kvtophys(vm_offset_t va);
++extern "C" vm_offset_t phystokv(uint64_t pa);
++extern "C" void FlushPoC_DcacheRegion(vm_offset_t, size_t);
++extern "C" void sweet_mali_publish(IOService *provider);
++extern "C" kern_return_t kernel_thread_start(void (*)(void *, int), void *,
++    thread_t *);
++extern "C" void thread_deallocate(thread_t);
++
++/* ---- hardware ------------------------------------------------------------ */
++
++#define A10_MALI_PA             0x11500000u
++#define A10_MALI_SIZE           0x5000u
++#define A10_PMU_PA              0x11c80000u
++#define A10_PMU_SIZE            0x10000u
++#define A10_PMU_G3D_CONF        0x40a0u
++#define A10_PMU_G3D_STAT        0x40a4u
++#define A10_CMU_TOP_PA          0x12060000u
++#define A10_CMU_TOP_SIZE        0x8000u
++#define A10_CMU_G3D_PA          0x11400000u
++#define A10_CMU_G3D_SIZE        0x8000u
++
++#define A10_TOP_CORE_G3D_GATE   0x2024u
++#define A10_GATE_MANUAL         (1u << 20)
++#define A10_GATE_CG_VAL         (1u << 21)
++#define A10_G3D_PLL_CON0        0x0120u
++
++static const uint16_t a10_g3d_gates[] = {
++	0x2004, 0x2014, 0x2018, 0x201c, 0x2020, 0x2024,
++	0x2028, 0x202c, 0x2030, 0x2034, 0x2038,
++};
++static const uint16_t a10_g3d_qch[] = {
++	0x3000, 0x3004, 0x3008, 0x300c, 0x3010, 0x3014, 0x3018,
++};
++
++#define GPU_ID                  0x000
++#define GPU_INT_RAWSTAT         0x020
++#define GPU_INT_CLEAR           0x024
++#define GPU_INT_MASK            0x028
++#define GPU_CMD                 0x030
++#define GPU_STATUS              0x034
++#define SHADER_PRESENT          0x100
++#define TILER_PRESENT           0x110
++#define L2_PRESENT              0x120
++#define SHADER_READY            0x140
++#define TILER_READY             0x150
++#define L2_READY                0x160
++#define SHADER_PWRON            0x180
++#define TILER_PWRON             0x190
++#define L2_PWRON                0x1a0
++#define SHADER_PWROFF           0x1c0
++#define TILER_PWROFF            0x1d0
++#define L2_PWROFF               0x1e0
++#define JOB_INT_RAWSTAT         0x1000
++#define JOB_INT_CLEAR           0x1004
++#define JOB_INT_MASK            0x1008
++#define MMU_INT_RAWSTAT         0x2000
++#define MMU_INT_CLEAR           0x2004
++#define MMU_INT_MASK            0x2008
++
++#define IRQ_RESET_COMPLETED     (1u << 8)
++#define GPU_CMD_SOFT_RESET      1u
++#define GPU_CMD_CLEAN_INV_CACHES 4u
++#define IRQ_CLEAN_CACHES_DONE   (1u << 17)
++
++#define JS(n, r)                (0x1800 + (n) * 0x80 + (r))
++#define JS_HEAD                 0x00
++#define JS_STATUS               0x24
++#define JS_COMMAND              0x20
++#define JS_HEAD_NEXT            0x40
++#define JS_AFFINITY_NEXT        0x50
++#define JS_CONFIG_NEXT          0x58
++#define JS_COMMAND_NEXT         0x60
++
++#define AS(n, r)                (0x2400 + (n) * 0x40 + (r))
++#define AS_TRANSTAB_LO          0x00
++#define AS_TRANSTAB_HI          0x04
++#define AS_MEMATTR_LO           0x08
++#define AS_MEMATTR_HI           0x0c
++#define AS_TRANSCFG_LO          0x30
++#define AS_TRANSCFG_HI          0x34
++#define AS_LOCKADDR_LO          0x10
++#define AS_LOCKADDR_HI          0x14
++#define AS_COMMAND              0x18
++#define AS_FAULTSTATUS          0x1c
++#define AS_FAULTADDRESS_LO      0x20
++#define AS_FAULTADDRESS_HI      0x24
++#define AS_STATUS               0x28
++
++#define AS_COMMAND_UPDATE       1
++#define AS_COMMAND_LOCK         2
++#define AS_COMMAND_FLUSH_PT     4
++#define AS_COMMAND_FLUSH_MEM    5
++
++/* Stock kbase format for this GPU (probe81 shape 1). */
++#define MALI_PTE_TABLE          ((1ull << 10) | 3ull)
++#define MALI_PTE_LEAF           ((1ull << 10) | (3ull << 8) | (1ull << 6) | 3ull)
++#define MALI_TRANSCFG           0x02000006u
++#define MALI_MEMATTR            0x8d888f88u
++
++#define MALI_VA_BASE            0x10000000ull
++#define MALI_VA_LIMIT           0x1f0000000ull
++#define MALI_MAX_TABLES         3072
++#define MALI_TIMEOUT_MS         2000
++
++#define JS_CONFIG_VAL           ((8u << 16) | (3u << 8) | (3u << 12))
++
++static vm_offset_t g_gpu, g_pmu, g_top, g_g3d;
++static uint32_t g_shader, g_tiler, g_l2;
++static bool g_ready;
++static IOLock *g_lock;
++static uint64_t *g_l0;
++static uint64_t g_l0_pa;
++static SInt64 g_bo_bytes;
++static SInt32 g_bo_count;
++
++static inline uint32_t
++rd(vm_offset_t b, uint32_t o)
++{
++	uint32_t v = *(volatile uint32_t *)(b + o);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static inline void
++wr(vm_offset_t b, uint32_t o, uint32_t v)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(b + o) = v;
++}
++
++static bool
++poll(vm_offset_t b, uint32_t off, uint32_t mask, uint32_t want, int ms)
++{
++	for (int i = 0; i < ms * 10; i++) {
++		if ((rd(b, off) & mask) == want) {
++			return true;
++		}
++		IODelay(100);
++	}
++	return false;
++}
++
++static void
++dc_civac(const void *p, size_t len)
++{
++	uintptr_t a = (uintptr_t)p & ~(uintptr_t)63, end = (uintptr_t)p + len;
++	for (; a < end; a += 64) {
++		__asm__ volatile ("dc civac, %0" : : "r"(a) : "memory");
++	}
++	__asm__ volatile ("dsb sy" : : : "memory");
++}
++
++/* ---- GPU power, clock, reset (probe77/probe81) --------------------------- */
++
++static bool
++gpu_domain_on(void)
++{
++	uint32_t conf, stat;
++
++	if ((rd(g_pmu, A10_PMU_G3D_STAT) & 0xfu) == 0xfu) {
++		return true;
++	}
++	conf = rd(g_pmu, A10_PMU_G3D_CONF);
++	wr(g_pmu, A10_PMU_G3D_CONF, conf | 0xfu);
++	if (!poll(g_pmu, A10_PMU_G3D_STAT, 0xf, 0xf, 100)) {
++		stat = rd(g_pmu, A10_PMU_G3D_STAT);
++		IOLog("SWEET MALI: pd-g3d did not come up (status 0x%x)\n", stat);
++		return false;
++	}
++	return true;
++}
++
++static void
++gpu_clock_on(void)
++{
++	uint32_t v;
++
++	/* MANUAL=1 makes CG_VAL the switch, CG_VAL=1 passes the clock. */
++	v = rd(g_top, A10_TOP_CORE_G3D_GATE);
++	wr(g_top, A10_TOP_CORE_G3D_GATE, v | A10_GATE_MANUAL | A10_GATE_CG_VAL);
++	for (unsigned i = 0; i < sizeof(a10_g3d_gates) / sizeof(a10_g3d_gates[0]); i++) {
++		v = rd(g_g3d, a10_g3d_gates[i]);
++		wr(g_g3d, a10_g3d_gates[i], v | A10_GATE_MANUAL | A10_GATE_CG_VAL);
++	}
++	/* QCH ENABLE=1 skips the request machinery. */
++	for (unsigned i = 0; i < sizeof(a10_g3d_qch) / sizeof(a10_g3d_qch[0]); i++) {
++		v = rd(g_g3d, a10_g3d_qch[i]);
++		wr(g_g3d, a10_g3d_qch[i], v | 1u | (1u << 1));
++	}
++}
++
++static bool
++gpu_reset(void)
++{
++	wr(g_gpu, GPU_INT_MASK, 0);
++	wr(g_gpu, JOB_INT_MASK, 0);
++	wr(g_gpu, MMU_INT_MASK, 0);
++	wr(g_gpu, GPU_INT_CLEAR, 0xffffffffu);
++	wr(g_gpu, JOB_INT_CLEAR, 0xffffffffu);
++	wr(g_gpu, MMU_INT_CLEAR, 0xffffffffu);
++	wr(g_gpu, GPU_CMD, GPU_CMD_SOFT_RESET);
++	if (!poll(g_gpu, GPU_INT_RAWSTAT, IRQ_RESET_COMPLETED,
++	    IRQ_RESET_COMPLETED, 100)) {
++		IOLog("SWEET MALI: soft reset timeout, rawstat 0x%x status 0x%x\n",
++		    rd(g_gpu, GPU_INT_RAWSTAT), rd(g_gpu, GPU_STATUS));
++		return false;
++	}
++	wr(g_gpu, GPU_INT_CLEAR, 0xffffffffu);
++	/*
++	 * Empty the L2: a stale line for a physical page the GPU has seen
++	 * before would hide the job or the tables the CPU just wrote.  The
++	 * completion interrupt never arrives on this part (probe81: rawstat
++	 * stays 0) but the command is not needed for correctness of the
++	 * first job after a reset, so it is fire-and-forget.
++	 */
++	wr(g_gpu, GPU_CMD, GPU_CMD_CLEAN_INV_CACHES);
++	(void)poll(g_gpu, GPU_INT_RAWSTAT, IRQ_CLEAN_CACHES_DONE,
++	    IRQ_CLEAN_CACHES_DONE, 20);
++	wr(g_gpu, GPU_INT_CLEAR, 0xffffffffu);
++	return true;
++}
++
++/* The cores the reset may have switched off, on again. */
++static bool
++gpu_cores_on(void)
++{
++	g_l2 = rd(g_gpu, L2_PRESENT);
++	g_tiler = rd(g_gpu, TILER_PRESENT);
++	g_shader = rd(g_gpu, SHADER_PRESENT);
++	if (g_l2 == 0 || g_tiler == 0 || g_shader == 0) {
++		return false;
++	}
++	if ((rd(g_gpu, L2_READY) & g_l2) != g_l2) {
++		wr(g_gpu, L2_PWRON, g_l2);
++		if (!poll(g_gpu, L2_READY, g_l2, g_l2, 50)) {
++			return false;
++		}
++	}
++	if ((rd(g_gpu, TILER_READY) & g_tiler) != g_tiler) {
++		wr(g_gpu, TILER_PWRON, g_tiler);
++		if (!poll(g_gpu, TILER_READY, g_tiler, g_tiler, 50)) {
++			return false;
++		}
++	}
++	if ((rd(g_gpu, SHADER_READY) & g_shader) != g_shader) {
++		wr(g_gpu, SHADER_PWRON, g_shader);
++		if (!poll(g_gpu, SHADER_READY, g_shader, g_shader, 50)) {
++			return false;
++		}
++	}
++	return true;
++}
++
++/* ---- page tables --------------------------------------------------------- */
++
++static uint64_t *g_tables_va[MALI_MAX_TABLES];
++static uint64_t g_tables_pa[MALI_MAX_TABLES];
++static unsigned g_ntables;
++
++static uint64_t *
++table_alloc(uint64_t *pa)
++{
++	vm_offset_t page = 0;
++
++	if (g_ntables >= MALI_MAX_TABLES) {
++		return NULL;
++	}
++	if (kmem_alloc(kernel_map, &page, PAGE_SIZE,
++	    KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) !=
++	    KERN_SUCCESS) {
++		return NULL;
++	}
++	*pa = (uint64_t)kvtophys(page);
++	FlushPoC_DcacheRegion(page, PAGE_SIZE);
++	g_tables_va[g_ntables] = (uint64_t *)page;
++	g_tables_pa[g_ntables] = *pa;
++	g_ntables++;
++	return (uint64_t *)page;
++}
++
++static uint64_t *
++table_va(uint64_t pa)
++{
++	for (unsigned i = 0; i < g_ntables; i++) {
++		if (g_tables_pa[i] == pa) {
++			return g_tables_va[i];
++		}
++	}
++	return NULL;
++}
++
++/* The leaf entry for va, tables created on the way when create. */
++static uint64_t *
++pte(uint64_t va, bool create)
++{
++	uint64_t *t = g_l0;
++	static const unsigned shift[4] = { 39, 30, 21, 12 };
++
++	for (int lvl = 0; lvl < 3; lvl++) {
++		unsigned idx = (unsigned)((va >> shift[lvl]) & 0x1ff);
++		uint64_t e = t[idx];
++		if ((e & 3) != 3) {
++			if (!create) {
++				return NULL;
++			}
++			uint64_t npa;
++			uint64_t *n = table_alloc(&npa);
++			if (n == NULL) {
++				return NULL;
++			}
++			t[idx] = npa | MALI_PTE_TABLE;
++			dc_civac(&t[idx], 8);
++			t = n;
++		} else {
++			t = table_va(e & 0x0000fffffffff000ull);
++			if (t == NULL) {
++				return NULL;
++			}
++		}
++	}
++	return &t[(va >> 12) & 0x1ff];
++}
++
++static bool
++as_wait(void)
++{
++	return poll(g_gpu, AS(0, AS_STATUS), 1, 0, 100);
++}
++
++/* panfrost_mmu.c lock_region + operation. */
++static void
++as_op(uint64_t va, uint64_t size, uint32_t cmd)
++{
++	uint64_t end = va + (size ? size : 1) - 1;
++	unsigned width = 15;
++
++	while (width < 63 && ((va >> width) != (end >> width))) {
++		width++;
++	}
++	uint64_t region = (va & ~((1ull << width) - 1)) | (width - 1);
++	as_wait();
++	wr(g_gpu, AS(0, AS_LOCKADDR_LO), (uint32_t)region);
++	wr(g_gpu, AS(0, AS_LOCKADDR_HI), (uint32_t)(region >> 32));
++	wr(g_gpu, AS(0, AS_COMMAND), AS_COMMAND_LOCK);
++	as_wait();
++	wr(g_gpu, AS(0, AS_COMMAND), cmd);
++	as_wait();
++}
++
++static bool
++gpu_map(uint64_t va, IOMemoryDescriptor *md, uint64_t size)
++{
++	for (uint64_t off = 0; off < size; off += 4096) {
++		IOByteCount len = 0;
++		addr64_t pa = md->getPhysicalSegment(off, &len,
++		    kIOMemoryMapperNone);
++		uint64_t *p = pte(va + off, true);
++		if (pa == 0 || p == NULL) {
++			return false;
++		}
++		*p = (pa & ~0xfffull) | MALI_PTE_LEAF;
++		dc_civac(p, 8);
++	}
++	as_op(va, size, AS_COMMAND_FLUSH_PT);
++	return true;
++}
++
++static void
++gpu_unmap(uint64_t va, uint64_t size)
++{
++	for (uint64_t off = 0; off < size; off += 4096) {
++		uint64_t *p = pte(va + off, false);
++		if (p != NULL) {
++			*p = 0;
++			dc_civac(p, 8);
++		}
++	}
++	as_op(va, size, AS_COMMAND_FLUSH_PT);
++}
++
++/*
++ * Point every address space at the new table set.  The loader leaves all
++ * four spaces unmapped (probe81: transtab 0, transcfg 0), and a job slot is
++ * told its space by the low bits of JS_CONFIG, so AS0 alone would be enough
++ * -- but writing all of them costs nothing and removes a class of doubt.
++ */
++static bool
++mmu_setup(void)
++{
++	for (unsigned as = 0; as < 8; as++) {
++		vm_offset_t base = AS(0, 0) + as * 0x40;
++
++		if (!poll(g_gpu, base + AS_STATUS, 1, 0, 50)) {
++			continue;
++		}
++		wr(g_gpu, base + AS_COMMAND, AS_COMMAND_FLUSH_MEM);
++		(void)poll(g_gpu, base + AS_STATUS, 1, 0, 50);
++		wr(g_gpu, base + AS_TRANSTAB_LO, (uint32_t)g_l0_pa);
++		wr(g_gpu, base + AS_TRANSTAB_HI, (uint32_t)(g_l0_pa >> 32));
++		wr(g_gpu, base + AS_TRANSCFG_LO, MALI_TRANSCFG);
++		wr(g_gpu, base + AS_TRANSCFG_HI, 0);
++		wr(g_gpu, base + AS_MEMATTR_LO, MALI_MEMATTR);
++		wr(g_gpu, base + AS_MEMATTR_HI, 0);
++		wr(g_gpu, base + AS_COMMAND, AS_COMMAND_UPDATE);
++		if (!poll(g_gpu, base + AS_STATUS, 1, 0, 100)) {
++			IOLog("SWEET MALI: AS%u update timeout, status 0x%x\n",
++			    as, rd(g_gpu, base + AS_STATUS));
++			return false;
++		}
++	}
++	return true;
++}
++
++/* ---- GPU virtual addresses ----------------------------------------------- */
++
++/*
++ * 64 KB granules, first fit from the bottom, freed ranges reused.  A bump
++ * pointer would never give VA back: Mesa's bo churn used up the table pool
++ * and every CREATE_BO then failed (a510f, kernel 49).
++ */
++#define VA_GRAN         0x10000ull
++#define VA_SLOTS        ((MALI_VA_LIMIT - MALI_VA_BASE) / VA_GRAN)
++static uint64_t g_va_bits[(VA_SLOTS + 63) / 64];
++static uint64_t g_va_used;
++
++static inline bool
++va_bit(uint64_t i)
++{
++	return (g_va_bits[i / 64] >> (i % 64)) & 1;
++}
++
++static void
++va_set(uint64_t first, uint64_t n, bool on)
++{
++	for (uint64_t i = first; i < first + n; i++) {
++		if (on) {
++			g_va_bits[i / 64] |= 1ull << (i % 64);
++		} else {
++			g_va_bits[i / 64] &= ~(1ull << (i % 64));
++		}
++	}
++	g_va_used = on ? g_va_used + n : g_va_used - n;
++}
++
++static uint64_t
++va_alloc(uint64_t size)
++{
++	uint64_t n = (size + VA_GRAN - 1) / VA_GRAN, run = 0;
++
++	for (uint64_t i = 0; i < VA_SLOTS; i++) {
++		if (g_va_bits[i / 64] == ~0ull && i % 64 == 0) {
++			i += 63;
++			run = 0;
++			continue;
++		}
++		run = va_bit(i) ? 0 : run + 1;
++		if (run == n) {
++			uint64_t first = i + 1 - n;
++			va_set(first, n, true);
++			return MALI_VA_BASE + first * VA_GRAN;
++		}
++	}
++	return 0;
++}
++
++/*
++ * Shader code lives in one 16 MiB window at a 16 MiB boundary: the vertex
++ * and fragment programs a draw jumps between must share their upper address
++ * bits (Linux panfrost keeps executable BOs from crossing 16 MiB).
++ */
++#define EXEC_VA_BASE    0x0f000000ull
++#define EXEC_VA_SIZE    0x01000000ull
++#define EXEC_GRAN       0x4000ull
++#define EXEC_SLOTS      (EXEC_VA_SIZE / EXEC_GRAN)
++static uint64_t g_exec_bits[EXEC_SLOTS / 64];
++static uint64_t g_exec_used;
++
++static uint64_t
++va_alloc_exec(uint64_t size)
++{
++	uint64_t n = (size + EXEC_GRAN - 1) / EXEC_GRAN, run = 0;
++
++	for (uint64_t i = 0; i < EXEC_SLOTS; i++) {
++		run = ((g_exec_bits[i / 64] >> (i % 64)) & 1) ? 0 : run + 1;
++		if (run == n) {
++			uint64_t first = i + 1 - n;
++			for (uint64_t k = first; k <= i; k++) {
++				g_exec_bits[k / 64] |= 1ull << (k % 64);
++			}
++			g_exec_used += n;
++			return EXEC_VA_BASE + first * EXEC_GRAN;
++		}
++	}
++	return 0;
++}
++
++static void
++va_free(uint64_t va, uint64_t size)
++{
++	if (va >= EXEC_VA_BASE && va < EXEC_VA_BASE + EXEC_VA_SIZE) {
++		uint64_t first = (va - EXEC_VA_BASE) / EXEC_GRAN;
++		uint64_t n = (size + EXEC_GRAN - 1) / EXEC_GRAN;
++
++		for (uint64_t k = first; k < first + n; k++) {
++			g_exec_bits[k / 64] &= ~(1ull << (k % 64));
++		}
++		g_exec_used -= n;
++		return;
++	}
++	va_set((va - MALI_VA_BASE) / VA_GRAN, (size + VA_GRAN - 1) / VA_GRAN,
++	    false);
++}
++
++/* ---- jobs ---------------------------------------------------------------- */
++
++static uint32_t g_jobs, g_faults;
++
++/* Run one job chain to completion. Lock held. Returns 0 or an error code. */
++static IOReturn
++gpu_run(uint64_t jc, uint32_t req, uint32_t *status_out, uint64_t *us_out)
++{
++	unsigned js = (req & 1) ? 0 : 1;        /* PANFROST_JD_REQ_FS -> slot 0 */
++	uint32_t done = 1u << js, err = 1u << (16 + js);
++	uint64_t t0 = mach_absolute_time();
++
++	wr(g_gpu, JOB_INT_CLEAR, done | err);
++	wr(g_gpu, MMU_INT_CLEAR, 1);
++	/*
++	 * Mesa wrote the job descriptors (and shader code compiled at draw
++	 * time) through write-combined mappings on this CPU: drain them
++	 * before the GPU reads them.
++	 */
++	__asm__ volatile ("dsb sy" : : : "memory");
++	wr(g_gpu, JS(js, JS_HEAD_NEXT), (uint32_t)jc);
++	wr(g_gpu, JS(js, JS_HEAD_NEXT) + 4, (uint32_t)(jc >> 32));
++	wr(g_gpu, JS(js, JS_AFFINITY_NEXT), g_shader);
++	wr(g_gpu, JS(js, JS_AFFINITY_NEXT) + 4, 0);
++	wr(g_gpu, JS(js, JS_CONFIG_NEXT), JS_CONFIG_VAL);
++	wr(g_gpu, JS(js, JS_COMMAND_NEXT), 1);
++
++	uint32_t raw = 0, mmu = 0;
++	uint64_t deadline;
++	nanoseconds_to_absolutetime((uint64_t)MALI_TIMEOUT_MS * 1000000ull,
++	    &deadline);
++	deadline += t0;
++	for (int spin = 0;; spin++) {
++		raw = rd(g_gpu, JOB_INT_RAWSTAT);
++		mmu = rd(g_gpu, MMU_INT_RAWSTAT);
++		if ((raw & (done | err)) || (mmu & 1) ||
++		    mach_absolute_time() > deadline) {
++			break;
++		}
++		if (spin < 2000) {
++			IODelay(10);
++		} else {
++			IOSleep(1);
++		}
++	}
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	uint32_t status = rd(g_gpu, JS(js, JS_STATUS));
++	if (us_out) {
++		*us_out = ns / 1000;
++	}
++	g_jobs++;
++	if ((raw & done) && !(raw & err) && !(mmu & 1)) {
++		wr(g_gpu, JOB_INT_CLEAR, done);
++		if (status_out) {
++			*status_out = 1;
++		}
++		return kIOReturnSuccess;
++	}
++	g_faults++;
++	if (g_faults <= 100) {
++		IOLog("SWEET MALI: job 0x%llx js%u %s: irq 0x%x mmu 0x%x "
++		    "status 0x%x head 0x%x | AS0 fault 0x%x at 0x%x%08x "
++		    "(%llu us)\n", jc, js,
++		    (raw & err) ? "error" : (mmu & 1) ? "MMU fault" : "TIMEOUT",
++		    raw, mmu, status, rd(g_gpu, JS(js, JS_HEAD)),
++		    rd(g_gpu, AS(0, AS_FAULTSTATUS)),
++		    rd(g_gpu, AS(0, AS_FAULTADDRESS_HI)),
++		    rd(g_gpu, AS(0, AS_FAULTADDRESS_LO)), ns / 1000);
++	}
++	if (status_out) {
++		*status_out = status ? status : 0xffff;
++	}
++	wr(g_gpu, JS(js, JS_COMMAND), 3);               /* HARD_STOP */
++	IOSleep(1);
++	if (gpu_reset() && gpu_cores_on() && mmu_setup()) {
++		/* ready for the next job */
++	}
++	return kIOReturnIOError;
++}
++
++/*
++ * Job queue: selector 17 queues a chain and returns its sequence number at
++ * once, a worker runs the queue in order (so vertex/tiler -> fragment order
++ * holds without fences) and selector 18 waits for a sequence number.  The
++ * CPU builds the next render pass while the GPU runs this one.
++ */
++#define MALI_QLEN               64
++
++static IOLock *g_qlock;
++static struct {
++	uint64_t jc;
++	uint32_t req;
++} g_q[MALI_QLEN];
++static uint64_t g_q_submitted, g_q_done;
++static bool g_q_on;
++static uint64_t g_q_t0, g_q_busy_us, g_q_max_us;
++static uint32_t g_q_n, g_q_frag, g_q_failed, g_q_failed_total;
++
++static void
++mali_queue_worker(__unused void *arg, __unused int wres)
++{
++	IOLockLock(g_qlock);
++	for (;;) {
++		while (g_q_done == g_q_submitted) {
++			IOLockSleep(g_qlock, &g_q_submitted, THREAD_UNINT);
++		}
++		uint64_t seq = g_q_done + 1;
++		uint64_t jc = g_q[seq % MALI_QLEN].jc;
++		uint32_t req = g_q[seq % MALI_QLEN].req;
++		IOLockUnlock(g_qlock);
++
++		uint32_t status = 0;
++		uint64_t us = 0;
++		IOLockLock(g_lock);
++		IOReturn r = gpu_run(jc, req, &status, &us);
++		IOLockUnlock(g_lock);
++
++		IOLockLock(g_qlock);
++		g_q_done = seq;
++		IOLockWakeup(g_qlock, &g_q_done, false);
++		IOLockWakeup(g_qlock, &g_q_submitted, false);
++		uint64_t now = mach_absolute_time(), ns = 0;
++		if (g_q_t0 == 0) {
++			g_q_t0 = now;
++		}
++		g_q_n++;
++		g_q_frag += req & 1;
++		g_q_busy_us += us;
++		g_q_failed += r != kIOReturnSuccess;
++		g_q_failed_total += r != kIOReturnSuccess;
++		if (us > g_q_max_us) {
++			g_q_max_us = us;
++		}
++		absolutetime_to_nanoseconds(now - g_q_t0, &ns);
++		if (ns >= 2000000000ull) {
++			IOLog("SWEET MALI: queue %llu ms: %u jobs (%u fragment, "
++			    "%u failed), GPU busy %llu ms (max job %llu ms), "
++			    "%u jobs and %u faults since boot\n",
++			    ns / 1000000, g_q_n, g_q_frag, g_q_failed,
++			    g_q_busy_us / 1000, g_q_max_us / 1000, g_jobs,
++			    g_faults);
++			g_q_t0 = 0;
++			g_q_n = g_q_frag = g_q_failed = 0;
++			g_q_busy_us = g_q_max_us = 0;
++		}
++	}
++}
++
++static uint64_t
++mali_queue_submit(uint64_t jc, uint32_t req)
++{
++	if (!g_q_on) {
++		return 0;
++	}
++	IOLockLock(g_qlock);
++	while (g_q_submitted - g_q_done >= MALI_QLEN - 1) {
++		IOLockSleep(g_qlock, &g_q_submitted, THREAD_UNINT);
++	}
++	uint64_t seq = ++g_q_submitted;
++	g_q[seq % MALI_QLEN].jc = jc;
++	g_q[seq % MALI_QLEN].req = req;
++	IOLockWakeup(g_qlock, &g_q_submitted, false);
++	IOLockUnlock(g_qlock);
++	return seq;
++}
++
++static bool
++mali_queue_wait(uint64_t seq, bool poll_only)
++{
++	if (!g_q_on) {
++		return true;
++	}
++	IOLockLock(g_qlock);
++	while (g_q_done < seq && seq <= g_q_submitted && !poll_only) {
++		IOLockSleep(g_qlock, &g_q_done, THREAD_UNINT);
++	}
++	bool done = g_q_done >= seq || seq > g_q_submitted;
++	IOLockUnlock(g_qlock);
++	return done;
++}
++
++static uint64_t
++mali_queue_last(void)
++{
++	if (!g_q_on) {
++		return 0;
++	}
++	IOLockLock(g_qlock);
++	uint64_t seq = g_q_submitted;
++	IOLockUnlock(g_qlock);
++	return seq;
++}
++
++/* Every queued job done (before GPU memory goes away). */
++static void
++mali_queue_idle(void)
++{
++	mali_queue_wait(mali_queue_last(), false);
++}
++
++extern "C" uint64_t sweet_mali_seq(void);
++extern "C" void sweet_mali_wait_seq(uint64_t seq);
++extern "C" uint64_t
++sweet_mali_seq(void)
++{
++	return mali_queue_last();
++}
++extern "C" void
++sweet_mali_wait_seq(uint64_t seq)
++{
++	if (seq != 0) {
++		mali_queue_wait(seq, false);
++	}
++}
++
++static void
++mali_queue_start(void)
++{
++	uint32_t on = 1;
++
++	PE_parse_boot_argn("sweetmali_async", &on, sizeof(on));
++	g_qlock = IOLockAlloc();
++	if (!on || g_qlock == NULL) {
++		IOLog("SWEET MALI: job queue off, synchronous submits\n");
++		return;
++	}
++	thread_t th;
++	if (kernel_thread_start(mali_queue_worker, NULL, &th) != KERN_SUCCESS) {
++		IOLog("SWEET MALI: queue worker not started\n");
++		return;
++	}
++	thread_deallocate(th);
++	g_q_on = true;
++	IOLog("SWEET MALI: job queue on (%u entries)\n", MALI_QLEN);
++}
++
++/* ---- buffer objects ------------------------------------------------------ */
++
++class SweetMaliBO : public OSObject {
++	OSDeclareDefaultStructors(SweetMaliBO);
++public:
++	IOMemoryDescriptor *md;
++	IOMemoryMap        *userMap;
++	SweetSurface       *surface;
++	uint64_t            gpuVA, size, vaSize;
++	bool                owned;
++	bool init() APPLE_KEXT_OVERRIDE
++	{
++		md = NULL; userMap = NULL; surface = NULL;
++		gpuVA = size = vaSize = 0; owned = false;
++		return OSObject::init();
++	}
++	void free() APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(SweetMaliBO, OSObject);
++
++void
++SweetMaliBO::free()
++{
++	if (gpuVA != 0) {
++		mali_queue_idle();
++		IOLockLock(g_lock);
++		gpu_unmap(gpuVA, size);
++		va_free(gpuVA, vaSize ? vaSize : size);
++		IOLockUnlock(g_lock);
++	}
++	if (owned) {
++		OSAddAtomic64(-(SInt64)size, &g_bo_bytes);
++		OSDecrementAtomic(&g_bo_count);
++	}
++	OSSafeReleaseNULL(userMap);
++	OSSafeReleaseNULL(md);
++	OSSafeReleaseNULL(surface);
++	OSObject::free();
++}
++
++/* GPU-map md (size rounded to 4 KB) and map it into task. */
++static SweetMaliBO *
++bo_make(IOMemoryDescriptor *md, uint64_t size, task_t task, IOOptionBits cache,
++    bool exec)
++{
++	SweetMaliBO *bo = OSTypeAlloc(SweetMaliBO);
++
++	if (bo == NULL || !bo->init()) {
++		OSSafeReleaseNULL(bo);
++		return NULL;
++	}
++	bo->md = md;
++	md->retain();
++	bo->size = (size + 4095) & ~4095ull;
++	IOLockLock(g_lock);
++	uint64_t va = exec ? va_alloc_exec(bo->size) : 0;
++	bo->vaSize = bo->size;
++	if (va == 0) {
++		/* An unmapped 64 KB guard after each ordinary bo. */
++		bo->vaSize = bo->size + VA_GRAN;
++		va = va_alloc(bo->vaSize);
++	}
++	bool ok = va != 0 && gpu_map(va, md, bo->size);
++	if (ok) {
++		bo->gpuVA = va;
++	} else if (va != 0) {
++		gpu_unmap(va, bo->size);
++		va_free(va, bo->vaSize);
++	}
++	if (!ok) {
++		static unsigned logged;
++		if (logged++ < 10) {
++			IOLog("SWEET MALI: no GPU mapping for %llu bytes: %s, "
++			    "VA in use %llu MB, %u tables\n", bo->size,
++			    va == 0 ? "VA full" : "page tables full",
++			    g_va_used * VA_GRAN >> 20, g_ntables);
++		}
++	}
++	IOLockUnlock(g_lock);
++	if (ok && task != NULL) {
++		bo->userMap = md->createMappingInTask(task, 0,
++		    kIOMapAnywhere | cache);
++		ok = bo->userMap != NULL;
++	}
++	if (!ok) {
++		bo->release();
++		return NULL;
++	}
++	return bo;
++}
++
++static SweetMaliBO *
++bo_new(uint64_t size, task_t task, bool exec)
++{
++	if (size == 0 || size > (256ull << 20)) {
++		return NULL;
++	}
++	size = (size + 16383) & ~16383ull;
++	IOBufferMemoryDescriptor *md =
++	    IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++	    kIODirectionInOut | kIOMemoryKernelUserShared, size, 16384);
++	if (md == NULL) {
++		return NULL;
++	}
++	bzero(md->getBytesNoCopy(), size);
++	dc_civac(md->getBytesNoCopy(), size);
++	SweetMaliBO *bo = bo_make(md, size, task, kIOMapWriteCombineCache, exec);
++	md->release();
++	if (bo != NULL) {
++		bo->owned = true;
++		OSAddAtomic64((SInt64)bo->size, &g_bo_bytes);
++		OSIncrementAtomic(&g_bo_count);
++	}
++	return bo;
++}
++
++/* ---- self-test ----------------------------------------------------------- */
++
++/*
++ * The probe77 WRITE_VALUE job (a 32-bit immediate through AS0), but through
++ * the BO and submit paths: it proves the driver's own tables, VA allocator
++ * and job slot before Mesa ever opens the device.
++ */
++static void
++mali_selftest(void)
++{
++	SweetMaliBO *bo = bo_new(16384, NULL, true);
++
++	if (bo == NULL) {
++		IOLog("SWEET MALI: self-test: no BO\n");
++		return;
++	}
++	uint8_t *mem = (uint8_t *)OSDynamicCast(IOBufferMemoryDescriptor,
++	    bo->md)->getBytesNoCopy();
++	uint32_t *w = (uint32_t *)(void *)mem;
++	uint32_t value = 0xc0ffee01u;
++	uint64_t target = bo->gpuVA + 0x800;
++
++	w[4] = (2u << 1) | 1u | (1u << 16);
++	w[8] = (uint32_t)target;
++	w[9] = (uint32_t)(target >> 32);
++	w[10] = 6;                              /* 32-bit immediate */
++	w[12] = value;
++	*(uint32_t *)(void *)(mem + 0x800) = 0;
++	dc_civac(mem, 16384);
++	uint32_t status = 0;
++	uint64_t us = 0;
++	IOLockLock(g_lock);
++	IOReturn r = gpu_run(bo->gpuVA, 0, &status, &us);
++	IOLockUnlock(g_lock);
++	dc_civac(mem, 16384);
++	uint32_t got = *(uint32_t *)(void *)(mem + 0x800);
++	IOLog("SWEET MALI: self-test job at gpu 0x%llx: 0x%x in %llu us, "
++	    "header 0x%x, word 0x%08x -> %s\n", bo->gpuVA, r, us, w[0], got,
++	    (r == kIOReturnSuccess && got == value) ? "THE GPU RAN IT" :
++	    "FAILED");
++	bo->release();
++}
++
++/* ---- user client --------------------------------------------------------- */
++
++/*
++ * DRM_PANFROST_PARAM_* numbering (panfrost_drm.h); 0 and 1 are derived from
++ * GPU_ID, the rest are register reads at the offsets below.
++ */
++static const uint32_t mali_param_reg[] = {
++	0, 0, SHADER_PRESENT, TILER_PRESENT, L2_PRESENT, 0xe00,
++	0x018, 0x01c, 0x004, 0x008, 0x00c, 0x010, 0x014, 0x0ac,
++	0x0a0, 0x0a4, 0x0a8, 0x300,
++	0x0b0, 0x0b4, 0x0b8, 0x0bc, 0x0c0, 0x0c4, 0x0c8, 0x0cc,
++	0x0d0, 0x0d4, 0x0d8, 0x0dc, 0x0e0, 0x0e4, 0x0e8, 0x0ec,
++	0x0f0, 0x0f4, 0x0f8, 0x0fc,
++};
++
++class SweetMaliUserClient : public IOUserClient {
++	OSDeclareDefaultStructors(SweetMaliUserClient);
++	task_t   fTask;
++	OSArray *fBOs;
++	IOReturn boReply(SweetMaliBO *bo, IOExternalMethodArguments *args);
++public:
++	bool initWithTask(task_t owningTask, void *securityID,
++	    UInt32 type) APPLE_KEXT_OVERRIDE;
++	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	void free(void) APPLE_KEXT_OVERRIDE;
++	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++	    IOExternalMethodDispatch *dispatch, OSObject *target,
++	    void *reference) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(SweetMaliUserClient, IOUserClient);
++
++bool
++SweetMaliUserClient::initWithTask(task_t owningTask, void *securityID,
++    UInt32 type)
++{
++	if (!IOUserClient::initWithTask(owningTask, securityID, type)) {
++		return false;
++	}
++	fTask = owningTask;
++	fBOs = OSArray::withCapacity(64);
++	return fBOs != NULL;
++}
++
++IOReturn
++SweetMaliUserClient::clientClose(void)
++{
++	if (fBOs != NULL) {
++		fBOs->flushCollection();
++	}
++	terminate();
++	return kIOReturnSuccess;
++}
++
++void
++SweetMaliUserClient::free(void)
++{
++	OSSafeReleaseNULL(fBOs);
++	IOUserClient::free();
++}
++
++IOReturn
++SweetMaliUserClient::boReply(SweetMaliBO *bo, IOExternalMethodArguments *args)
++{
++	if (bo == NULL) {
++		return kIOReturnNoMemory;
++	}
++	/* handle = slot + 1; freed slots are reused (OSArray holds the BO) */
++	unsigned slot = fBOs->getCount();
++	for (unsigned i = 0; i < fBOs->getCount(); i++) {
++		if (OSDynamicCast(SweetMaliBO, fBOs->getObject(i)) == NULL) {
++			slot = i;
++			break;
++		}
++	}
++	if (slot < fBOs->getCount()) {
++		fBOs->replaceObject(slot, bo);
++	} else {
++		fBOs->setObject(bo);
++	}
++	bo->release();
++	if (args->scalarOutputCount < 4) {
++		return kIOReturnBadArgument;
++	}
++	args->scalarOutput[0] = slot + 1;
++	args->scalarOutput[1] = bo->gpuVA;
++	args->scalarOutput[2] = bo->userMap ? bo->userMap->getAddress() : 0;
++	args->scalarOutput[3] = bo->size;
++	return kIOReturnSuccess;
++}
++
++IOReturn
++SweetMaliUserClient::externalMethod(uint32_t selector,
++    IOExternalMethodArguments *args, IOExternalMethodDispatch *, OSObject *,
++    void *)
++{
++	if (!g_ready) {
++		return kIOReturnNotReady;
++	}
++	const uint64_t *in = args->scalarInput;
++	uint32_t nin = args->scalarInputCount;
++
++	switch (selector) {
++	case 10:                                        /* BO_NEW */
++		if (nin < 2) {
++			return kIOReturnBadArgument;
++		}
++		/* flags bit 0: PANFROST_BO_NOEXEC -> not executable */
++		return boReply(bo_new(in[0], fTask, (in[1] & 1) == 0), args);
++	case 11: {                                      /* BO_FREE */
++		if (nin < 1 || in[0] == 0 || in[0] > fBOs->getCount()) {
++			return kIOReturnBadArgument;
++		}
++		OSNumber *empty = OSNumber::withNumber(
++		    (unsigned long long)0, 32);
++		fBOs->replaceObject((unsigned)in[0] - 1, empty);
++		OSSafeReleaseNULL(empty);
++		return kIOReturnSuccess;
++	}
++	case 12: {                                      /* IMPORT IOSurface */
++		if (nin < 1) {
++			return kIOReturnBadArgument;
++		}
++		SweetSurface *s = sweet_surface_copy((uint32_t)in[0]);
++		if (s == NULL || s->memory == NULL) {
++			OSSafeReleaseNULL(s);
++			return kIOReturnNotFound;
++		}
++		SweetMaliBO *bo = bo_make(s->memory, s->memory->getLength(),
++		    fTask, kIOMapWriteCombineCache, false);
++		if (bo != NULL) {
++			bo->surface = s;
++		} else {
++			s->release();
++		}
++		return boReply(bo, args);
++	}
++	case 13: {                                      /* SUBMIT (sync) */
++		if (nin < 2 || args->scalarOutputCount < 2) {
++			return kIOReturnBadArgument;
++		}
++		uint32_t status = 0;
++		uint64_t us = 0;
++		mali_queue_idle();
++		IOLockLock(g_lock);
++		IOReturn r = gpu_run(in[0], (uint32_t)in[1], &status, &us);
++		IOLockUnlock(g_lock);
++		args->scalarOutput[0] = status;
++		args->scalarOutput[1] = us;
++		return r;
++	}
++	case 17: {                                      /* SUBMIT_ASYNC */
++		if (nin < 2 || args->scalarOutputCount < 1) {
++			return kIOReturnBadArgument;
++		}
++		/* Drain this CPU's write-combined stores first. */
++		__asm__ volatile ("dsb sy" : : : "memory");
++		uint64_t seq = mali_queue_submit(in[0], (uint32_t)in[1]);
++		if (seq == 0) {
++			return kIOReturnUnsupported;
++		}
++		args->scalarOutput[0] = seq;
++		if (args->scalarOutputCount >= 2) {
++			args->scalarOutput[1] = g_q_failed_total;
++		}
++		return kIOReturnSuccess;
++	}
++	case 18: {                                      /* WAIT_SEQ */
++		if (nin < 2 || args->scalarOutputCount < 1) {
++			return kIOReturnBadArgument;
++		}
++		bool done = mali_queue_wait(in[0], in[1] == 0);
++		args->scalarOutput[0] = done;
++		return done ? kIOReturnSuccess : kIOReturnTimeout;
++	}
++	case 14:                                        /* WAIT */
++		mali_queue_idle();
++		return kIOReturnSuccess;
++	case 15: {                                      /* GET_PARAM */
++		if (nin < 1 || args->scalarOutputCount < 1) {
++			return kIOReturnBadArgument;
++		}
++		uint64_t p = in[0], v = 0;
++		uint32_t id = rd(g_gpu, GPU_ID);
++		if (p == 0) {
++			v = id >> 16;
++		} else if (p == 1) {
++			v = id & 0xffff;
++		} else if (p == 5) {                    /* STACK_PRESENT */
++			v = 0;
++		} else if (p == 17) {                   /* COHERENCY_FEATURES */
++			v = 1;
++		} else if (p < sizeof(mali_param_reg) / sizeof(mali_param_reg[0])) {
++			v = rd(g_gpu, mali_param_reg[p]);
++		} else if (p == 38) {                   /* NR_CORE_GROUPS */
++			v = 1;
++		}
++		args->scalarOutput[0] = v;
++		return kIOReturnSuccess;
++	}
++	case 16: {                                      /* LOG */
++		if (args->structureInput == NULL ||
++		    args->structureInputSize == 0) {
++			return kIOReturnBadArgument;
++		}
++		char line[240];
++		size_t n = args->structureInputSize < sizeof(line) - 1 ?
++		    args->structureInputSize : sizeof(line) - 1;
++		memcpy(line, args->structureInput, n);
++		line[n] = '\0';
++		while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\0')) {
++			line[--n] = '\0';
++		}
++		IOLog("SWEETGL: %s\n", line);
++		return kIOReturnSuccess;
++	}
++	default:
++		return kIOReturnUnsupported;
++	}
++}
++
++class SweetMali : public IOService {
++	OSDeclareDefaultStructors(SweetMali);
++public:
++	IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type,
++	    IOUserClient **handler) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(SweetMali, IOService);
++
++IOReturn
++SweetMali::newUserClient(task_t owningTask, void *securityID, UInt32 type,
++    IOUserClient **handler)
++{
++	SweetMaliUserClient *uc = OSTypeAlloc(SweetMaliUserClient);
++
++	if (uc == NULL) {
++		return kIOReturnNoMemory;
++	}
++	if (!uc->initWithTask(owningTask, securityID, type) ||
++	    !uc->attach(this)) {
++		uc->release();
++		return kIOReturnError;
++	}
++	if (!uc->start(this)) {
++		uc->detach(this);
++		uc->release();
++		return kIOReturnError;
++	}
++	*handler = uc;
++	return kIOReturnSuccess;
++}
++
++/* ---- bring-up ------------------------------------------------------------ */
++
++static bool
++mali_init(void)
++{
++	uint32_t pll;
++
++	g_gpu = ml_io_map(A10_MALI_PA, A10_MALI_SIZE);
++	g_pmu = ml_io_map(A10_PMU_PA, A10_PMU_SIZE);
++	g_top = ml_io_map(A10_CMU_TOP_PA, A10_CMU_TOP_SIZE);
++	g_g3d = ml_io_map(A10_CMU_G3D_PA, A10_CMU_G3D_SIZE);
++	g_lock = IOLockAlloc();
++	if (!g_gpu || !g_pmu || !g_top || !g_g3d || !g_lock) {
++		IOLog("SWEET MALI: cannot map the GPU, PMU or CMUs\n");
++		return false;
++	}
++	if (!gpu_domain_on()) {
++		return false;
++	}
++	gpu_clock_on();
++	/*
++	 * Do not touch the Mali if its PLL is not running: an unclocked AXI
++	 * block can hang the bus on the first read.
++	 */
++	pll = rd(g_g3d, A10_G3D_PLL_CON0);
++	if ((pll & ((1u << 31) | (1u << 29))) !=
++	    ((1u << 31) | (1u << 29))) {
++		IOLog("SWEET MALI: PLL_G3D not enabled/locked (0x%x)\n", pll);
++		return false;
++	}
++	if ((rd(g_gpu, GPU_ID) >> 16) != 0x60a0u) {
++		IOLog("SWEET MALI: not a Mali-G71 (GPU_ID 0x%x)\n",
++		    rd(g_gpu, GPU_ID));
++		return false;
++	}
++	g_l0 = table_alloc(&g_l0_pa);
++	if (g_l0 == NULL) {
++		return false;
++	}
++	if (!gpu_reset()) {
++		return false;
++	}
++	if (!gpu_cores_on()) {
++		IOLog("SWEET MALI: cores did not power up\n");
++		return false;
++	}
++	if (!mmu_setup()) {
++		return false;
++	}
++	IOLog("SWEET MALI: Mali-G71 GPU_ID 0x%08x shader 0x%x tiler 0x%x "
++	    "l2 0x%x, AS0 table 0x%llx\n", rd(g_gpu, GPU_ID), g_shader,
++	    g_tiler, g_l2, g_l0_pa);
++	return true;
++}
++
++void
++sweet_mali_publish(IOService *provider)
++{
++	/*
++	 * Opt-in for now: the driver must not change the behaviour of a probe
++	 * that is testing something else.  sweetmali=1 enables it; once it has
++	 * run real Mesa jobs the default flips.
++	 */
++	uint32_t on = 0;
++
++	PE_parse_boot_argn("sweetmali", &on, sizeof(on));
++	if (!on) {
++		IOLog("SWEET MALI: off (sweetmali=1 enables)\n");
++		return;
++	}
++	if (!mali_init()) {
++		IOLog("SWEET MALI: init failed, no GPU service\n");
++		return;
++	}
++	g_ready = true;
++	mali_selftest();
++	mali_queue_start();
++	SweetMali *m = OSTypeAlloc(SweetMali);
++	if (m != NULL && m->init() && m->attach(provider)) {
++		m->registerService();
++		IOLog("SWEET MALI: SweetMali published\n");
++	}
++	OSSafeReleaseNULL(m);
++}
++
++#else /* !SWEET_GICV2 */
++
++extern "C" void
++sweet_mali_publish(IOService *)
++{
++}
++extern "C" uint64_t sweet_mali_seq(void);
++extern "C" void sweet_mali_wait_seq(uint64_t seq);
++extern "C" uint64_t
++sweet_mali_seq(void)
++{
++	return 0;
++}
++extern "C" void
++sweet_mali_wait_seq(uint64_t)
++{
++}
++
++#endif /* ARM64_BOARD_CONFIG_SWEET && SWEET_GICV2 */
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index af841c6..c72a68e 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -40,6 +40,9 @@
+ #include <libkern/c++/OSUnserialize.h>
+ #include <sys/proc.h>
+ 
++/* A10: the Mali driver (iokit/Kernel/arm/SweetMali.cpp). */
++extern "C" void sweet_mali_publish(IOService *provider);
++
+ enum {
+ 	kSweetSurfaceCreate             = 0,
+ 	kSweetSurfaceLookup             = 4,
+@@ -402,6 +405,11 @@ IOCoreSurfaceRoot::start(IOService *provider)
+ 	setName("IOCoreSurfaceRoot");
+ 	registerService();
+ 	IOLog("SWEET SURF: IOCoreSurfaceRoot registered\n");
++	/*
++	 * A10: bring up the Mali-G71 and publish SweetMali, the service Mesa's
++	 * panfrost driver reaches through sweet_drm_pan.c.
++	 */
++	sweet_mali_publish(this);
+ 	return true;
+ }
+ 
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index acc9ae0..1b13029 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -14,6 +14,7 @@ iokit/Kernel/arm/SweetEntitlements.cpp                           optional iokitc
+ iokit/Kernel/arm/SweetKeyStore.cpp                               optional iokitcpp
+ iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitcpp
+ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
++iokit/Kernel/arm/SweetMali.cpp                                   optional iokitcpp
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
