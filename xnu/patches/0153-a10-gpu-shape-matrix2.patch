@@ -1,0 +1,499 @@
+diff --git a/bsd/dev/a10_gpu.c b/bsd/dev/a10_gpu.c
+--- a/bsd/dev/a10_gpu.c
++++ b/bsd/dev/a10_gpu.c
+@@ -158,9 +158,12 @@
+ #define JS_COMMAND_NEXT         0x60u
+ #define JS_STATUS               0x24u
+ #define JS_CONFIG               ((3u << 8) | (3u << 12) | (8u << 16))
++#define JS_CONFIG_RO            0x18u   /* the slot's current configuration */
+ 
+ #define MMU_IRQ_RAWSTAT         0x2000u
+ #define MMU_IRQ_CLEAR           0x2004u
++#define MMU_IRQ_MASK            0x2008u
++#define MMU_IRQ_STATUS          0x200cu
+ #define AS0                     0x2400u
+ #define AS_TRANSTAB_LO          0x00u
+ #define AS_TRANSTAB_HI          0x04u
+@@ -449,86 +452,118 @@
+ }
+ 
+ /*
+- * Address space 0: a translation table at `transtab` (0 with TRANSCFG
+- * ADRMODE_IDENTITY for physical addresses) and the walker configuration
+- * in `transcfg`.  AS_COMMAND_UPDATE broadcasts the two to the MMU, and
++ * One address space: a translation table at `transtab` (0 with TRANSCFG
++ * ADRMODE_IDENTITY for physical addresses) and the walker configuration in
++ * `transcfg`.  AS_COMMAND_UPDATE broadcasts the two to the MMU, and
+  * AS_STATUS bit 0 stays set until that is done.
++ *
++ * probe81 writes every shape into AS0..AS3, not only AS0.  A job slot is
++ * told its address space by the low bits of JS_CONFIG (the A21s port runs
++ * slot 1 on AS0 with those bits clear), but if this GPU takes the space
++ * from the slot number instead, a slot-1 job was reading AS1 all along --
++ * which the loader left in identity mode.  That would explain identity
++ * jobs running while four different table shapes all failed with the same
++ * DATA_INVALID_FAULT at the untranslated 0x100000.
+  */
++#define A10_GPU_AS_COUNT            4u
++#define A10_GPU_AS_STRIDE           0x40u   /* MMU_AS_REG(n, r): n << 6 */
++#define A10_GPU_TRANSCFG_IDENTITY   2u
++
+ static bool
+-a10_gpu_as0_mem(vm_offset_t mali, uint64_t transtab, uint32_t transcfg,
+-    uint32_t memattr)
+-{
++a10_gpu_as_setup(vm_offset_t mali, unsigned as, uint64_t transtab,
++    uint32_t transcfg, uint32_t memattr)
++{
++	vm_offset_t base = AS0 + as * A10_GPU_AS_STRIDE;
++
+ 	/*
+ 	 * Panfrost flushes the GPU's memory traffic and L1s before it hands
+ 	 * the MMU a new translation table.  Without that a job already in
+ 	 * the pipe, or the caches it filled, can outlive the old mapping.
+ 	 */
+-	if (!a10_gpu_wait(mali, AS0 + AS_STATUS, 1, 0, 50000)) {
+-		printf("A10 GPU: AS0 busy before flush, status=%08x\n",
+-		    a10_gpu_read(mali, AS0 + AS_STATUS));
+-		return false;
+-	}
+-	a10_gpu_write(mali, AS0 + AS_COMMAND, 5);       /* flush memory */
+-	if (!a10_gpu_wait(mali, AS0 + AS_STATUS, 1, 0, 50000)) {
+-		printf("A10 GPU: AS0 flush timeout, status=%08x\n",
+-		    a10_gpu_read(mali, AS0 + AS_STATUS));
+-		return false;
+-	}
+-
+-	a10_gpu_write(mali, AS0 + AS_TRANSTAB_LO, (uint32_t)transtab);
+-	a10_gpu_write(mali, AS0 + AS_TRANSTAB_HI, (uint32_t)(transtab >> 32));
+-	a10_gpu_write(mali, AS0 + AS_TRANSCFG_LO, transcfg);
+-	a10_gpu_write(mali, AS0 + AS_TRANSCFG_HI, 0);
+-	a10_gpu_write(mali, AS0 + AS_MEMATTR_LO, memattr);
+-	a10_gpu_write(mali, AS0 + AS_MEMATTR_HI, 0);
+-	a10_gpu_write(mali, AS0 + AS_COMMAND, 1);       /* update */
+-	if (!a10_gpu_wait(mali, AS0 + AS_STATUS, 1, 0, 50000)) {
+-		printf("A10 GPU: AS0 update timeout, status=%08x\n",
+-		    a10_gpu_read(mali, AS0 + AS_STATUS));
+-		return false;
+-	}
+-	printf("A10 GPU: AS0 read back transtab=%08x%08x transcfg=%08x "
+-	    "memattr=%08x%08x status=%08x\n",
+-	    a10_gpu_read(mali, AS0 + AS_TRANSTAB_HI),
+-	    a10_gpu_read(mali, AS0 + AS_TRANSTAB_LO),
+-	    a10_gpu_read(mali, AS0 + AS_TRANSCFG_LO),
+-	    a10_gpu_read(mali, AS0 + AS_MEMATTR_HI),
+-	    a10_gpu_read(mali, AS0 + AS_MEMATTR_LO),
+-	    a10_gpu_read(mali, AS0 + AS_STATUS));
++	if (!a10_gpu_wait(mali, base + AS_STATUS, 1, 0, 50000)) {
++		printf("A10 GPU: AS%u busy before flush, status=%08x\n",
++		    as, a10_gpu_read(mali, base + AS_STATUS));
++		return false;
++	}
++	a10_gpu_write(mali, base + AS_COMMAND, 5);      /* flush memory */
++	if (!a10_gpu_wait(mali, base + AS_STATUS, 1, 0, 50000)) {
++		printf("A10 GPU: AS%u flush timeout, status=%08x\n",
++		    as, a10_gpu_read(mali, base + AS_STATUS));
++		return false;
++	}
++
++	a10_gpu_write(mali, base + AS_TRANSTAB_LO, (uint32_t)transtab);
++	a10_gpu_write(mali, base + AS_TRANSTAB_HI, (uint32_t)(transtab >> 32));
++	a10_gpu_write(mali, base + AS_TRANSCFG_LO, transcfg);
++	a10_gpu_write(mali, base + AS_TRANSCFG_HI, 0);
++	a10_gpu_write(mali, base + AS_MEMATTR_LO, memattr);
++	a10_gpu_write(mali, base + AS_MEMATTR_HI, memattr);
++	a10_gpu_write(mali, base + AS_COMMAND, 1);      /* update */
++	if (!a10_gpu_wait(mali, base + AS_STATUS, 1, 0, 50000)) {
++		printf("A10 GPU: AS%u update timeout, status=%08x\n",
++		    as, a10_gpu_read(mali, base + AS_STATUS));
++		return false;
++	}
++	printf("A10 GPU: AS%u read back transtab=%08x%08x transcfg=%08x "
++	    "memattr=%08x%08x status=%08x\n", as,
++	    a10_gpu_read(mali, base + AS_TRANSTAB_HI),
++	    a10_gpu_read(mali, base + AS_TRANSTAB_LO),
++	    a10_gpu_read(mali, base + AS_TRANSCFG_LO),
++	    a10_gpu_read(mali, base + AS_MEMATTR_HI),
++	    a10_gpu_read(mali, base + AS_MEMATTR_LO),
++	    a10_gpu_read(mali, base + AS_STATUS));
+ 	return true;
+ }
+ 
++/*
++ * Identity mode in every low address space: the GPU address is the physical
++ * one, whichever space the job slot uses.
++ */
+ static bool
+-a10_gpu_as0(vm_offset_t mali, uint64_t transtab, uint32_t transcfg)
+-{
+-	return a10_gpu_as0_mem(mali, transtab, transcfg, 0x88888888u);
++a10_gpu_identity(vm_offset_t mali)
++{
++	unsigned as;
++
++	for (as = 0; as < A10_GPU_AS_COUNT; as++) {
++		if (!a10_gpu_as_setup(mali, as, 0,
++		    A10_GPU_TRANSCFG_IDENTITY, 0x88888888u)) {
++			return false;
++		}
++	}
++	return true;
+ }
+ 
+ /*
+- * The GPU's page tables.  probe78 and probe79 tried two encodings and both
+- * jobs came back 0x58 (DATA_INVALID_FAULT), but the MMU reported no fault
+- * at all and the GPU had written that status into the job header, so the
+- * tables were being read.  The giveaway is that *every* shape after the
+- * first failure -- 48-bit, uncached, 35-bit -- produced the identical
+- * 0x00010258.  A faulted Bifrost job slot stays faulted until the GPU is
+- * reset, so those later jobs most likely never ran.  probe80 therefore
+- * soft-resets (and invalidates the caches) before each shape, and runs an
+- * identity job as a control after each one.
++ * The GPU's page tables.  probe78 and probe79 tried four encodings and the
++ * job came back 0x58 (DATA_INVALID_FAULT) every time, with no MMU fault and
++ * with the same 0x00010258 written into the job header.  That value is the
++ * GPU's own: (job index << 16) | (job type 2 << 8) | 0x58, and the fault
++ * pointer was 0x100000 -- the job itself, not the word it was told to
++ * write.  So the job manager read a descriptor it judged invalid, which is
++ * what an untranslated read of 0x100000 (outside DRAM, which starts at
++ * 0x80000000) would look like.
+  *
+- * The first shape is the one the stock Samsung kbase driver uses on this
+- * exact GPU (mali_kbase_mmu_mode_aarch64.c): ADRMODE_AARCH64_4K with the
+- * AArch64 walker, a translation table with no mode bits, MEMATTR built
+- * from five kbase policies (0x8d888f88), and -- the part probe78 missed --
+- * ENTRY_ACCESS_BIT (1 << 10) on the *table* entries too, not only on the
+- * leaves.  A leaf is type 0b11 at the last level with access, inner
+- * shareable, AP 01 read/write.
++ * That is why probe81 writes each shape into AS0..AS3 and not only AS0: if
++ * this GPU takes the address space from the job slot number, a slot-1 job
++ * was reading AS1, which the loader left in identity mode -- and every
++ * table shape would then fail exactly this way while identity jobs kept
++ * working.  Each shape is also preceded by a GPU reset (a faulted Bifrost
++ * slot takes no new job until then) and followed by an identity control,
++ * so the log says whether the slot recovers.
+  *
+- * The second shape is the one herolte/a5xelte proved on XNU with a Mali
+- * that also boots from a Samsung loader: Panfrost's legacy "Mali LPAE"
+- * tables, leaf type 0b01, HAP read/write, outer shareable, and memory
+- * attribute index 0 (0x88), not index 1.  Panfrost's own choice (index 1,
+- * write-allocate) is the third shape, and the A21s G52's three-level
+- * AArch64 shape is the fourth.
++ * Shapes, in the order tried:
++ *   1  the stock Samsung kbase AArch64 format for this GPU: bare
++ *      TRANSTAB, TRANSCFG AARCH64_4K | PTW write-back, MEMATTR 0x8d888f88,
++ *      tables phys|0x403, leaves phys|0x743.
++ *   2  the same with PTW_SH_OS, which kbase adds on a coherent system.
++ *   3  the same tables with Panfrost's aarch64_4k TRANSCFG (INA_BITS 7,
++ *      write-back walks, read-allocate) and its 0x88888888 MEMATTR.
++ *   4  Panfrost's legacy Mali LPAE, which it picks for a G71 by default:
++ *      TRANSTAB|7, TRANSCFG 0, MEMATTR 0x008d8888, tables |3, leaves
++ *      |0x2c1 (memory attribute 0).
++ *   5  the same with memory attribute 1, Panfrost's own leaf (0x2c5).
++ *   6  the A21s G52's three-level AArch64 shape, the one this port has
++ *      already run on XNU: TRANSCFG 0x42000506.
+  */
+ #define PTE_TABLE_LEGACY    3ull        /* a table, Mali legacy/AArch64 */
+ #define PTE_TABLE_AARCH64   ((1ull << 10) | 3ull)  /* kbase: ACCESS|table */
+@@ -545,11 +580,14 @@
+ #define TRANSCFG_ADRMODE_LEGACY     0u
+ #define TRANSCFG_ADRMODE_AARCH64_4K 6u
+ #define TRANSCFG_KBASE      (TRANSCFG_ADRMODE_AARCH64_4K | (2u << 24))
+-#define TRANSCFG_A21S       0x420001c6u /* PTW WB, RA, INA_BITS 7 */
++#define TRANSCFG_PTW_SH_OS   (2u << 28)  /* kbase, coherent system */
++#define TRANSCFG_PANFROST_A64 0x420001c6u /* WB walks, RA, INA_BITS 7 */
++#define TRANSCFG_A21S_3LVL  0x42000506u  /* the same, 35-bit VA */
+ 
+ #define TRANSTAB_MALI_TABLE 7ull        /* ADRMODE_TABLE | READ_INNER */
+ #define MEMATTR_MALI        0x008d8888u
+ #define MEMATTR_KBASE       0x8d888f88u
++#define MEMATTR_A21S        0x88888888u
+ 
+ #define A10_GPU_TEST_VA     0x00100000ull
+ 
+@@ -838,6 +876,54 @@
+ 	return true;
+ }
+ 
++/*
++ * What the loader left behind, before this probe changes anything.  The job
++ * slot's JS_CONFIG low bits name its address space; if the loader pointed
++ * slot 1 at AS1 and left AS1 in identity mode, every table written into AS0
++ * would be invisible to the job while identity jobs kept running.  That is
++ * the one explanation probe79 could not rule out, and this dump rules it in
++ * or out without guessing.
++ */
++static void
++a10_gpu_dump_loader(vm_offset_t mali)
++{
++	unsigned as, js;
++
++	for (as = 0; as < A10_GPU_AS_COUNT; as++) {
++		vm_offset_t base = AS0 + as * A10_GPU_AS_STRIDE;
++
++		printf("A10 GPU: loader AS%u transtab=%08x%08x transcfg=%08x "
++		    "memattr=%08x status=%08x fault=%08x\n", as,
++		    a10_gpu_read(mali, base + AS_TRANSTAB_HI),
++		    a10_gpu_read(mali, base + AS_TRANSTAB_LO),
++		    a10_gpu_read(mali, base + AS_TRANSCFG_LO),
++		    a10_gpu_read(mali, base + AS_MEMATTR_LO),
++		    a10_gpu_read(mali, base + AS_STATUS),
++		    a10_gpu_read(mali, base + AS_FAULTSTATUS));
++	}
++	for (js = 0; js < 3; js++) {
++		vm_offset_t base = JS0 + js * (JS1 - JS0);
++
++		printf("A10 GPU: loader JS%u config=%08x head=%08x%08x "
++		    "tail=%08x%08x status=%08x cmd=%08x\n", js,
++		    a10_gpu_read(mali, base + JS_CONFIG_RO),
++		    a10_gpu_read(mali, base + 0x04),
++		    a10_gpu_read(mali, base + 0x00),
++		    a10_gpu_read(mali, base + 0x0c),
++		    a10_gpu_read(mali, base + 0x08),
++		    a10_gpu_read(mali, base + JS_STATUS),
++		    a10_gpu_read(mali, base + 0x20));
++	}
++	printf("A10 GPU: loader job_int rawstat=%08x mask=%08x js_state=%08x "
++	    "mmu rawstat=%08x mask=%08x status=%08x\n",
++	    a10_gpu_read(mali, JOB_INT_RAWSTAT),
++	    a10_gpu_read(mali, JOB_INT_MASK),
++	    a10_gpu_read(mali, JOB_INT_JS_STATE),
++	    a10_gpu_read(mali, MMU_IRQ_RAWSTAT),
++	    a10_gpu_read(mali, MMU_IRQ_MASK),
++	    a10_gpu_read(mali, MMU_IRQ_STATUS));
++}
++
+ /* An identity job after a shape: did the slot come back at all? */
+ static bool
+ a10_gpu_control(vm_offset_t mali, uint32_t *shader_mask, vm_offset_t page,
+@@ -847,19 +933,26 @@
+ 		printf("A10 GPU: control: reset failed\n");
+ 		return false;
+ 	}
+-	if (!a10_gpu_as0(mali, 0, 2)) {
++	if (!a10_gpu_identity(mali)) {
+ 		return false;
+ 	}
+ 	return a10_gpu_write_value(mali, *shader_mask, page,
+ 	    (uint64_t)kvtophys(page), value);
+ }
+ 
++/*
++ * Put one table shape into AS0..AS3, run the job through it, and on failure
++ * say what every space and the MMU saw.  The register read-back is the
++ * point: a shape the MMU refused to accept, or a fault in a space other
++ * than AS0, changes the story.
++ */
+ static bool
+ a10_gpu_try_shape(vm_offset_t mali, uint32_t shader_mask, vm_offset_t page,
+     const char *name, struct a10_gpu_pt *pt, uint64_t transtab,
+     uint32_t transcfg, uint32_t memattr)
+ {
+ 	bool ok;
++	unsigned as;
+ 
+ 	printf("A10 GPU: %s top=%08x%08x leaf=%03llx table=%03llx "
+ 	    "transtab=%08x%08x transcfg=%08x memattr=%08x\n",
+@@ -869,12 +962,33 @@
+ 	    (uint32_t)(transtab >> 32), (uint32_t)transtab,
+ 	    transcfg, memattr);
+ 	a10_gpu_pt_dump(pt, A10_GPU_TEST_VA);
+-	if (!a10_gpu_as0_mem(mali, transtab, transcfg, memattr)) {
+-		printf("A10 GPU: %s: AS0 did not take the tables\n", name);
+-		return false;
++	for (as = 0; as < A10_GPU_AS_COUNT; as++) {
++		if (!a10_gpu_as_setup(mali, as, transtab, transcfg, memattr)) {
++			printf("A10 GPU: %s: AS%u did not take the tables\n",
++			    name, as);
++			return false;
++		}
+ 	}
+ 	ok = a10_gpu_write_value(mali, shader_mask, page, A10_GPU_TEST_VA,
+ 	    A10_GPU_TEST_WORD);
++	if (!ok) {
++		printf("A10 GPU: %s slot config=%08x js_state=%08x "
++		    "gpu_status=%08x mmu_irq=%08x\n", name,
++		    a10_gpu_read(mali, JS1 + JS_CONFIG_RO),
++		    a10_gpu_read(mali, JOB_INT_JS_STATE),
++		    a10_gpu_read(mali, GPU_STATUS),
++		    a10_gpu_read(mali, MMU_IRQ_RAWSTAT));
++		for (as = 0; as < A10_GPU_AS_COUNT; as++) {
++			vm_offset_t base = AS0 + as * A10_GPU_AS_STRIDE;
++
++			printf("A10 GPU: %s AS%u fault=%08x addr=%08x%08x "
++			    "status=%08x\n", name, as,
++			    a10_gpu_read(mali, base + AS_FAULTSTATUS),
++			    a10_gpu_read(mali, base + AS_FAULTADDRESS_HI),
++			    a10_gpu_read(mali, base + AS_FAULTADDRESS_LO),
++			    a10_gpu_read(mali, base + AS_STATUS));
++		}
++	}
+ 	printf("A10 GPU: %s job %s\n", name, ok ? "ran" : "did not run");
+ 	return ok;
+ }
+@@ -907,7 +1021,7 @@
+ {
+ 	vm_offset_t pmu, top, g3d, mali, page = 0;
+ 	uint32_t id, pll, product, shader_mask = 0;
+-	struct a10_gpu_pt kbase, legacy, pfmali, a21s;
++	struct a10_gpu_pt kbase, lpae0, lpae1, a21s;
+ 	struct {
+ 		const char *name;
+ 		struct a10_gpu_pt *pt;
+@@ -915,7 +1029,7 @@
+ 		uint32_t transcfg;
+ 		uint32_t memattr;
+ 		bool ran;
+-	} shapes[4];
++	} shapes[6];
+ 	uint64_t phys;
+ 	bool powered, job_ok = false, control_ok;
+ 	unsigned i;
+@@ -972,6 +1086,7 @@
+ 	}
+ 
+ 	a10_gpu_dump_gpu(mali);
++	a10_gpu_dump_loader(mali);
+ 	if (!a10_gpu_reset(mali)) {
+ 		goto out;
+ 	}
+@@ -988,59 +1103,73 @@
+ 	phys = (uint64_t)kvtophys(page);
+ 
+ 	/* Control: identity mode, the address the GPU sees is the physical one. */
+-	if (a10_gpu_as0(mali, 0, 2)) {
++	if (a10_gpu_identity(mali)) {
+ 		job_ok = a10_gpu_write_value(mali, shader_mask, page, phys,
+ 		    A10_GPU_TEST_WORD);
+-		printf("A10 GPU: identity job %s\n",
+-		    job_ok ? "ran" : "did not run");
+-	}
+-
+-	/* A: the stock kbase AArch64 tables for this GPU. */
++		printf("A10 GPU: identity job %s, slot config=%08x\n",
++		    job_ok ? "ran" : "did not run",
++		    a10_gpu_read(mali, JS1 + JS_CONFIG_RO));
++	}
++
++	/*
++	 * The table sets.  Shapes 1 to 3 share one AArch64 set, since only the
++	 * walker configuration differs between them.
++	 */
+ 	if (!a10_gpu_pt_build(&kbase, 4, PTE_TABLE_AARCH64,
+ 	    PTE_ACCESS | PTE_SH_INNER | PTE_AP_RW | PTE_PAGE_A64, phys)) {
+-		printf("A10 GPU: kbase AArch64 tables not built\n");
+-	}
+-	shapes[0].name = "kbase AArch64";
++		printf("A10 GPU: kbase tables not built\n");
++	}
++	if (!a10_gpu_pt_build(&lpae0, 4, PTE_TABLE_LEGACY,
++	    PTE_HAP_RW | PTE_SH_OUTER | PTE_PAGE_MALI, phys)) {
++		printf("A10 GPU: Mali LPAE tables not built\n");
++	}
++	if (!a10_gpu_pt_build(&lpae1, 4, PTE_TABLE_LEGACY,
++	    PTE_HAP_RW | PTE_SH_OUTER | PTE_ATTR_CACHE | PTE_PAGE_MALI,
++	    phys)) {
++		printf("A10 GPU: Mali LPAE (attribute 1) tables not built\n");
++	}
++	if (!a10_gpu_pt_build(&a21s, 3, PTE_TABLE_LEGACY,
++	    PTE_ACCESS | PTE_SH_INNER | PTE_AP_RW | PTE_PAGE_A64, phys)) {
++		printf("A10 GPU: A21s tables not built\n");
++	}
++
++	shapes[0].name = "stock AArch64";
+ 	shapes[0].pt = &kbase;
+ 	shapes[0].transtab = kbase.top_phys;
+ 	shapes[0].transcfg = TRANSCFG_KBASE;
+ 	shapes[0].memattr = MEMATTR_KBASE;
+ 
+-	/* B: the legacy Mali LPAE recipe proven on XNU. */
+-	if (!a10_gpu_pt_build(&legacy, 4, PTE_TABLE_LEGACY,
+-	    PTE_HAP_RW | PTE_SH_OUTER | PTE_PAGE_MALI, phys)) {
+-		printf("A10 GPU: legacy tables not built\n");
+-	}
+-	shapes[1].name = "legacy 0x2c1";
+-	shapes[1].pt = &legacy;
+-	shapes[1].transtab = legacy.top_phys | TRANSTAB_MALI_TABLE;
+-	shapes[1].transcfg = TRANSCFG_ADRMODE_LEGACY;
+-	shapes[1].memattr = MEMATTR_MALI;
+-
+-	/* C: legacy tables with Panfrost's memory attribute 1. */
+-	if (!a10_gpu_pt_build(&pfmali, 4, PTE_TABLE_LEGACY,
+-	    PTE_HAP_RW | PTE_SH_OUTER | PTE_ATTR_CACHE | PTE_PAGE_MALI,
+-	    phys)) {
+-		printf("A10 GPU: panfrost tables not built\n");
+-	}
+-	shapes[2].name = "panfrost 0x2c5";
+-	shapes[2].pt = &pfmali;
+-	shapes[2].transtab = pfmali.top_phys | TRANSTAB_MALI_TABLE;
+-	shapes[2].transcfg = TRANSCFG_ADRMODE_LEGACY;
+-	shapes[2].memattr = MEMATTR_MALI;
+-
+-	/* D: the A21s G52's three-level AArch64 tables. */
+-	if (!a10_gpu_pt_build(&a21s, 3, PTE_TABLE_LEGACY,
+-	    PTE_ACCESS | PTE_SH_INNER | PTE_AP_RW | PTE_PAGE_A64, phys)) {
+-		printf("A10 GPU: a21s tables not built\n");
+-	}
+-	shapes[3].name = "a21s 3-level";
+-	shapes[3].pt = &a21s;
+-	shapes[3].transtab = a21s.top_phys;
+-	shapes[3].transcfg = TRANSCFG_A21S;
+-	shapes[3].memattr = 0x88888888u;
+-
+-	for (i = 0; i < 4; i++) {
++	shapes[1].name = "stock AArch64, PTW outer-shareable";
++	shapes[1].pt = &kbase;
++	shapes[1].transtab = kbase.top_phys;
++	shapes[1].transcfg = TRANSCFG_KBASE | TRANSCFG_PTW_SH_OS;
++	shapes[1].memattr = MEMATTR_KBASE;
++
++	shapes[2].name = "Panfrost AArch64, INA 7";
++	shapes[2].pt = &kbase;
++	shapes[2].transtab = kbase.top_phys;
++	shapes[2].transcfg = TRANSCFG_PANFROST_A64;
++	shapes[2].memattr = MEMATTR_A21S;
++
++	shapes[3].name = "Mali LPAE, attribute 0";
++	shapes[3].pt = &lpae0;
++	shapes[3].transtab = lpae0.top_phys | TRANSTAB_MALI_TABLE;
++	shapes[3].transcfg = TRANSCFG_ADRMODE_LEGACY;
++	shapes[3].memattr = MEMATTR_MALI;
++
++	shapes[4].name = "Mali LPAE, attribute 1";
++	shapes[4].pt = &lpae1;
++	shapes[4].transtab = lpae1.top_phys | TRANSTAB_MALI_TABLE;
++	shapes[4].transcfg = TRANSCFG_ADRMODE_LEGACY;
++	shapes[4].memattr = MEMATTR_MALI;
++
++	shapes[5].name = "A21s G52 three-level";
++	shapes[5].pt = &a21s;
++	shapes[5].transtab = a21s.top_phys;
++	shapes[5].transcfg = TRANSCFG_A21S_3LVL;
++	shapes[5].memattr = MEMATTR_A21S;
++
++	for (i = 0; i < 6; i++) {
+ 		if (shapes[i].pt->top == NULL) {
+ 			continue;
+ 		}
+@@ -1062,13 +1191,13 @@
+ 	if (page != 0) {
+ 		kmem_free(kernel_map, page, PAGE_SIZE);
+ 	}
+-	printf("A10 GPU: probe done, identity %s, kbase %s, legacy %s, "
+-	    "panfrost %s, a21s %s\n",
+-	    job_ok ? "ran" : "did not run",
+-	    shapes[0].ran ? "ran" : "did not run",
+-	    shapes[1].ran ? "ran" : "did not run",
+-	    shapes[2].ran ? "ran" : "did not run",
+-	    shapes[3].ran ? "ran" : "did not run");
++	printf("A10 GPU: probe done, identity %s\n",
++	    job_ok ? "ran" : "did not run");
++	for (i = 0; i < 6; i++) {
++		printf("A10 GPU: shape %u (%s) %s\n", i + 1,
++		    shapes[i].name != NULL ? shapes[i].name : "?",
++		    shapes[i].ran ? "ran" : "did not run");
++	}
+ }
+ 
+ static void

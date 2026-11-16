@@ -2,6 +2,57 @@
 
 ## >>> A10 PORT (Samsung Galaxy A10, SM-A105F) - active work 2026-11-13 <<<
 
+### >>> UPDATE 2026-11-16: probe79 GPU shapes all 0x58, slot sticks; probe80 resets per shape; CPU/fb timing <<<
+
+**probe79 (0149/0150, kernel CI `43890132893`, SHA256 A4CB95F5...).** iOS boots and
+runs; the user still sees ~1-2 fps and could not reach the home screen. GPU:
+`GPU_ID=60a00002`, identity WRITE_VALUE job ran, then **all four table shapes
+(legacy 0x2c5, 48-bit, 48-bit uncached, 35-bit) reported the identical
+`slot=0x58 job_status=0x00010258`, `fault_ptr=0x100000`, `mmu_irq=0`, `as_fault=0`.**
+A faulted Bifrost slot stays at 0x58 until the GPU is reset, so only the first
+shape really ran; the rest wrote into a dead slot. That is the probe80 premise.
+
+**probe80 (0151).** `a10_gpu_reset()` now also issues `GPU_CMD_CLEAN_INV_CACHES`
+(8) and waits for `IRQ_CLEAN_CACHES_DONE` (1<<17); `a10_gpu_as0_mem()` does
+`AS_COMMAND_FLUSH_MEM` (5) before the new TRANSTAB and writes MEMATTR_HI=0;
+`a10_gpu_write_value()` bzeroes the whole job page; new
+`a10_gpu_ensure_cores()`/`a10_gpu_recover()` (reset + core power-on),
+`a10_gpu_control()` (reset + identity job) and `a10_gpu_try_shape()`. Four shapes,
+each after a reset and followed by an identity control:
+A kbase AArch64 (TRANSTAB=top, TRANSCFG=6|(2<<24), MEMATTR=0x8d888f88,
+tables 0x403, leaf 0x743); B legacy herolte (TRANSTAB|7, TRANSCFG 0,
+MEMATTR 0x008d8888, tables 3, leaf 0x2c1); C legacy Panfrost (same, leaf 0x2c5);
+D A21s 3-level (TRANSTAB=top, TRANSCFG 0x420001c6, MEMATTR 0x88888888, leaf 0x743).
+
+**CPU clocks (probe79, boot thread on the A53 boot core).**
+`cpucl0 A73 pll_con0=a09c0310 m=156 p=3 s=0 -> 1352 MHz, switch div=00000001`;
+`cpucl1/cpucl2 A53 pll_con0=a0750310 m=117 p=3 s=0 -> 1014 MHz, switch div=0`.
+The CMU_TOP switch divider is only in the PLL-change path; the running CPU clock
+is `MUX_CLK_CPUCLx_PLL` (CPUCLx+0x1000) -> `DIV_CLK_CPUCLx_CPU` (CPUCLx+0x1810),
+and Samsung's DIVRATIO field holds divisor-1. Patch 0152 (with 0153-0155 in
+the same push) prints both plus the switch mux (CPUCL0+0x120, CPUCL1/2+0x100)
+and the resulting MHz, to settle whether the A73 really runs at 1352 or at
+676 MHz.
+
+**probe81 (0153-0155).** 0153 writes the six table shapes into AS0..AS3
+(stock kbase AArch64, kbase + PTW_SH_OS, Panfrost A64, Mali LPAE attr0/attr1,
+A21s 3-level), resets and runs an identity control after each, and before the
+first reset dumps what the loader left in AS0..AS3 and JS0..JS2: if slot 1
+was left pointing at an identity AS, that alone explains probe79's identical
+0x58 faults at the untranslated 0x100000. 0154 publishes an empty
+`IOAcceleratorES` (stops QuartzCore's 300x100 ms poll in every process), drops
+the IOKit daemon registry hold (`sweetiokitdhold=1` restores it) and caps the
+AKS console log at 48 lines (`sweetakslog=1` logs all). 0155 adds
+`osfmk/arm64/a10_prof.c`: `a10prof=SECONDS` samples all CPUs at 1 kHz from
+`a10prof_at=SECONDS` and prints per-process ticks and backboardd PCs.
+
+**Frame timing (0150, probe79).** `SWEET FB: 10597 ms: 9 swaps (0/s), 9 presents,
+copy avg 4356 us max 6660 us`; later 10.5 s windows show 0-2 swaps. The panel
+copy is ~4 ms for 1125x2436, i.e. not the bottleneck: CoreAnimation itself
+produces ~1 frame/s through its software renderer. CPU is at stock OPPs, so the
+1-2 fps is the missing GPU (CA::OGL::SWContext), not the copy path.
+
+
 ### >>> UPDATE 2026-11-15: probe73 в работе, кодек жив, ABOX требует прошивку до probe <<<
 
 **probe73 снят (TWRP):** `dist/logs/probe73/a10-sweetlog.txt` (541 846 Б,

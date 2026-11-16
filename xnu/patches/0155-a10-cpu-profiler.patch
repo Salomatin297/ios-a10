@@ -1,0 +1,388 @@
+diff --git a/osfmk/arm64/a10_prof.c b/osfmk/arm64/a10_prof.c
+new file mode 100644
+--- /dev/null
++++ b/osfmk/arm64/a10_prof.c
+@@ -0,0 +1,344 @@
++/*
++ * A10: sampling CPU profiler, after a510f (Wojtacho/ios-unsweet 0131).
++ *
++ * A kernel thread interrupts every other CPU about 1000 times a second
++ * (cpu_xcall).  The handler, on the interrupted CPU, looks at what it was
++ * running: for backboardd (CoreAnimation's render server) it records the
++ * interrupted PC (user, or kernel plus the user PC of the kernel entry);
++ * for every process it counts the tick.  The report (printf) lists CPU
++ * ticks per process and the top backboardd PCs, with backboardd's shared
++ * cache base/slide and, for PCs outside the cache, the mapping they are in,
++ * so they can be symbolized on the PC.
++ *
++ * Boot args: a10prof=SECONDS (0 off, max 120) and a10prof_at=SECONDS after
++ * boot (default 120), so the sample lands on the running UI, not on boot.
++ */
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <kern/task.h>
++#include <kern/kern_types.h>
++#include <kern/locks.h>
++#include <kern/misc_protos.h>
++#include <kern/clock.h>
++#include <arm/cpu_data_internal.h>
++#include <arm/cpu_internal.h>
++#include <arm64/proc_reg.h>
++#include <vm/vm_map.h>
++#include <vm/vm_shared_region.h>
++#include <kern/processor.h>
++#include <arm/machine_routines.h>
++#include <mach/vm_param.h>
++#include <string.h>
++
++extern char *proc_name_address(void *p);
++
++#define PROF_SLOTS      4096
++#define PROF_NAMES      24
++
++struct prof_slot {
++	uint64_t key;           /* pc & ~3 | kind (0 user, 1 kernel, 2 user pc at kernel entry) */
++	uint32_t n;
++};
++
++static struct prof_slot prof_tab[PROF_SLOTS];
++static struct {
++	char name[20];
++	uint32_t n;
++} prof_names[PROF_NAMES];
++static uint32_t prof_ticks, prof_bbd, prof_lost;
++/* every process: key = name index << 56 | kernel << 55 | pc & 2^47-1 */
++#define PROF2_SLOTS     8192
++static struct prof_slot prof_tab2[PROF2_SLOTS];
++static volatile int prof_on;
++static int prof_seconds;
++static uint64_t prof_at;
++
++static void
++prof_add(uint64_t pc, unsigned kind)
++{
++	uint64_t key = (pc & ~3ull) | kind;
++	uint32_t h = (uint32_t)((key >> 2) * 2654435761u) % PROF_SLOTS;
++	for (int i = 0; i < 64; i++, h = (h + 1) % PROF_SLOTS) {
++		uint64_t cur = __atomic_load_n(&prof_tab[h].key, __ATOMIC_RELAXED);
++		if (cur == 0) {
++			uint64_t zero = 0;
++			if (__atomic_compare_exchange_n(&prof_tab[h].key, &zero, key, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
++				cur = key;
++			} else {
++				cur = zero;
++			}
++		}
++		if (cur == key) {
++			__atomic_fetch_add(&prof_tab[h].n, 1, __ATOMIC_RELAXED);
++			return;
++		}
++	}
++	__atomic_fetch_add(&prof_lost, 1, __ATOMIC_RELAXED);
++}
++
++static void
++prof_add2(uint64_t key)
++{
++	uint32_t h = (uint32_t)((key >> 2) * 2654435761u) % PROF2_SLOTS;
++	for (int i = 0; i < 64; i++, h = (h + 1) % PROF2_SLOTS) {
++		uint64_t cur = __atomic_load_n(&prof_tab2[h].key, __ATOMIC_RELAXED);
++		if (cur == 0) {
++			uint64_t zero = 0;
++			cur = __atomic_compare_exchange_n(&prof_tab2[h].key, &zero, key, false, __ATOMIC_RELAXED,
++			    __ATOMIC_RELAXED) ? key : zero;
++		}
++		if (cur == key) {
++			__atomic_fetch_add(&prof_tab2[h].n, 1, __ATOMIC_RELAXED);
++			return;
++		}
++	}
++	__atomic_fetch_add(&prof_lost, 1, __ATOMIC_RELAXED);
++}
++
++static int
++prof_name_tick(const char *name)
++{
++	for (int i = 0; i < PROF_NAMES; i++) {
++		if (prof_names[i].name[0] == 0) {
++			/* racy first claim: a rare duplicate row is fine */
++			strlcpy(prof_names[i].name, name, sizeof(prof_names[i].name));
++		}
++		if (strncmp(prof_names[i].name, name, sizeof(prof_names[i].name) - 1) == 0) {
++			__atomic_fetch_add(&prof_names[i].n, 1, __ATOMIC_RELAXED);
++			return i;
++		}
++	}
++	return -1;
++}
++
++/* on the interrupted CPU, in the IPI handler */
++static void
++prof_xcall(void *arg)
++{
++	(void)arg;
++	if (!prof_on) {
++		return;
++	}
++	cpu_data_t *cdp = getCpuDatap();
++	arm_saved_state_t *st = (arm_saved_state_t *)cdp->cpu_int_state;
++	thread_t th = current_thread();
++	task_t t = th ? get_threadtask(th) : TASK_NULL;
++	void *bp = t ? get_bsdtask_info(t) : NULL;
++	const char *name = bp ? proc_name_address(bp) : "kernel_task";
++	if (th != THREAD_NULL && (th->state & TH_IDLE)) {
++		name = "(idle)";
++	}
++	int ni = prof_name_tick(name ? name : "?");
++	if (st != NULL && ni >= 0 && !(th != THREAD_NULL && (th->state & TH_IDLE))) {
++		uint64_t pc2 = get_saved_state_pc(st);
++		bool k = !PSR64_IS_USER(get_saved_state_cpsr(st));
++		prof_add2(((uint64_t)ni << 56) | ((uint64_t)k << 55) | (pc2 & 0x7fffffffffffull));
++	}
++	if (st == NULL || name == NULL || strcmp(name, "backboardd") != 0) {
++		return;
++	}
++	__atomic_fetch_add(&prof_bbd, 1, __ATOMIC_RELAXED);
++	uint64_t pc = get_saved_state_pc(st);
++	if (PSR64_IS_USER(get_saved_state_cpsr(st))) {
++		prof_add(pc, 0);
++	} else {
++		prof_add(pc, 1);
++		if (th->machine.upcb != NULL) {
++			prof_add(get_saved_state_pc(th->machine.upcb), 2);
++		}
++	}
++}
++
++static task_t
++prof_find_task(const char *want)
++{
++	task_t found = TASK_NULL, t;
++	lck_mtx_lock(&tasks_threads_lock);
++	queue_iterate(&tasks, t, task_t, tasks) {
++		void *bp = get_bsdtask_info(t);
++		const char *n = bp ? proc_name_address(bp) : NULL;
++		if (n != NULL && strcmp(n, want) == 0) {
++			task_reference(t);
++			found = t;
++			break;
++		}
++	}
++	lck_mtx_unlock(&tasks_threads_lock);
++	return found;
++}
++
++static void
++prof_report(void)
++{
++	printf("A10 PROF: %u ticks of %d CPUs, backboardd running in %u CPU-ticks, %u samples lost\n",
++	    prof_ticks, ml_get_max_cpu_number() + 1, prof_bbd, prof_lost);
++	for (int i = 0; i < PROF_NAMES && prof_names[i].name[0]; i++) {
++		printf("A10 PROF: cpu %-20s %u\n", prof_names[i].name, prof_names[i].n);
++	}
++	task_t bt = prof_find_task("backboardd");
++	uint64_t sc_base = 0, sc_size = 0, sc_slide = 0;
++	vm_map_t map = VM_MAP_NULL;
++	if (bt != TASK_NULL) {
++		vm_shared_region_t sr = vm_shared_region_get(bt);
++		if (sr != NULL) {
++			sc_base = sr->sr_base_address;
++			sc_size = sr->sr_size;
++			sc_slide = sr->sr_slide;
++			vm_shared_region_deallocate(sr);
++		}
++		map = get_task_map_reference(bt);
++	}
++	printf("A10 PROF: backboardd shared region base 0x%llx size 0x%llx slide 0x%llx\n", sc_base, sc_size, sc_slide);
++	/* top 80 by count (selection; the table is small) */
++	static uint8_t used[PROF_SLOTS];
++	bzero(used, sizeof(used));
++	for (int r = 0; r < 80; r++) {
++		int best = -1;
++		for (int i = 0; i < PROF_SLOTS; i++) {
++			if (!used[i] && prof_tab[i].key != 0 && (best < 0 || prof_tab[i].n > prof_tab[best].n)) {
++				best = i;
++			}
++		}
++		if (best < 0 || prof_tab[best].n == 0) {
++			break;
++		}
++		used[best] = 1;
++		uint64_t key = prof_tab[best].key, pc = key & ~3ull;
++		unsigned kind = (unsigned)(key & 3);
++		if (kind == 1) {
++			printf("A10 PROF: %5u K 0x%llx (unslid 0x%llx)\n", prof_tab[best].n, pc,
++			    (uint64_t)VM_KERNEL_UNSLIDE(pc));
++		} else if (pc >= sc_base && pc < sc_base + sc_size) {
++			printf("A10 PROF: %5u %c cache+0x%llx\n", prof_tab[best].n, kind == 0 ? 'U' : 'S', pc - sc_base);
++		} else {
++			uint64_t start = 0, off = 0;
++			if (map != VM_MAP_NULL) {
++				vm_map_entry_t e;
++				vm_map_lock_read(map);
++				if (vm_map_lookup_entry(map, pc, &e)) {
++					start = e->vme_start;
++					off = VME_OFFSET(e);
++				}
++				vm_map_unlock_read(map);
++			}
++			printf("A10 PROF: %5u %c 0x%llx (map entry 0x%llx + 0x%llx, object offset 0x%llx)\n", prof_tab[best].n,
++			    kind == 0 ? 'U' : 'S', pc, start, pc - start, off);
++		}
++	}
++	if (map != VM_MAP_NULL) {
++		vm_map_deallocate(map);
++	}
++	if (bt != TASK_NULL) {
++		task_deallocate(bt);
++	}
++	/* the 6 busiest processes: their top 14 PCs each */
++	static uint8_t done_n[PROF_NAMES];
++	bzero(done_n, sizeof(done_n));
++	for (int r = 0; r < 6; r++) {
++		int bi = -1;
++		for (int i = 0; i < PROF_NAMES && prof_names[i].name[0]; i++) {
++			if (!done_n[i] && strcmp(prof_names[i].name, "(idle)") != 0 &&
++			    (bi < 0 || prof_names[i].n > prof_names[bi].n)) {
++				bi = i;
++			}
++		}
++		if (bi < 0) {
++			break;
++		}
++		done_n[bi] = 1;
++		static uint8_t used2[PROF2_SLOTS];
++		bzero(used2, sizeof(used2));
++		for (int q = 0; q < 14; q++) {
++			int best = -1;
++			for (int i = 0; i < PROF2_SLOTS; i++) {
++				if (!used2[i] && prof_tab2[i].key != 0 && (int)(prof_tab2[i].key >> 56) == bi &&
++				    (best < 0 || prof_tab2[i].n > prof_tab2[best].n)) {
++					best = i;
++				}
++			}
++			if (best < 0) {
++				break;
++			}
++			used2[best] = 1;
++			uint64_t key = prof_tab2[best].key, pc = key & 0x7fffffffffffull;
++			if (key & (1ull << 55)) {
++				printf("A10 PROF: %s %5u K 0x%llx\n", prof_names[bi].name, prof_tab2[best].n,
++				    pc | 0xffff800000000000ull);
++			} else if (pc >= sc_base && pc < sc_base + sc_size) {
++				printf("A10 PROF: %s %5u U cache+0x%llx\n", prof_names[bi].name, prof_tab2[best].n, pc - sc_base);
++			} else {
++				printf("A10 PROF: %s %5u U 0x%llx\n", prof_names[bi].name, prof_tab2[best].n, pc);
++			}
++		}
++	}
++	printf("A10 PROF: end\n");
++}
++
++static void
++prof_thread(void *arg, wait_result_t wr)
++{
++	(void)arg;
++	(void)wr;
++	uint64_t ns = 0, abs = 0;
++	int ncpu = ml_get_max_cpu_number() + 1;
++
++	/* wait until the configured point after boot */
++	while (mach_absolute_time() < prof_at) {
++		uint64_t left = prof_at - mach_absolute_time();
++		uint64_t ms;
++
++		absolutetime_to_nanoseconds(left, &ns);
++		ms = ns / NSEC_PER_MSEC;
++		if (ms > 1000) {
++			ms = 1000;
++		}
++		if (ms == 0) {
++			ms = 1;
++		}
++		assert_wait_timeout((event_t)&prof_ticks, THREAD_UNINT,
++		    (uint32_t)ms, NSEC_PER_MSEC);
++		thread_block(THREAD_CONTINUE_NULL);
++	}
++	printf("A10 PROF: sampling %d CPUs for %d s\n", ncpu, prof_seconds);
++	prof_on = 1;
++	uint64_t end = mach_absolute_time();
++	ns = (uint64_t)prof_seconds * NSEC_PER_SEC;
++	nanoseconds_to_absolutetime(ns, &abs);
++	end += abs;
++	while (mach_absolute_time() < end) {
++		int me = cpu_number();
++		for (int c = 0; c < ncpu; c++) {
++			if (c != me && CpuDataEntries[c].cpu_data_vaddr != NULL) {
++				(void)cpu_xcall(c, prof_xcall, (void *)1);
++			}
++		}
++		prof_ticks++;
++		assert_wait_timeout((event_t)&prof_ticks, THREAD_UNINT, 1000, NSEC_PER_USEC);
++		thread_block(THREAD_CONTINUE_NULL);
++	}
++	prof_on = 0;
++	assert_wait_timeout((event_t)&prof_ticks, THREAD_UNINT, 20, NSEC_PER_MSEC);
++	thread_block(THREAD_CONTINUE_NULL);
++	prof_report();
++}
++
++void a10_prof_start(int at_seconds, int seconds);
++
++void
++a10_prof_start(int at_seconds, int seconds)
++{
++	static int started;
++	if (started++ || seconds <= 0 || seconds > 120) {
++		printf("A10 PROF: not started (%d s, run %d)\n", seconds, started);
++		return;
++	}
++	prof_seconds = seconds;
++	uint64_t ns = (uint64_t)(at_seconds > 0 ? at_seconds : 0) * NSEC_PER_SEC;
++	uint64_t abs = 0;
++	nanoseconds_to_absolutetime(ns, &abs);
++	prof_at = mach_absolute_time() + abs;
++	thread_t th;
++	if (kernel_thread_start(prof_thread, NULL, &th) == KERN_SUCCESS) {
++		thread_deallocate(th);
++	}
++}
+diff --git a/osfmk/conf/files.arm64 b/osfmk/conf/files.arm64
+--- a/osfmk/conf/files.arm64
++++ b/osfmk/conf/files.arm64
+@@ -41,6 +41,7 @@
+ osfmk/arm/arm_init.c	optional config_pmap_ppl
+ osfmk/arm64/arm_vm_init.c	optional config_pmap_ppl
+ osfmk/arm64/sweet_early.c	standard
++osfmk/arm64/a10_prof.c	standard
+ osfmk/arm64/arm64_hypercall.c	standard
+ osfmk/arm/io_map.c		standard
+ osfmk/arm64/loose_ends.c	standard
+diff --git a/bsd/dev/sweet_emmc.c b/bsd/dev/sweet_emmc.c
+--- a/bsd/dev/sweet_emmc.c
++++ b/bsd/dev/sweet_emmc.c
+@@ -1627,6 +1627,24 @@
+ 		printf("SWEET SMP: A10 sampler start\n");
+ 		sweet_sample_start();
+ 	}
++	/*
++	 * a10prof=SECONDS: sample every CPU 1000 times a second for that long,
++	 * a10prof_at=SECONDS after this point (default 120), and print where
++	 * the time went.  Off unless asked for.
++	 */
++	{
++		extern void a10_prof_start(int at_seconds, int seconds);
++		int prof_secs = 0, prof_at = 120;
++
++		if (PE_parse_boot_argn("a10prof", &prof_secs, sizeof(prof_secs)) &&
++		    prof_secs > 0) {
++			(void)PE_parse_boot_argn("a10prof_at", &prof_at,
++			    sizeof(prof_at));
++			printf("A10 PROF: start at +%d s for %d s\n", prof_at,
++			    prof_secs);
++			a10_prof_start(prof_at, prof_secs);
++		}
++	}
+ 	return 0;
+ }
+ 

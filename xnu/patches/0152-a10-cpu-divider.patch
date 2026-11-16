@@ -1,0 +1,63 @@
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -228,15 +228,26 @@
+ #define SWEET_CPUCL2_PA    0x10a00000u
+ #define SWEET_CPUCL_SIZE   0x2000u
+ 
++/*
++ * The CPU's own clock is PLL_CPUCLx through MUX_CLK_CPUCLx_PLL (CPUCLx +
++ * 0x1000) and DIV_CLK_CPUCLx_CPU (CPUCLx + 0x1810).  Samsung's DIVRATIO
++ * field holds the divisor minus one, so 0 is divide-by-one.  The CMU_TOP
++ * switch divider (0x182c/0x1830/0x1834) is only in the PLL-change path,
++ * not in the running CPU clock, and the switch mux (CPUCL0 + 0x120, the
++ * A53 clusters at + 0x100) says whether the switch or the PLL feeds it.
++ */
+ static void
+ sweet_cpu_cluster(const char *name, vm_offset_t cmu_top, vm_offset_t pll,
+-    uint32_t pll_con0, uint32_t div_off)
+-{
+-	uint32_t con = 0, div = 0;
+-	uint64_t m, p, s, mhz = 0;
++    uint32_t pll_con0, uint32_t div_off, uint32_t switch_mux_off)
++{
++	uint32_t con = 0, div = 0, mux = 0, cpu_div = 0, sw = 0, ratio = 1;
++	uint64_t m, p, s, mhz = 0, cpu_mhz = 0;
+ 
+ 	if (pll != 0) {
+ 		con = *(volatile uint32_t *)(pll + pll_con0);
++		mux = *(volatile uint32_t *)(pll + 0x1000);
++		cpu_div = *(volatile uint32_t *)(pll + 0x1810);
++		sw = *(volatile uint32_t *)(pll + switch_mux_off);
+ 	}
+ 	if (cmu_top != 0) {
+ 		div = *(volatile uint32_t *)(cmu_top + div_off);
+@@ -247,10 +258,15 @@
+ 	if (m != 0 && p != 0) {
+ 		mhz = (26000000ull * m) / (p << s) / 1000000ull;
+ 	}
++	ratio = (cpu_div & 0xfffu) + 1;
++	cpu_mhz = mhz / ratio;
+ 	IOLog("SWEET CPU: %s pll_con0=%08x m=%llu p=%llu s=%llu -> %llu MHz, "
+ 	    "switch div=%08x%s\n",
+ 	    name, con, m, p, s, mhz, div,
+ 	    (con & (1u << 31)) ? "" : " (PLL OFF)");
++	IOLog("SWEET CPU: %s mux=%08x cpu_div=%08x (/ %u) -> %llu MHz, "
++	    "switch mux=%08x\n",
++	    name, mux, cpu_div, ratio, cpu_mhz, sw);
+ }
+ 
+ static void
+@@ -269,9 +285,9 @@
+ 		return;
+ 	}
+ 	/* CPUCL0 is the A73 pair, CPUCL1 and CPUCL2 the two A53 pairs. */
+-	sweet_cpu_cluster("cpucl0 A73", top, cl0, 0x140, 0x182c);
+-	sweet_cpu_cluster("cpucl1 A53", top, cl1, 0x120, 0x1830);
+-	sweet_cpu_cluster("cpucl2 A53", top, cl2, 0x120, 0x1834);
++	sweet_cpu_cluster("cpucl0 A73", top, cl0, 0x140, 0x182c, 0x120);
++	sweet_cpu_cluster("cpucl1 A53", top, cl1, 0x120, 0x1830, 0x100);
++	sweet_cpu_cluster("cpucl2 A53", top, cl2, 0x120, 0x1834, 0x100);
+ }
+ 
+ /* Do not wait in a nub's start(): matching can be asynchronous or serialized. */

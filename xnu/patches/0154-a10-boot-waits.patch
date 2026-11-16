@@ -1,0 +1,149 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -177,6 +177,21 @@
+ 
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+ 
++/*
++ * The GPU service class QuartzCore looks for.  Without it,
++ * CAMetalContextCreate polls IOServiceMatching("IOAcceleratorES") 300
++ * times, 100 ms apart -- thirty seconds in every process that draws, and
++ * again at every backboardd start.  This object carries no MetalPluginName
++ * and no MetalPluginClassName, so Metal finds it, passes it over, and leaves
++ * the renderers as they were; the poll itself stops on the first match.
++ * sweetaccel=0 publishes nothing (the old 30 s wait).
++ */
++class IOAcceleratorES : public IOService {
++	OSDeclareDefaultStructors(IOAcceleratorES);
++};
++
++OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
++
+ class IOMobileFramebufferUserClient : public IOUserClient {
+ 	OSDeclareDefaultStructors(IOMobileFramebufferUserClient);
+ 
+@@ -286,6 +301,23 @@
+ 	registerService();
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
++	{
++		uint32_t accel_on = 1;
++		IOAcceleratorES *accel;
++
++		(void)PE_parse_boot_argn("sweetaccel", &accel_on,
++		    sizeof(accel_on));
++		accel = accel_on ? OSTypeAlloc(IOAcceleratorES) : NULL;
++		if (accel != NULL && accel->init()) {
++			accel->setName("sgx");
++			if (accel->attach(this)) {
++				accel->registerService();
++				IOLog("SWEET FB: empty IOAcceleratorES published "
++				    "(no 30 s CAMetalContextCreate wait)\n");
++			}
++		}
++		OSSafeReleaseNULL(accel);
++	}
+ 	return true;
+ }
+ 
+diff --git a/iokit/Kernel/IOStartIOKit.cpp b/iokit/Kernel/IOStartIOKit.cpp
+--- a/iokit/Kernel/IOStartIOKit.cpp
++++ b/iokit/Kernel/IOStartIOKit.cpp
+@@ -46,9 +46,14 @@
+ #include <IOKit/IOKitKeysPrivate.h>
+ #include <IOKit/IOInterruptAccountingPrivate.h>
+ #include <IOKit/assert.h>
++#include <pexpert/pexpert.h>
+ #include <sys/conf.h>
+ 
+ #include "IOKitKernelInternal.h"
++
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++bool gSweetIOKitdHold = true;           /* read by IOService::iokitDaemonLaunched */
++#endif
+ 
+ const OSSymbol * gIOProgressBackbufferKey;
+ OSSet *          gIORemoveOnReadProperties;
+@@ -188,7 +193,17 @@
+ 	}
+ 
+ #if !NO_KEXTD
+-	if (OSKext::iokitDaemonAvailable()) {
++	/*
++	 * No IOKit daemon ever reports in on this port (there are no kexts to
++	 * manage), so Apple's hold kept the registry root busy forever: IOKit
++	 * never quiesced, configd's InterfaceNamer never said "quiet", and
++	 * wifid -- SpringBoard behind it -- waited for that at boot.
++	 * sweetiokitdhold=1 restores Apple's hold.
++	 */
++	uint32_t hold = 0;
++	(void)PE_parse_boot_argn("sweetiokitdhold", &hold, sizeof(hold));
++	gSweetIOKitdHold = (hold != 0);
++	if (gSweetIOKitdHold && OSKext::iokitDaemonAvailable()) {
+ 		/* Add a busy count to keep the registry busy until the IOKit daemon has
+ 		 * completely finished launching. This is decremented when the IOKit daemon
+ 		 * messages the kernel after the in-kernel linker has been
+diff --git a/iokit/Kernel/IOService.cpp b/iokit/Kernel/IOService.cpp
+--- a/iokit/Kernel/IOService.cpp
++++ b/iokit/Kernel/IOService.cpp
+@@ -28,6 +28,10 @@
+ 
+ #include <IOKit/system.h>
+ #include <IOKit/IOService.h>
++
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++extern bool gSweetIOKitdHold;           /* IOStartIOKit.cpp */
++#endif
+ #include <libkern/OSDebug.h>
+ #include <libkern/c++/OSAllocation.h>
+ #include <libkern/c++/OSContainers.h>
+@@ -1200,6 +1204,9 @@
+ 	}
+ 	IOServiceTrace(IOSERVICE_KEXTD_READY, 0, 0, 0, 0);
+ 	startDeferredMatches();
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	if (gSweetIOKitdHold)     /* IOStartIOKit.cpp: no hold was taken */
++#endif
+ 	getServiceRoot()->adjustBusy(-1);
+ 	IOService::publishUserResource(gIOResourceIOKitKey);
+ #endif /* !NO_KEXTD */
+diff --git a/iokit/Kernel/arm/SweetKeyStore.cpp b/iokit/Kernel/arm/SweetKeyStore.cpp
+--- a/iokit/Kernel/arm/SweetKeyStore.cpp
++++ b/iokit/Kernel/arm/SweetKeyStore.cpp
+@@ -15,6 +15,7 @@
+  * with kIOReturnUnsupported.
+  */
+ #include <pexpert/arm64/board_config.h>
++#include <pexpert/pexpert.h>
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+@@ -232,6 +233,27 @@
+ 		break;
+ 	}
+ 
++	/*
++	 * Every keystore call used to print a console line -- hundreds per boot,
++	 * each one drawn and scrolled on the panel.  Now the first 48 calls
++	 * only; sweetakslog=1 logs all of them.
++	 */
++	static int aks_log = -1;
++	static uint32_t aks_lines;
++	if (aks_log < 0) {
++		int v = 0;
++		(void)PE_parse_boot_argn("sweetakslog", &v, sizeof(v));
++		aks_log = v;
++	}
++	if (!aks_log && aks_lines >= 48) {
++		if (aks_lines++ == 48) {
++			IOLog("SWEET AKS: further calls not logged "
++			    "(sweetakslog=1 logs all)\n");
++		}
++		return ret;
++	}
++	aks_lines++;
++
+ 	char name[32];
+ 	proc_selfname(name, sizeof(name));
+ 	IOLog("SWEET AKS: %s sel %u arg0 %llu in %u/%u out %u/%u -> 0x%x\n", name, selector,
