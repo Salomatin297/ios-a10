@@ -226,6 +226,10 @@ jobs:
           need dxb/xnu/iokit/Kernel/arm/SweetMali.cpp 'SweetMali published' present '0158 A10 Mali driver'
           need dxb/xnu/iokit/conf/files.arm64 'SweetMali.cpp' present '0158 Mali driver in the build'
           need dxb/xnu/iokit/Kernel/arm/SweetSurface.cpp 'sweet_mali_publish' present '0158 Mali driver published'
+          need dxb/xnu/bsd/kern/kern_exec.c 'sweet_env_append' present '0159 sweetenv boot arg'
+          need dxb/xnu/bsd/kern/sweet_amfi.c 'sweet_amfi_dyld_syscall' present '0159 AMFI dyld policy'
+          need dxb/xnu/bsd/dev/a10_touch.c 'a10_touch_boot_status' present '0160 touch boot status cache'
+          need dxb/xnu/bsd/dev/a10_touch.c 'failed bring-ups' present '0160 touch retry without power-cycle storm'
           if [ "$fail" -ne 0 ]; then
             echo "::error::A10 port patches did not apply cleanly"
             exit 1

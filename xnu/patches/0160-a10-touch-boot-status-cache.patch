@@ -1,0 +1,103 @@
+diff --git a/bsd/dev/a10_touch.c b/bsd/dev/a10_touch.c
+index d11ddf6..9e0859a 100644
+--- a/bsd/dev/a10_touch.c
++++ b/bsd/dev/a10_touch.c
+@@ -526,6 +526,15 @@ a10_touch_power_cycle(void)
+  * byte 1 = 0x00 (ack), byte 2 = 0x20 (app mode).  Reading 0x55 is the
+  * authoritative check; the event only tells us the queue is alive.
+  */
++/*
++ * The IC answers SEC_TS_READ_BOOT_STATUS (0x55) once after it boots; a second
++ * read NAKs.  probe82 showed the wait loop getting 0x20 and the check right
++ * after it getting no answer at all, so the driver power-cycled the panel
++ * forever (469 times in one session) and touch was dead.  Remember what the
++ * wait loop saw instead of asking again.
++ */
++static uint8_t a10_touch_boot_status;
++
+ static bool
+ a10_touch_wait_app_mode(unsigned ms)
+ {
+@@ -552,10 +561,15 @@ a10_touch_wait_app_mode(unsigned ms)
+ 		}
+ 		if (sec_ts_read(SEC_TS_READ_BOOT_STATUS, &boot, 1) &&
+ 		    boot == SEC_TS_STATUS_APP_MODE) {
++			a10_touch_boot_status = boot;
+ 			printf("A10 TOUCH: app mode after %u ms%s\n", waited,
+ 			    saw_boot ? " (boot event seen)" : "");
+ 			return true;
+ 		}
++		if (a10_touch_boot_status == SEC_TS_STATUS_APP_MODE) {
++			/* Already known from before a bus glitch; do not ask. */
++			return true;
++		}
+ 		a10_touch_wait_ms(20);
+ 		waited += 20;
+ 	}
+@@ -574,11 +588,13 @@ a10_touch_bringup(void)
+ 	const uint8_t func[2] = { SEC_TS_DEFAULT_SETFUNC, 0 };
+ 
+ 	if (!a10_touch_powered) {
++		a10_touch_boot_status = 0;
+ 		a10_touch_power_cycle();
+ 		a10_touch_powered = true;
+ 	}
+ 	if (a10_touch_reset) {
+ 		a10_touch_reset = 0;
++		a10_touch_boot_status = 0;
+ 		a10_touch_power_cycle();
+ 	}
+ 	if (!a10_touch_wait_app_mode(1500)) {
+@@ -597,9 +613,8 @@ a10_touch_bringup(void)
+ 	if (sec_ts_read(SEC_TS_READ_FW_INTEGRITY, &fw, 1)) {
+ 		printf("A10 TOUCH: fw integrity %02x\n", fw);
+ 	}
+-	if (sec_ts_read(SEC_TS_READ_BOOT_STATUS, &boot, 1)) {
+-		printf("A10 TOUCH: boot status %02x\n", boot);
+-	}
++	boot = a10_touch_boot_status;
++	printf("A10 TOUCH: boot status %02x (cached)\n", boot);
+ 	if (sec_ts_read(SEC_TS_READ_TS_STATUS, ts, sizeof(ts))) {
+ 		printf("A10 TOUCH: ts status %02x %02x %02x %02x\n",
+ 		    ts[0], ts[1], ts[2], ts[3]);
+@@ -758,6 +773,7 @@ a10_touch_thread(void *arg, wait_result_t result)
+ 	unsigned events = 0;
+ 	unsigned errors = 0;
+ 	unsigned ticks = 0;
++	unsigned fails = 0;
+ 
+ 	(void)arg;
+ 	(void)result;
+@@ -767,11 +783,22 @@ a10_touch_thread(void *arg, wait_result_t result)
+ 		if (!up) {
+ 			up = a10_touch_bringup();
+ 			if (!up) {
+-				/* Power-cycle again on the next attempt. */
+-				a10_touch_powered = false;
++				/*
++				 * probe82: the IC answers 0x55 once, so an
++				 * unconditional re-power turned one failed check
++				 * into 469 LDO cycles and the bus never settled.
++				 * Retry on the live bus and re-power only every
++				 * fifth failure.
++				 */
++				if (++fails % 5 == 0) {
++					printf("A10 TOUCH: %u failed bring-ups, "
++					    "re-powering\n", fails);
++					a10_touch_powered = false;
++				}
+ 				a10_touch_wait_ms(1000);
+ 				continue;
+ 			}
++			fails = 0;
+ 			printf("A10 TOUCH: ready\n");
+ 			errors = 0;
+ 			ticks = 0;
+@@ -784,7 +811,6 @@ a10_touch_thread(void *arg, wait_result_t result)
+ 				printf("A10 TOUCH: bus lost, re-initialising\n");
+ 				a10_touch_drop_all();
+ 				up = false;
+-				a10_touch_powered = false;
+ 				errors = 0;
+ 			}
+ 			a10_touch_wait_ms(50);

@@ -1,0 +1,160 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 910e1b6..fe3ac70 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -445,6 +445,84 @@ exec_add_user_string(struct image_params *imgp, user_addr_t str, int seg, boolea
+ 	return error;
+ }
+ 
++/*
++ * A10: sweetenv=name:VAR=VAL[,VAR=VAL][;name:VAR=VAL...]
++ *
++ * Injects environment variables into a named executable at exec time, so a
++ * library can be loaded into one process without touching the root image:
++ *   sweetenv=backboardd:DYLD_INSERT_LIBRARIES=/usr/lib/sweetgl.dylib
++ * The name is the last path component of the executable.  dyld only honours
++ * DYLD_* variables once the AMFI dyld policy answers (sweet_amfi.c), and it
++ * aborts the process if the named library does not exist, so do not set this
++ * before the file is on the phone.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++static int
++sweet_env_append(struct image_params *imgp, int ptr_size)
++{
++	static char sweetenv[512];
++	static char *entries[8];
++	static int nentries = -1;
++
++	if (nentries < 0) {
++		nentries = 0;
++		if (PE_parse_boot_argn("sweetenv", sweetenv, sizeof(sweetenv))) {
++			char *p = sweetenv;
++			while (*p != '\0' && nentries < 8) {
++				entries[nentries++] = p;
++				while (*p != '\0' && *p != ';') {
++					p++;
++				}
++				if (*p == ';') {
++					*p++ = '\0';
++				}
++			}
++			printf("A10 ENV: %d sweetenv entries\n", nentries);
++		}
++	}
++	if (nentries == 0 || imgp->ip_vp == NULL || imgp->ip_vp->v_name == NULL) {
++		return 0;
++	}
++	const char *name = imgp->ip_vp->v_name;
++	for (int i = 0; i < nentries; i++) {
++		char *e = entries[i];
++		char *colon = strchr(e, ':');
++		if (colon == NULL) {
++			continue;
++		}
++		size_t nlen = (size_t)(colon - e);
++		if (strlen(name) != nlen || strncmp(name, e, nlen) != 0) {
++			continue;
++		}
++		for (char *vars = colon + 1; *vars != '\0'; ) {
++			char *comma = strchr(vars, ',');
++			size_t vlen = comma ? (size_t)(comma - vars) : strlen(vars);
++			if (vlen > 0 && vlen < 256) {
++				char var[256];
++				memcpy(var, vars, vlen);
++				var[vlen] = '\0';
++				int err = exec_add_user_string(imgp,
++				    CAST_USER_ADDR_T(var), UIO_SYSSPACE, TRUE);
++				if (err != 0) {
++					return err;
++				}
++				if (imgp->ip_argspace < ptr_size) {
++					return E2BIG;
++				}
++				imgp->ip_argspace -= ptr_size;
++				imgp->ip_envc++;
++				printf("A10 ENV: %s += %s\n", name, var);
++			}
++			if (comma == NULL) {
++				break;
++			}
++			vars = comma + 1;
++		}
++	}
++	return 0;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
++
+ /*
+  * dyld is now passed the executable path as a getenv-like variable
+  * in the same fashion as the stack_guard and malloc_entropy keys.
+@@ -5741,6 +5819,14 @@ exec_extract_strings(struct image_params *imgp)
+ 		imgp->ip_envc++;
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/* A10: extra environment for one named executable (sweetenv boot arg). */
++	error = sweet_env_append(imgp, new_ptr_size);
++	if (error != 0) {
++		goto bad;
++	}
++#endif
++
+ 	/* Save space for envv[] NULL terminator */
+ 	if (imgp->ip_argspace < new_ptr_size) {
+ 		error = E2BIG;
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index cb67b4d..9a43a66 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -367,6 +367,42 @@ static struct mac_policy_conf sweet_amfi_mac_conf = {
+ 
+ static mac_policy_handle_t sweet_amfi_mac_handle;
+ 
++/*
++ * Policy "AMFI": dyld asks __mac_syscall("AMFI", 90 (check_dyld_policy_self),
++ * &flags) whether the DYLD_* variables of this process may be honoured.  With
++ * no policy of that name the call fails with ENOPOLICY and dyld reports flags
++ * 0, so DYLD_INSERT_LIBRARIES is ignored (a510f, patch 0124).  0x7b is the
++ * value the a510f port answers with on the same dyld (iOS 16.7.16, 20H392):
++ * at-paths, path vars, print, failed insertion allowed, interposing, suppress.
++ */
++static int
++sweet_amfi_dyld_syscall(__unused struct proc *p, int call, user_addr_t arg)
++{
++	uint64_t flags = 0x7b;
++	static bool logged;
++
++	if (call != 0x5a) {
++		return 0;
++	}
++	if (!logged) {
++		logged = true;
++		printf("SWEET AMFI: dyld policy asked, answering 0x%llx\n", flags);
++	}
++	return copyout(&flags, arg, sizeof(flags)) == 0 ? 0 : EFAULT;
++}
++
++static const struct mac_policy_ops sweet_amfi_dyld_mac_ops = {
++	.mpo_policy_syscall = sweet_amfi_dyld_syscall,
++};
++
++static struct mac_policy_conf sweet_amfi_dyld_mac_conf = {
++	.mpc_name = "AMFI",
++	.mpc_fullname = "SWEET AMFI dyld policy stand-in",
++	.mpc_ops = &sweet_amfi_dyld_mac_ops,
++};
++
++static mac_policy_handle_t sweet_amfi_dyld_mac_handle;
++
+ /* Called from bsd_init once MAC policies can register, before any exec. */
+ void sweet_amfi_policy_register(void);
+ 
+@@ -379,5 +415,8 @@ sweet_amfi_policy_register(void)
+ 	error = mac_policy_register(&sweet_sandbox_mac_conf, &sweet_sandbox_mac_handle, NULL);
+ 	printf("SWEET Sandbox: permissive policy %s (%d)\n",
+ 	    error ? "NOT registered" : "registered", error);
++	error = mac_policy_register(&sweet_amfi_dyld_mac_conf, &sweet_amfi_dyld_mac_handle, NULL);
++	printf("SWEET AMFI: dyld policy %s (%d)\n",
++	    error ? "NOT registered" : "registered", error);
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
