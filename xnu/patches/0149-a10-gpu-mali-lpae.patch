@@ -1,0 +1,246 @@
+diff --git a/bsd/dev/a10_gpu.c b/bsd/dev/a10_gpu.c
+--- a/bsd/dev/a10_gpu.c
++++ b/bsd/dev/a10_gpu.c
+@@ -23,17 +23,22 @@
+  * granule takes four levels (bits 47..39, 38..30, 29..21, 20..12) and
+  * INA_BITS = 55 - 48 = 7 in AS_TRANSCFG.  Both the 48-bit and the A21s
+  * G52's 35-bit shape then failed with JS_STATUS 0x58, DATA_INVALID_FAULT,
+- * and no MMU fault at all.
+- *
+- * probe79 fixes the entry encoding: Mali's AArch64 walker is not quite
+- * the ARMv8 one.  kbase (mali_kbase_mmu_mode_aarch64.c) flags a valid
+- * entry at levels 0-2 with 0b01 (ENTRY_IS_ATE_L02) and a page at level 3
+- * with 0b11 (ENTRY_IS_ATE_L3); probe78 wrote 0b11 for the tables too, so
+- * the walker stopped at the first table entry and the job reported bad
+- * data.  It also prints the job header's first_incomplete_task and
+- * fault_pointer, the GPU fault registers (0x03c, not 0x080), all three
+- * job slot statuses and the JS state, and tries uncached walks if the
+- * cached ones still fail.
++ * and no MMU fault at all -- although the GPU had written that status into
++ * the job header, so the tables were being read.
++ *
++ * probe79 reads Linux's Panfrost instead of guessing: a Mali-G71 is driven
++ * through Panfrost's "Mali LPAE" page-table format, not the ARMv8 one
++ * (drivers/gpu/drm/panfrost maps "arm,mali-bifrost" to default_data, which
++ * never sets GPU_QUIRK_FORCE_AARCH64_PGTABLE, so io-pgtable builds
++ * ARM_MALI_LPAE).  That format is different in every detail: TRANSTAB
++ * carries ADRMODE_TABLE and READ_INNER flags, TRANSCFG is ADRMODE_LEGACY
++ * (zero, no INA_BITS), MEMATTR index 1 is write-allocate 0x8d, a leaf is
++ * type 0b01 even at the last level, permissions are stage-2-like HAP bits
++ * (0b11 = read/write), and no access flag is set.  The probe now runs the
++ * job through that shape first, then through the two ARMv8 shapes as
++ * fallbacks, and prints AS0 back after every update, the job header's
++ * first_incomplete_task and fault_pointer, the GPU fault registers (0x03c,
++ * not 0x080), all three job slot statuses and the JS state.
+  *
+  * It is opt-in and changes nothing else.
+  *
+@@ -432,47 +437,80 @@
+  * AS_STATUS bit 0 stays set until that is done.
+  */
+ static bool
+-a10_gpu_as0(vm_offset_t mali, uint64_t transtab, uint32_t transcfg)
++a10_gpu_as0_mem(vm_offset_t mali, uint64_t transtab, uint32_t transcfg,
++    uint32_t memattr)
+ {
+ 	a10_gpu_write(mali, AS0 + AS_TRANSTAB_LO, (uint32_t)transtab);
+ 	a10_gpu_write(mali, AS0 + AS_TRANSTAB_HI, (uint32_t)(transtab >> 32));
+ 	a10_gpu_write(mali, AS0 + AS_TRANSCFG_LO, transcfg);
+ 	a10_gpu_write(mali, AS0 + AS_TRANSCFG_HI, 0);
+-	a10_gpu_write(mali, AS0 + AS_MEMATTR_LO, 0x88888888u);
+-	a10_gpu_write(mali, AS0 + AS_MEMATTR_HI, 0x88888888u);
++	a10_gpu_write(mali, AS0 + AS_MEMATTR_LO, memattr);
++	a10_gpu_write(mali, AS0 + AS_MEMATTR_HI, memattr);
+ 	a10_gpu_write(mali, AS0 + AS_COMMAND, 1);       /* update */
+ 	if (!a10_gpu_wait(mali, AS0 + AS_STATUS, 1, 0, 50000)) {
+ 		printf("A10 GPU: AS0 update timeout, status=%08x\n",
+ 		    a10_gpu_read(mali, AS0 + AS_STATUS));
+ 		return false;
+ 	}
++	printf("A10 GPU: AS0 read back transtab=%08x%08x transcfg=%08x "
++	    "memattr=%08x status=%08x\n",
++	    a10_gpu_read(mali, AS0 + AS_TRANSTAB_HI),
++	    a10_gpu_read(mali, AS0 + AS_TRANSTAB_LO),
++	    a10_gpu_read(mali, AS0 + AS_TRANSCFG_LO),
++	    a10_gpu_read(mali, AS0 + AS_MEMATTR_LO),
++	    a10_gpu_read(mali, AS0 + AS_STATUS));
+ 	return true;
+ }
+ 
++static bool
++a10_gpu_as0(vm_offset_t mali, uint64_t transtab, uint32_t transcfg)
++{
++	return a10_gpu_as0_mem(mali, transtab, transcfg, 0x88888888u);
++}
++
+ /*
+- * The GPU's page tables: ordinary AArch64 stage-1 tables with 4 KB pages
+- * (AS_TRANSCFG ADRMODE 6), the same shape Linux's Panfrost gives this
+- * hardware.  The A10's MMU reports 48 virtual bits and 40 physical
+- * (MMU_FEATURES 0x2830: VA_BITS = 0x30, PA_BITS = 0x28), so four levels
+- * cover it: bits 47..39, 38..30, 29..21, 20..12.  The walker starts at
+- * the level INA_BITS selects (55 - VA bits, as Panfrost computes it).
+- * A21s's G52 reports 35 bits and uses three levels; that shape is built
+- * as a fallback, so one boot says which one this GPU takes.
++ * The GPU's page tables.  There are two formats this walker understands,
++ * and probe78 picked the wrong one.
++ *
++ * Linux's Panfrost drives a Mali-G71 through its "Mali LPAE" format, not
++ * the ARMv8 one: drivers/gpu/drm/panfrost matches "arm,mali-bifrost" (this
++ * GPU's compatible string) to default_data, which never sets
++ * GPU_QUIRK_FORCE_AARCH64_PGTABLE, so io-pgtable builds ARM_MALI_LPAE.  In
++ * that format (drivers/iommu/io-pgtable-arm.c):
++ *
++ *   - AS_TRANSTAB carries flags, not just an address: ADRMODE_TABLE (0b11)
++ *     in bits 1..0 and READ_INNER (bit 2), and SHARE_OUTER (bit 4) when
++ *     walks are coherent -- here they are not.
++ *   - AS_TRANSCFG is ADRMODE_LEGACY, zero: no INA_BITS.
++ *   - AS_MEMATTR is index 0 = 0x88 (implementation defined), 1 = 0x8d
++ *     (write allocate), 2 = 0x88.
++ *   - A leaf is type 0b01 (BLOCK) even at the last level, not 0b11, and
++ *     the permissions are stage-2-like: bits 7..6 are HAP, 0b11 for read
++ *     and write.  No access flag is set.
++ *   - Tables are type 0b11 at every level but the last.
++ *
++ * The A10's MMU reports 48 virtual bits and 40 physical (MMU_FEATURES
++ * 0x2830: VA_BITS = 0x30, PA_BITS = 0x28), and Panfrost gives Mali a full
++ * four-level table regardless, so the indices are bits 47..39, 38..30,
++ * 29..21 and 20..12.
++ *
++ * Probe79 runs the job through that shape first.  It then keeps the two
++ * ARMv8 shapes probe78 tried (ADRMODE 6 with INA_BITS 55 - 48, leaf type
++ * 0b11, AP stage-1 style) as fallbacks, so one boot still answers whether
++ * this GPU prefers Panfrost's format or the architectural one.
+  */
+-/*
+- * Mali's AArch64 walker uses bit 1 as "this is a level-3 page" rather than
+- * as the ARMv8 table bit: kbase writes 0b01 for a valid entry at levels
+- * 0-2 (ENTRY_IS_ATE_L02) and 0b11 for a page at level 3 (ENTRY_IS_ATE_L3),
+- * and treats 0b10 as invalid.  Probe78 wrote 0b11 for both, so the walker
+- * refused the very first table entry.
+- */
+-#define PTE_TABLE           1ull
+-#define PTE_PAGE            3ull
++#define PTE_TABLE           3ull        /* a table, levels 0..2 */
++#define PTE_PAGE_A64        3ull        /* a page, ARMv8 (ADRMODE 6) */
++#define PTE_PAGE_MALI       1ull        /* a leaf, Mali LPAE (legacy) */
+ #define PTE_AF              (1ull << 10)
+ #define PTE_SH_INNER        (3ull << 8)
+-#define PTE_AP_RW           (1ull << 6)
++#define PTE_SH_OUTER        (2ull << 8)
++#define PTE_AP_RW           (1ull << 6) /* ARMv8: AP[2:1] = 01, read/write */
++#define PTE_HAP_RW          (3ull << 6) /* Mali LPAE: HAP = 11, read/write */
++#define PTE_ATTR_CACHE      (1ull << 2) /* AS_MEMATTR index 1 */
+ #define PTE_ADDRESS         0x0000fffffffff000ull
+ 
++#define TRANSCFG_ADRMODE_LEGACY     0u
+ #define TRANSCFG_ADRMODE_AARCH64_4K 6u
+ #define TRANSCFG_WALK_WB    (TRANSCFG_ADRMODE_AARCH64_4K | (2u << 24) | \
+ 			    (1u << 30))		/* walks write-back, read-allocate */
+@@ -482,12 +520,16 @@
+ #define TRANSCFG_WALK_NC    (TRANSCFG_ADRMODE_AARCH64_4K | (1u << 24))
+ #define TRANSCFG_48BIT_NC   (TRANSCFG_WALK_NC | (7u << 6))
+ 
++#define TRANSTAB_MALI_TABLE 7ull        /* ADRMODE_TABLE | READ_INNER */
++#define MEMATTR_MALI        0x008d8888u
++
+ #define A10_GPU_TEST_VA     0x00100000ull
+ 
+ struct a10_gpu_pt {
+ 	uint64_t *top;
+ 	uint64_t top_phys;
+ 	unsigned levels;        /* 4 for a 48-bit VA, 3 for a 35-bit one */
++	uint64_t pte_flags;     /* format-specific bits of a leaf entry */
+ };
+ 
+ static uint64_t *
+@@ -549,8 +591,7 @@
+ 		return false;
+ 	}
+ 	entry = &table[(gpu >> 12) & 511];
+-	*entry = (phys & PTE_ADDRESS) | PTE_AF | PTE_SH_INNER | PTE_AP_RW |
+-	    PTE_PAGE;
++	*entry = (phys & PTE_ADDRESS) | pt->pte_flags;
+ 	FlushPoC_DcacheRegion((vm_offset_t)entry, sizeof(*entry));
+ 	return true;
+ }
+@@ -646,8 +687,9 @@
+ {
+ 	vm_offset_t pmu, top, g3d, mali, page = 0;
+ 	uint32_t id, pll, product, shader_mask = 0;
+-	struct a10_gpu_pt pt48, pt35;
+-	bool powered, job_ok = false, job48 = false, job48nc = false;
++	struct a10_gpu_pt ptm, pt48, pt35;
++	bool powered, job_ok = false, jobmali = false;
++	bool job48 = false, job48nc = false;
+ 	bool job35 = false;
+ 
+ 	pmu = ml_io_map(A10_PMU_PA, A10_PMU_SIZE);
+@@ -722,9 +764,40 @@
+ 		    job_ok ? "ran" : "did not run");
+ 	}
+ 
+-	/* The shape Panfrost uses on a 48-bit VA MMU: four levels. */
++	/*
++	 * Panfrost's format for this GPU: Mali LPAE.  Leaf entries are type
++	 * 0b01 with stage-2-like permissions, TRANSTAB carries ADRMODE_TABLE
++	 * and READ_INNER, TRANSCFG is ADRMODE_LEGACY, and MEMATTR index 1 is
++	 * the write-allocate policy.
++	 */
++	bzero(&ptm, sizeof(ptm));
++	ptm.levels = 4;
++	ptm.pte_flags = PTE_HAP_RW | PTE_ATTR_CACHE | PTE_SH_OUTER |
++	    PTE_PAGE_MALI;
++	ptm.top = a10_gpu_pt_page(&ptm.top_phys);
++	if (ptm.top != NULL &&
++	    a10_gpu_map(&ptm, A10_GPU_TEST_VA, (uint64_t)kvtophys(page))) {
++		printf("A10 GPU: Mali LPAE tables top=%08x%08x "
++		    "transtab=%08x%08x transcfg=%08x\n",
++		    (uint32_t)(ptm.top_phys >> 32), (uint32_t)ptm.top_phys,
++		    (uint32_t)((ptm.top_phys | TRANSTAB_MALI_TABLE) >> 32),
++		    (uint32_t)(ptm.top_phys | TRANSTAB_MALI_TABLE),
++		    TRANSCFG_ADRMODE_LEGACY);
++		if (a10_gpu_as0_mem(mali, ptm.top_phys | TRANSTAB_MALI_TABLE,
++		    TRANSCFG_ADRMODE_LEGACY, MEMATTR_MALI)) {
++			jobmali = a10_gpu_write_value(mali, shader_mask, page,
++			    A10_GPU_TEST_VA, A10_GPU_TEST_WORD + 4);
++			printf("A10 GPU: Mali LPAE (legacy) job %s\n",
++			    jobmali ? "ran" : "did not run");
++		}
++	} else {
++		printf("A10 GPU: Mali LPAE tables not built\n");
++	}
++
++	/* The architectural shape: four levels, ADRMODE 6, INA_BITS 7. */
+ 	bzero(&pt48, sizeof(pt48));
+ 	pt48.levels = 4;
++	pt48.pte_flags = PTE_AF | PTE_SH_INNER | PTE_AP_RW | PTE_PAGE_A64;
+ 	pt48.top = a10_gpu_pt_page(&pt48.top_phys);
+ 	if (pt48.top != NULL &&
+ 	    a10_gpu_map(&pt48, A10_GPU_TEST_VA, (uint64_t)kvtophys(page))) {
+@@ -749,9 +822,11 @@
+ 	}
+ 
+ 	/* The A21s G52 shape: 35 bits of VA, three levels. */
+-	if (!job48 && !job48nc) {
++	if (!jobmali && !job48 && !job48nc) {
+ 		bzero(&pt35, sizeof(pt35));
+ 		pt35.levels = 3;
++		pt35.pte_flags = PTE_AF | PTE_SH_INNER | PTE_AP_RW |
++		    PTE_PAGE_A64;
+ 		pt35.top = a10_gpu_pt_page(&pt35.top_phys);
+ 		if (pt35.top != NULL &&
+ 		    a10_gpu_map(&pt35, A10_GPU_TEST_VA,
+@@ -778,9 +853,10 @@
+ 	if (page != 0) {
+ 		kmem_free(kernel_map, page, PAGE_SIZE);
+ 	}
+-	printf("A10 GPU: probe done, identity %s, 48-bit %s, uncached %s, "
+-	    "35-bit %s\n",
++	printf("A10 GPU: probe done, identity %s, Mali LPAE %s, 48-bit %s, "
++	    "uncached %s, 35-bit %s\n",
+ 	    job_ok ? "ran" : "did not run",
++	    jobmali ? "ran" : "did not run",
+ 	    job48 ? "ran" : "did not run",
+ 	    job48nc ? "ran" : "did not run",
+ 	    job35 ? "ran" : "did not run");
