@@ -101,7 +101,7 @@ diff --git a/bsd/dev/a10_gpu.c b/bsd/dev/a10_gpu.c
 +	a10_gpu_write(mali, base + AS_TRANSCFG_LO, transcfg);
 +	a10_gpu_write(mali, base + AS_TRANSCFG_HI, 0);
 +	a10_gpu_write(mali, base + AS_MEMATTR_LO, memattr);
-+	a10_gpu_write(mali, base + AS_MEMATTR_HI, memattr);
++	a10_gpu_write(mali, base + AS_MEMATTR_HI, 0);
 +	a10_gpu_write(mali, base + AS_COMMAND, 1);      /* update */
 +	if (!a10_gpu_wait(mali, base + AS_STATUS, 1, 0, 50000)) {
 +		printf("A10 GPU: AS%u update timeout, status=%08x\n",
