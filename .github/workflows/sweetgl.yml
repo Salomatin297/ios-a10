@@ -1,0 +1,130 @@
+name: a10-sweetgl
+
+# GPU step: sweetgl.dylib, Mesa's panfrost GLES driver for the Mali-G71 as an
+# iOS library (loaded into backboardd, where CoreAnimation's GL renderer uses
+# it through an EAGL shim). Built on a macOS runner with Xcode:
+#   1. Mesa host tools (mesa_clc, vtn_bindgen2, panfrost_compile) for the
+#      precompiled panfrost shaders, with Homebrew's LLVM (cached)
+#   2. Mesa 26.2.4 for iOS arm64 (static), our panfrost DRM emulation, and the
+#      EAGL/GLES frontend derived from joranv1/ios-sailfish (sweetgl/)
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: "Runner label (macos-15-intel when arm64 runners are short)"
+        default: macos-15
+  push:
+    branches: [main]
+    paths:
+      - "sweetgl/**"
+      - ".github/workflows/sweetgl.yml"
+
+permissions:
+  contents: read
+
+env:
+  MESA_TAG: mesa-26.2.4
+
+jobs:
+  sweetgl:
+    runs-on: ${{ inputs.runner || 'macos-15' }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tools
+        run: |
+          brew install ninja bison flex pkgconf llvm
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install -q meson mako pyyaml packaging pycparser
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix flex)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
+          echo "PKG_CONFIG_PATH=$(brew --prefix)/lib/pkgconfig:$(brew --prefix llvm)/lib/pkgconfig" >> "$GITHUB_ENV"
+          echo "LLVM_VERSION=$(brew list --versions llvm | awk '{print $2}')" >> "$GITHUB_ENV"
+          xcodebuild -version
+          xcrun -sdk iphoneos --show-sdk-path
+
+      - name: Sources
+        run: |
+          git clone -q --depth 1 -b "$MESA_TAG" https://gitlab.freedesktop.org/mesa/mesa.git mesa
+          # host tools and the iOS build both see the patched tree (the
+          # host links the same DRM emulation, so its hooks resolve)
+          python3 -I sweetgl/mesa-fixup.py mesa
+
+      - name: Cached host tools
+        id: hostcache
+        uses: actions/cache/restore@v4
+        with:
+          path: hostinst
+          key: mesa-host-${{ env.MESA_TAG }}-llvm-${{ env.LLVM_VERSION }}-${{ runner.arch }}-v1
+
+      - name: Mesa host tools (mesa_clc, vtn_bindgen2, panfrost_compile)
+        if: steps.hostcache.outputs.cache-hit != 'true'
+        run: |
+          # The host tools link Mesa's kmod code, which calls libdrm: our
+          # emulation stands in (never called at build time; real definitions
+          # keep meson's function checks honest).
+          mkdir -p hostdrm
+          clang -O1 -c -I sweetgl/include -I mesa/include sweetgl/sweet_drm_pan.c -o hostdrm/sweet_drm_pan.o
+          ar rcs hostdrm/libsweetdrm.a hostdrm/sweet_drm_pan.o
+          HOSTLINK="-L$PWD/hostdrm -lsweetdrm -framework IOKit -framework CoreFoundation"
+          meson setup mesa-host mesa --prefix="$PWD/hostinst" \
+            --buildtype=release -Db_ndebug=true \
+            -Dplatforms= -Degl=disabled -Dglx=disabled -Dgbm=disabled \
+            -Dgallium-drivers= -Dvulkan-drivers= \
+            -Dopengl=false -Dgles1=disabled -Dgles2=disabled \
+            -Dllvm=enabled -Dshared-llvm=enabled \
+            -Dmesa-clc=enabled -Dinstall-mesa-clc=true \
+            -Dprecomp-compiler=enabled -Dinstall-precomp-compiler=true \
+            -Dtools=panfrost -Dbuild-tests=false \
+            -Dzstd=disabled -Dvalgrind=disabled -Dlibunwind=disabled -Dlmsensors=disabled \
+            -Dshader-cache=disabled -Dperfetto=false -Dgallium-va=disabled \
+            -Dgallium-rusticl=false -Dhtml-docs=disabled -Ddisplay-info=disabled -Dteflon=false \
+            -Dc_args="-I$PWD/sweetgl/include" -Dcpp_args="-I$PWD/sweetgl/include" \
+            -Dc_link_args="$HOSTLINK" -Dcpp_link_args="$HOSTLINK"
+          # only the three tools (panfrost's own debug tools are Linux-only)
+          T="src/compiler/clc/mesa_clc src/compiler/spirv/vtn_bindgen2 src/panfrost/clc/panfrost_compile"
+          ninja -C mesa-host $T
+          mkdir -p hostinst/bin
+          for t in $T; do cp "mesa-host/$t" hostinst/bin/; done
+          ls -la hostinst/bin
+
+      - name: Save host tools
+        if: steps.hostcache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: hostinst
+          key: mesa-host-${{ env.MESA_TAG }}-llvm-${{ env.LLVM_VERSION }}-${{ runner.arch }}-v1
+
+      - name: Mesa for iOS + sweetgl.dylib
+        run: |
+          export PATH="$PWD/hostinst/bin:$PATH"
+          which mesa_clc vtn_bindgen2 panfrost_compile
+          sh sweetgl/build.sh mesa out
+
+      - name: Check the library
+        run: |
+          otool -hv out/sweetgl-unpadded.dylib
+          otool -L out/sweetgl-unpadded.dylib
+          nm -gU out/sweetgl-unpadded.dylib | grep sweetgl_
+          ls -la out/sweetgl.dylib out/sweetgl-unpadded.dylib
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: a10-sweetgl
+          path: |
+            out/sweetgl.dylib
+            out/sweetgl-unpadded.dylib
+            out/libs.txt
+          retention-days: 30
+
+      - name: Logs on failure
+        if: failure()
+        run: |
+          for f in mesa-host/meson-logs/meson-log.txt out/mesa-ios/meson-logs/meson-log.txt; do
+            [ -f "$f" ] && { echo "== $f"; tail -60 "$f"; }
+          done
+          true
