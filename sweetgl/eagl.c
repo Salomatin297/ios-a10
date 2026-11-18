@@ -1115,10 +1115,51 @@ sgl_PixelStorei(void *rctx, GLenum pname, GLint param)
 	SGL_POST(195);
 }
 
+/*
+ * The last draws, so a failed submit (sweet_drm_pan.c) can say what was in
+ * flight: mode, vertex count, program, the bound framebuffer and texture 0.
+ */
+#define DRAW_RING 32
+static struct {
+	GLenum mode;
+	GLsizei count;
+	GLuint prog;
+	GLint fb;
+	GLuint tex0;
+} draw_ring[DRAW_RING];
+static unsigned draw_ring_n;
+
+static void
+draw_ring_add(GLenum mode, GLsizei count)
+{
+	GLint prog = 0, fb = 0;
+	glGetIntegerv(GL_CURRENT_PROGRAM, &prog);
+	glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fb);
+	typeof(draw_ring[0]) *d = &draw_ring[draw_ring_n++ % DRAW_RING];
+	d->mode = mode;
+	d->count = count;
+	d->prog = (GLuint)prog;
+	d->fb = fb;
+	d->tex0 = unit_2d[0];
+}
+
+void
+sweetgl_draw_ring_dump(void)
+{
+	unsigned n = draw_ring_n < DRAW_RING ? draw_ring_n : DRAW_RING;
+	sweet_drm_log("sweetgl: draw ring: last %u of %u draws", n, draw_ring_n);
+	for (unsigned i = 0; i < n; i++) {
+		typeof(draw_ring[0]) *d = &draw_ring[(draw_ring_n - n + i) % DRAW_RING];
+		sweet_drm_log("sweetgl:   draw %u mode %#x count %d prog %u fb %d tex0 %u",
+		    draw_ring_n - n + i, d->mode, d->count, d->prog, d->fb, d->tex0);
+	}
+}
+
 void
 sgl_DrawArrays(void *rctx, GLenum mode, GLint first, GLsizei count)
 {
 	SGL_CUR(rctx);
+	draw_ring_add(mode, count);
 	bool fresh = draw_prep(mode, count);
 	if (fresh) {
 		GLint prog = 0;
@@ -1142,6 +1183,7 @@ void
 sgl_DrawElements(void *rctx, GLenum mode, GLsizei count, GLenum type, const void *indices)
 {
 	SGL_CUR(rctx);
+	draw_ring_add(mode, count);
 	bool fresh = draw_prep(mode, count);
 	if (fresh) {
 		GLint prog = 0, ebuf = 0;
