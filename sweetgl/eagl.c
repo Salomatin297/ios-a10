@@ -24,6 +24,7 @@
 #include <string.h>
 #include <time.h>
 #include <IOSurface/IOSurfaceRef.h>
+#include <mach-o/dyld.h>
 #include <mach/vm_page_size.h>
 #include <mach/mach_time.h>
 #include <libkern/OSCacheControl.h>
@@ -1919,6 +1920,10 @@ extern const void *_dyld_get_shared_cache_range(size_t *length);
 void sgl_fmt_log(uint32_t fmt, uint32_t flag, uint64_t caller);
 uint64_t sgl_fmt_cont;
 static uint64_t sgl_cache_slide;
+/* QuartzCore may sit at a constant offset from the sailfish addresses below (a510f: +0x4000) */
+static int64_t sgl_qc_delta;
+static bool sgl_qc_ok;
+static uint64_t sgl_qc_slide(void);
 
 void
 sgl_fmt_log(uint32_t fmt, uint32_t flag, uint64_t caller)
@@ -2156,7 +2161,7 @@ static void
 sgl_install_hooks(void)
 {
 	for (int i = 0; i < SGL_HOOKS; i++) {
-		uint32_t *t = (uint32_t *)(uintptr_t)(sgl_hook_def[i].addr + sgl_cache_slide);
+		uint32_t *t = (uint32_t *)(uintptr_t)(sgl_hook_def[i].addr + sgl_cache_slide + sgl_qc_delta);
 		sgl_hook_cont[i] = (uint64_t)(uintptr_t)t + 16;
 		bool ok = sgl_patch(t, sgl_hook_def[i].code, sgl_hook_stub[i]);
 		sweet_drm_log("sweetgl: hook %s at %p: %s", sgl_hook_def[i].name, (void *)t, ok ? "installed" : "FAILED");
@@ -2166,16 +2171,16 @@ sgl_install_hooks(void)
 static void
 sgl_install_fmt_hook(void)
 {
-	size_t len = 0;
-	const uint8_t *cache = _dyld_get_shared_cache_range(&len);
-	if (cache == NULL) {
+	uint64_t qc = sgl_qc_slide();
+	if (!sgl_qc_ok) {
 		return;
 	}
-	sgl_cache_slide = (uint64_t)(uintptr_t)cache - 0x180000000ull;
-	uint32_t *t = (uint32_t *)(uintptr_t)(0x18840433cull + sgl_cache_slide);
+	sgl_cache_slide = qc;
+	uint32_t *t = (uint32_t *)(uintptr_t)(0x18840433cull + qc + sgl_qc_delta);
 	static const uint32_t want[4] = {0xb90000bf, 0xb900009f, 0xb900007f, 0x390000df};
 	if (memcmp(t, want, sizeof(want)) != 0) {
 		sweet_drm_log("sweetgl: format hook: unexpected code at %p (%08x), not hooked", (void *)t, t[0]);
+		sgl_install_hooks();
 		return;
 	}
 	sgl_fmt_cont = (uint64_t)(uintptr_t)t + 16;
@@ -2224,19 +2229,74 @@ sgl_write_const(void *at, const void *val, size_t len, vm_prot_t back)
 	return true;
 }
 
+/*
+ * The QuartzCore addresses below come from sailfish's dyld cache. Another
+ * build of the same iOS keeps the whole image at a constant offset (a510f
+ * found +0x4000), and the shared cache base is not always 0x180000000, so
+ * neither can be assumed: take the slide from dyld and find the offset from
+ * emit_filter's prologue. Sets sgl_qc_ok when the image was recognised.
+ */
+static uint64_t
+sgl_qc_slide(void)
+{
+	uintptr_t slide = 0;
+	bool named = false;
+	for (uint32_t i = 0, n = _dyld_image_count(); i < n; i++) {
+		const char *name = _dyld_get_image_name(i);
+		if (name != NULL && strstr(name, "QuartzCore.framework/QuartzCore") != NULL) {
+			slide = (uintptr_t)_dyld_get_image_vmaddr_slide(i);
+			named = true;
+			break;
+		}
+	}
+	if (!named) {
+		size_t len = 0;
+		const uint8_t *cache = _dyld_get_shared_cache_range(&len);
+		if (cache == NULL) {
+			sweet_drm_log("sweetgl: QuartzCore not found, texture function fixes off");
+			return 0;
+		}
+		slide = (uintptr_t)cache - 0x180000000ull;
+	}
+	static const int64_t deltas[] = {0, 0x4000, -0x4000, 0x8000, -0x8000, 0x1000, -0x1000, 0x2000,
+	    -0x2000, 0x10000, -0x10000, 0x20000, -0x20000};
+	for (size_t i = 0; i < sizeof(deltas) / sizeof(deltas[0]); i++) {
+		const uint32_t *t = (const uint32_t *)(uintptr_t)(0x188424e54ull + slide + deltas[i]);
+		if (memcmp(t, sgl_hook_def[0].code, 16) == 0) {
+			sgl_qc_delta = deltas[i];
+			sgl_qc_ok = true;
+			sweet_drm_log("sweetgl: QuartzCore at %#llx (slide %#llx, delta %+#llx), emit_filter matches",
+			    (unsigned long long)(0x188424e54ull + slide + sgl_qc_delta), (unsigned long long)slide,
+			    (long long)sgl_qc_delta);
+			return slide;
+		}
+	}
+	{
+		const uint32_t *t = (const uint32_t *)(uintptr_t)(0x188424e54ull + slide);
+		sweet_drm_log("sweetgl: QuartzCore at slide %#llx: emit_filter not found (%08x %08x %08x %08x)",
+		    (unsigned long long)slide, t[0], t[1], t[2], t[3]);
+	}
+	return slide;
+}
+
 static void
 sgl_install_texfns(void)
 {
-	size_t len = 0;
-	const uint8_t *cache = _dyld_get_shared_cache_range(&len);
-	if (cache == NULL) {
+	uint64_t slide = sgl_qc_slide();
+	if (!sgl_qc_ok) {
 		return;
 	}
-	uint64_t slide = (uint64_t)(uintptr_t)cache - 0x180000000ull;
+	slide += sgl_qc_delta;
 	const char **table = (const char **)(uintptr_t)(0x1d5b44a10ull + slide);
 	uint8_t *cases = (uint8_t *)(uintptr_t)(0x18855a1e4ull - 0x11 + slide);
-	if (table[0x13] == NULL || strcmp(table[0x13], "colorMatrix4x4Bias(s0)") != 0 || cases[0x13] != 0) {
-		sweet_drm_log("sweetgl: texture function fixes: unexpected QuartzCore, not installed");
+	size_t clen = 0;
+	const uint8_t *cr = _dyld_get_shared_cache_range(&clen);
+	const uint8_t *p13 = (const uint8_t *)table[0x13];
+	bool p13ok = cr != NULL && p13 >= cr && p13 < cr + clen;
+	if (!p13ok || strcmp(table[0x13], "colorMatrix4x4Bias(s0)") != 0 || cases[0x13] != 0) {
+		sweet_drm_log("sweetgl: texture function fixes: unexpected QuartzCore at %#llx (table[0x13] %s %p, cases[0x13] %#x), not installed",
+		    (unsigned long long)(0x1d5b44a10ull + slide), p13ok ? table[0x13] : "(not in the cache)",
+		    (void *)table[0x13], cases[0x13]);
 		return;
 	}
 	for (size_t i = 0; i < sizeof(sgl_texfns) / sizeof(sgl_texfns[0]); i++) {
