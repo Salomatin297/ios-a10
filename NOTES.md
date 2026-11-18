@@ -2,6 +2,54 @@
 
 ## >>> A10 PORT (Samsung Galaxy A10, SM-A105F) - active work 2026-11-13 <<<
 
+### >>> UPDATE 2026-11-17: sweetgl CI, in-place GPU delivery armed, ramdisk backup <<<
+
+**sweetgl (Mesa panfrost GLES for the Mali-G71) is committed** as `bfd25e0`
+(`sweetgl: Mesa panfrost GLES for the Mali-G71 (EAGL shim, DRM emulation, CI)`,
+pushed to `a10/main`). Tree: `ref/ios-sweet/sweetgl/` (already-adapted sailfish
+EAGL/GLES frontend, `sweet_drm_pan.c` DRM emulation over SweetMali, six-patch
+idempotent `mesa-fixup.py`, `build.sh`) and
+`.github/workflows/sweetgl.yml`. CI run **44137863044** (`a10-sweetgl`) was
+created 2026-11-17T17:31:09Z and was still **queued** at 17:43Z. Artifact name
+`a10-sweetgl` (`out/sweetgl.dylib`, padded to 64 MiB, and `-unpadded`).
+
+**Delivery target (live TWRP catalog, read 2026-11-17).**
+`/iOSRoot/usr/standalone/update/ramdisk/arm64SURamDisk.dmg`: size
+**113,246,235** bytes, one extent **start_block 2,354,673 count 27,649** ->
+raw userdata offset **9,644,740,608**; first bytes
+`30 84 06 c0 00 15 16 04 49 4d 34 50` (DER SEQUENCE, `IM4P` at offset **8**,
+not 6). `/dev/block/by-name/userdata` -> `/dev/block/mmcblk0p32`, TWRP `/tmp`
+tmpfs 876 MB free.
+
+**Rollback backup made before any write:** `work/a10-ramdisk-orig-64m.bin`,
+exactly **67,108,864** bytes, SHA256
+**428E0DBB48C73E9F7CAFBB2736D5E8108D0A3FAFEB0AA6B6E8A44C615B1A43AB** (note:
+`adb exec-out dd` on TWRP appends the dd stats line to stdout; the file was
+truncated to 64 MiB after capture). Restore with
+`python tools/a10_install_sweetgl.py --restore work/a10-ramdisk-orig-64m.bin`
+(phone in TWRP).
+
+**`tools/a10_install_sweetgl.py`** now supports `--dylib` (install) and
+`--restore` (rollback), `--dry-run`, `--flash`. It derives the write offset
+from the live HFSX catalog, accepts `IM4P` anywhere in the first 16 bytes,
+checks the dylib starts with a Mach-O header, writes with
+`dd ... bs=4096 seek=<start> conv=fsync`, and verifies the read-back SHA256.
+`--restore ... --dry-run` already succeeds against the phone.
+
+**probe84** is built: `dist/boot-a10-probe84.img`, 16,848,896 bytes, SHA256
+`2129A0F50F9A7FBA72D6047042C8DCF3DC4BB839D3F769246FF2CF17EA2CD6E3`; boot args
+(555 bytes, under the 1024-byte `CommandLine`) include
+`sweetmali=1 a10prof=15 ... sweetenv=backboardd:DYLD_INSERT_LIBRARIES=/usr/standalone/update/ramdisk/arm64SURamDisk.dmg,SWEETGL_TEST=1`
+and the probe83 kernel (SHA256 `500EC2CF...`). Do not flash it before the
+dylib is written: dyld aborts backboardd if the insert library is missing.
+
+Next: when CI 44137863044 finishes, download `a10-sweetgl`, run
+`python tools/a10_install_sweetgl.py --dylib <dir>/sweetgl.dylib --dry-run`,
+then without `--dry-run`, flash probe84, boot iOS and pull
+`dist/logs/probe84` for `A10 ENV: ... DYLD_INSERT_LIBRARIES`,
+`sweetgl: screen Mali-G71 (Panfrost)`, `MESA GLES ON THE MALI WORKS`,
+`EAGLContext ... on Mesa` and the CA flush rate.
+
 ### >>> UPDATE 2026-11-16: probe79 GPU shapes all 0x58, slot sticks; probe80 resets per shape; CPU/fb timing <<<
 
 **probe79 (0149/0150, kernel CI `43890132893`, SHA256 A4CB95F5...).** iOS boots and

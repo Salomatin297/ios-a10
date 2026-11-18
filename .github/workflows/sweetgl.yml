@@ -12,8 +12,8 @@ on:
   workflow_dispatch:
     inputs:
       runner:
-        description: "Runner label (macos-15-intel when arm64 runners are short)"
-        default: macos-15
+        description: "Runner label (macos-15 for arm64, macos-15-intel for x86_64)"
+        default: macos-15-intel
   push:
     branches: [main]
     paths:
@@ -28,14 +28,14 @@ env:
 
 jobs:
   sweetgl:
-    runs-on: ${{ inputs.runner || 'macos-15' }}
+    runs-on: ${{ inputs.runner || 'macos-15-intel' }}
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
 
       - name: Tools
         run: |
-          brew install ninja bison flex pkgconf llvm
+          brew install ninja bison flex pkgconf llvm spirv-llvm-translator spirv-tools
           python3 -m venv "$RUNNER_TEMP/venv"
           "$RUNNER_TEMP/venv/bin/pip" install -q meson mako pyyaml packaging pycparser
           echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
@@ -59,7 +59,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: hostinst
-          key: mesa-host-${{ env.MESA_TAG }}-llvm-${{ env.LLVM_VERSION }}-${{ runner.arch }}-v1
+          key: mesa-host-${{ env.MESA_TAG }}-llvm-${{ env.LLVM_VERSION }}-${{ runner.arch }}-v2
 
       - name: Mesa host tools (mesa_clc, vtn_bindgen2, panfrost_compile)
         if: steps.hostcache.outputs.cache-hit != 'true'
@@ -97,7 +97,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: hostinst
-          key: mesa-host-${{ env.MESA_TAG }}-llvm-${{ env.LLVM_VERSION }}-${{ runner.arch }}-v1
+          key: mesa-host-${{ env.MESA_TAG }}-llvm-${{ env.LLVM_VERSION }}-${{ runner.arch }}-v2
 
       - name: Mesa for iOS + sweetgl.dylib
         run: |
