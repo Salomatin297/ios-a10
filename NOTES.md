@@ -2,6 +2,60 @@
 
 ## >>> A10 PORT (Samsung Galaxy A10, SM-A105F) - active work 2026-11-13 <<<
 
+### >>> UPDATE 2026-11-18: sweetgl loaded into backboardd; 32 MiB BO failed (16K alignment on 4K pages); fix in 0158 <<<
+
+**CI fixed twice.** `sweetgl` host tools need `spirv-llvm-translator` and
+`spirv-tools` (Mesa 26.2.4 `mesa_clc` requires `LLVMSPIRVLib`); the workflow
+now installs them and defaults to `macos-15-intel` (the arm64 `macos-15` job
+`44137863044` sat queued 15 min and was cancelled with `runner_id 0`). Commit
+`8acd49b`. A link error (`_sweetgl_draw_ring_dump`) was fixed by recording the
+last 32 draws in `eagl.c` and defining `sweetgl_draw_ring_dump()` (commit
+`9aa7896`). **Run `44357112446` succeeded**: artifact `a10-sweetgl`,
+`sweetgl.dylib` 67,108,864 bytes, SHA256
+`E8FDD409E716925D4F31ECC621016287F19F8B8345A617AA7DC6ADA4A26BA215`
+(`sweetgl-unpadded.dylib` 20,432,672 bytes, arm64 MH_DYLIB, cputype
+`0x0100000c`).
+
+**Install tool fix:** toybox `dd` with `seek` and `conv=fsync` fails
+`ftruncate: Invalid argument` on a block device *before writing* (the first
+attempt left the ramdisk unchanged; verified by read-back). Use
+`conv=notrunc,fsync`. With that, the padded dylib was written at raw offset
+9,644,740,608 and the read-back SHA256 matched.
+
+**probe84 booted iOS with the library inside backboardd** (kernel from
+`43966120194`, boot args unchanged, `sweetenv=backboardd:...`):
+- `A10 ENV: backboardd += DYLD_INSERT_LIBRARIES=/usr/standalone/update/ramdisk/arm64SURamDisk.dmg`
+- `SWEET AMFI: dyld policy asked, answering 0x7b`
+- `SWEETGL: sweetgl: SweetMali open, GPU product 0x60a0`
+- `SWEETGL: sweetgl: EAGL shim installed`
+- then, for every context attempt:
+  `sweetgl: CREATE_BO 33554432 bytes flags 0x3 failed: 0xe00002bd`
+  (`kIOReturnNoMemory`) x2, `sweetgl: panfrost screen creation failed`,
+  `sweetgl: EAGLContext API 3: no Mesa context, Apple's EAGL instead`.
+  So CA stayed on Apple's EAGL; the UI is exactly as slow as before.
+
+**Root cause (observation + code):** `SweetMali.cpp bo_new()` asked
+`IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, ..., size, 16384)`.
+The A10 kernel is a **4 KB-page** kernel (`__ARM_16K_PG__` off), and XNU treats
+`alignment > page_size` as `kIOMemoryPhysicallyContiguous`
+(`IOBufferMemoryDescriptor.cpp`: `if (alignment > page_size) options |=
+kIOMemoryPhysicallyContiguous`), so every BO went through `kmem_alloc_contig`.
+A 32 MiB contiguous chunk (the panfrost tiler heap) fails on a 2 GB phone.
+Fix (commit `f2bbdd4`, patch `0158`): pass `PAGE_SIZE` instead of `16384`
+(4 KB <= page_size -> ordinary kalloc, no contig; `gpu_map` already uses 4 KB
+PTEs). Kernel CI run `44361291772` was started 2026-11-18T17:40:36Z.
+
+**Next:** when `44361291772` finishes, download `xnu-kernel-only`, build probe85
+with `tools/build_probe_smp.ps1 -Version 85 -Cpus 2 -Kernel <kernel> -Adt
+work\a10-a73-first.adt -ExtraArgs "sweetmali=1 a10audio=1 a10audio_diag=1
+a10prof=15 a10prof_at=150 wqchk=0
+sweetenv=backboardd:DYLD_INSERT_LIBRARIES=/usr/standalone/update/ramdisk/arm64SURamDisk.dmg,SWEETGL_TEST=1"`,
+flash it (the dylib is already in the ramdisk) and pull
+`dist/logs/probe85`. Success markers: `sweetgl: screen Mali-G71 (Panfrost)
+(Mesa)`, `MESA GLES ON THE MALI WORKS`, `EAGLContext API 3 ... on Mesa`, CA
+flush rate. Failure signature to watch: another `CREATE_BO ... failed` (then
+the size/flags tell which allocation).
+
 ### >>> UPDATE 2026-11-17: sweetgl CI, in-place GPU delivery armed, ramdisk backup <<<
 
 **sweetgl (Mesa panfrost GLES for the Mali-G71) is committed** as `bfd25e0`
