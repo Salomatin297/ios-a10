@@ -2,6 +2,45 @@
 
 ## >>> A10 PORT (Samsung Galaxy A10, SM-A105F) - active work 2026-11-13 <<<
 
+### >>> UPDATE 2026-11-18 (2): probe85 - Mesa works, backboardd crash was IOSurface wrap; 0046 fix <<<
+
+**probe85 = f2bbdd4 kernel (PAGE_SIZE BO alignment) + the same ramdisk dylib.** iOS boots and
+**Mesa runs on the Mali inside backboardd**:
+```
+SWEETGL: sweetgl: selftest fbo 8cd5 linked 1 err 0 px(32,32) ff0000ff px(224,224) 0000ffff
+         context 27.7 ms draw+readback 16.66 ms -> MESA GLES ON THE MALI WORKS
+SWEETGL: sweetgl: second frame clear+draw+finish 0.47 ms
+SWEETGL: sweetgl: EAGLContext 0x101849f60 API 3 on Mesa (GLI 0x1023bf600)
+SWEETGL: sweetgl: job queue on, submits do not wait for the GPU
+```
+No more `CREATE_BO ... failed`; `SWEET MALI: queue ... 3 fragment, 0 failed ... 0 faults`.
+
+**But backboardd crash-loops** (sig 11, far 0x30, same pc/lr/bt every time, "Too many corpses"):
+`CRASH backboardd pc 0x1f5e19e70 lr 0x1c7c9bffc ... bt 0x1ac64f65c ...`. Log right before:
+`SWEET SURF: backboardd create id 2 1125x2436 fmt 0x42475241 bpe 4 bpr 4608 planes 0 size 11227136`
+then `sel 9`, `sel 27`, `sel 5`, `sel 6`.
+
+**Root cause (from the .ips, not a guess).** `work/bb-00028.ips` (pulled with the new
+`tools/hfs_get_live.py`) symbolises the faulting thread `com.apple.coreanimation.display.primary`:
+```
+_platform_memmove
+IOSurfaceClientGetBulkAttachments
+CA::Render::iosurface_get_edr_factor(__IOSurface*)
+CA::WindowServer::IOSurface::wrap_buffer(...)
+CA::OGL::GLESContext::retain_image(...)
+```
+Selector 6 = `WrapClientImage` (7 = `WrapClientMemory`). Our 0046 `default:` answered
+`kIOReturnSuccess` with zeroed outputs, so IOSurface.framework built an IOSurfaceClient with NULL
+pointers and `GetBulkAttachments` memmoved from NULL+0x30. Same failure and same fix as a5xelte
+patch `0244-iosurface-wrap-refuse-drop-trunc.patch`: refuse those two selectors with
+`kIOReturnUnsupported` so CA takes its copying path. Fix committed as `4d82fb3` (0046, +12 lines,
+hunk `+1,884`); kernel CI run **44369784317**.
+
+**Next:** download `xnu-kernel-only` from 44369784317, build probe86 (`-Version 86 -Cpus 2 -Kernel
+<kernel> -Adt work\a10-a73-first.adt` + the same ExtraArgs as probe85), flash, boot. Success =
+no `CRASH backboardd`, `sweetgl: texImageIOSurface ...` copy path, CA flushes and a visibly faster
+UI. If it still crashes, the next .ips tells the next NULL.
+
 ### >>> UPDATE 2026-11-18: sweetgl loaded into backboardd; 32 MiB BO failed (16K alignment on 4K pages); fix in 0158 <<<
 
 **CI fixed twice.** `sweetgl` host tools need `spirv-llvm-translator` and
