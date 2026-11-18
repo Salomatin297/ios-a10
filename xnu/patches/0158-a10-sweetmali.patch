@@ -906,7 +906,7 @@ index 0000000..5c10138
 +	size = (size + 16383) & ~16383ull;
 +	IOBufferMemoryDescriptor *md =
 +	    IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
-+	    kIODirectionInOut | kIOMemoryKernelUserShared, size, 16384);
++	    kIODirectionInOut | kIOMemoryKernelUserShared, size, PAGE_SIZE);
 +	if (md == NULL) {
 +		return NULL;
 +	}
