@@ -2039,13 +2039,17 @@ sgl_hook_log(uint64_t id, uint64_t x0, uint64_t x1, uint64_t x2, uint64_t x3, ui
 		if (n < 256) {
 			memcpy(seen[n++], sh, 16);
 		}
-		const char *const *tex = (const char *const *)(uintptr_t)(0x1d5b44a10ull + sgl_cache_slide);
+		const char *const *tex = (const char *const *)(uintptr_t)(0x1d5b44a10ull + sgl_cache_slide + sgl_qc_delta);
 		char hex[3 * 0x30 + 1];
 		for (int i = 0; i < 0x30; i++) {
 			snprintf(hex + 3 * i, 4, "%02x ", sh[i]);
 		}
-		sweet_drm_log("sweetgl: create_shader fn %#x%s: %s", sh[0], sh[0] < 90 && tex[sh[0]] == NULL ? " MISSING" : "",
-		    hex);
+		const char *name = sh[0] < 90 ? tex[sh[0]] : NULL;
+		if (name != NULL) {
+			sweet_drm_log("sweetgl: create_shader fn %#x (%s): %s", sh[0], name, hex);
+		} else {
+			sweet_drm_log("sweetgl: create_shader fn %#x MISSING: %s", sh[0], hex);
+		}
 		return;
 	}
 	if (id == 9 || id == 10) {
@@ -2319,10 +2323,18 @@ sweetgl_eagl_install(void)
 	const char *e = getenv("SWEETGL_GLERR");
 	sgl_check_errors = e && e[0] == '1';
 	const char *t = getenv("SWEETGL_TRACE");
+	/*
+	 * 1: the full per-draw trace and every shader source.  2: only the
+	 * QuartzCore entry hooks (create_shader variants, renderer calls), which
+	 * is what tells a missing tex_fragment_shaders entry apart from a shader
+	 * that compiles but draws wrong.
+	 */
+	bool trace = t && (t[0] == '1' || t[0] == '2');
 	trace_left = t && t[0] == '1' ? 20000 : 0;
 	dump_shaders = trace_left > 0;
 	sgl_install_texfns();
-	if (trace_left > 0) {
+	if (trace) {
+		sweet_drm_log("sweetgl: trace %c (hooks%s)", t[0], dump_shaders ? ", shader sources" : ", variants only");
 		sgl_install_fmt_hook();
 	}
 	Class cls = objc_getClass("EAGLContext");
