@@ -22,13 +22,38 @@ the bank gap `0xBD800000-0xC0000000` and bank 1's seclog
 `sane_size`, `pa_valid()` reports them as I/O, `pmap_steal_memory()` skips
 them (`pmap_next_page_hi`) and `pmap_startup()` keeps their `vm_pages[]` slots
 marked `vmp_error` and never frees them; the physmap is mapped around them.
-The shim's overlap checks now compare against `[phys_base, top)` (the copy
-destination), so a kernel at `0x80000000` is accepted while SBOOT's own image
-at `0x9BBF0000` is not touched. `tools/mkadt-a10.py` now emits `dram-base
-0x80000000`, `dram-size 0x68F00000`; the panic log stays at `0xE8F00000`,
-just below wifibt. Adapted from Open Mapple's `mp_mem4g` (see NOTICE).
-Next: probe88 = mixed 4 cores (`0x100,0x0,0x1,0x101`) + 0161 kernel + the
-TRACE=2 sweetgl; probe89 = new ADT + 0162 kernel.
+`tools/mkadt-a10.py` now emits `dram-base 0x80000000`, `dram-size
+0x68F00000`; the panic log stays at `0xE8F00000`, just below wifibt.
+Adapted from Open Mapple's `mp_mem4g` (see NOTICE).
+
+**probe88 (0161, 4 mixed cores, `wqchk=1`, TRACE=2).** The step markers work:
+`SWEET CPU: processor_start cpu=1 mpidr=0x0 from cpu=0`, `pre-cpu-on`, then
+`SWEET STEP: ps: locked` and a panic:
+`Console I/O from interrupt-disabled context @serial_console.c:168`. This is
+the marker itself, not SMP: `processor_startup` runs with interrupts disabled
+and XNU's DEVELOPMENT build panics on `printf` from that context. XNU already
+has the tunable `nointr_consio` (`allow_printf_from_interrupts_disabled_context`),
+so `nointr_consio=1` fixes it with no kernel rebuild.
+
+**probe89 (0162 + full-RAM ADT, `sweet_mem4g=1 nointr_consio=1`, 4 cores).**
+The shim rejected the image before XNU: `LOADER ramdisk overlaps kernel
+memory`. Root cause: SBOOT loads the boot image at `0x80000000` (not
+`0x9BBF0000`), so the embedded payload sat at `0x8001E020` and ran into the
+kernel copy destination, whose first segment is at `0x81004000`. The old
+`[phys_base, top)` test was right about the destination, but the payload
+source was inside it.
+
+**probe90 (shim fix).** `find_payload` now computes the bytes the payload
+actually needs (segment data + ADT, rounded to 8), copies them to scratch DRAM
+at `0xE0000000` (below the `0xE8F00000` panic log), and re-points
+`p`/`rd_start`/`rd_end` at the copy. The overlap checks are per destination
+(each segment, the ADT, the boot_args page) and also verify that this shim's
+own code range `[_head, _end)` does not overlap the copy; `_head`/`_end` are
+resolved PC-relatively (`adr`), so SBOOT's load base does not matter. The
+scratch is checked against the live DTB and against the source. Image
+`dist/boot-a10-probe90.img` SHA256
+`B9AF8DC42D23F8C15E1561004B377C2F39528C14259BA401915900D9B812CF33`,
+flashed and booting.
 
 
 ### >>> UPDATE 2026-11-18 (2): probe85 - Mesa works, backboardd crash was IOSurface wrap; 0046 fix <<<
