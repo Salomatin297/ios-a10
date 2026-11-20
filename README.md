@@ -142,6 +142,6 @@ Device dumps, partition backups, Apple firmware, IPSW files and generated root i
 
 ## Credits
 
-Built on Apple's open-source releases (XNU, IOHIDFamily, libpthread, HFS), [ios-sweet](https://github.com/dipa-studio/ios-sweet), the [ios-a30s](https://github.com/xJezykk/ios-a30s) Exynos 7904 port, [blacktop/darwin-xnu-build](https://github.com/blacktop/darwin-xnu-build), [ipsw](https://github.com/blacktop/ipsw), Samsung/Exynos kernel sources and TWRP. iOS itself is Apple's and is not distributed here.
+Built on Apple's open-source releases (XNU, IOHIDFamily, libpthread, HFS), [ios-sweet](https://github.com/dipa-studio/ios-sweet), [ios-viva / viva-gpu](https://github.com/Nik300/ios-viva), [Open Mapple](https://github.com/open-mapple) (kernel memory/framebuffer work and the Mali/Metal driver), the [ios-a30s](https://github.com/xJezykk/ios-a30s) Exynos 7904 port, [blacktop/darwin-xnu-build](https://github.com/blacktop/darwin-xnu-build), [ipsw](https://github.com/blacktop/ipsw), Samsung/Exynos kernel sources and TWRP. The licence terms and required attributions are in [NOTICE](NOTICE); the Mali/Metal driver is GPL-3.0-or-later with the viva-gpu attribution term. iOS itself is Apple's and is not distributed here.
 
 This is an experimental port, not a usable phone OS. Apple's security model is largely disabled, and nothing personal should be stored on the device.

@@ -1,0 +1,184 @@
+diff --git a/bsd/dev/sweet_emmc.c b/bsd/dev/sweet_emmc.c
+index 782a6cb..ab95d44 100644
+--- a/bsd/dev/sweet_emmc.c
++++ b/bsd/dev/sweet_emmc.c
+@@ -1475,6 +1475,18 @@ sweet_emmc_log_flush_now(const char *tag)
+ 	}
+ }
+ 
++/*
++ * 0161: synchronous SMP bring-up step marker.  printf() reaches the console
++ * ring; kprintf() does not.  The flush puts the line on the eMMC before the
++ * next step can wedge the boot core.
++ */
++void
++sweet_emmc_step(const char *tag)
++{
++	printf("SWEET STEP: %s\n", tag);
++	sweet_emmc_log_flush_now(tag);
++}
++
+ static bool sweet_emmc_brought_up;
+ 
+ /*
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index e6e7995..b343b7e 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -29,6 +29,7 @@ extern "C" int sweet_emmc_early_init(void);
+ extern "C" void sweet_emmc_log_flush_now(const char *tag);
+ /* osfmk/kern/waitq.c: global waitq table health, the 4-core panic suspect. */
+ extern "C" void sweet_wq_check(const char *tag);
++extern "C" void sweet_emmc_step(const char *tag);
+ extern "C" unsigned int sweet_wq_bad_count(void);
+ #if defined(SWEET_GICV2)
+ /* GIC-400 helpers from pe_fiq.c; also used to retry a lost bring-up SGI. */
+@@ -645,6 +646,7 @@ kern_return_t
+ SweetCPU::startCPU(vm_offset_t start_paddr, vm_offset_t arg_paddr)
+ {
+ 	const ml_topology_cpu_t *cpu = &ml_get_topology_info()->cpus[getCPUNumber()];
++	sweet_emmc_step("startCPU: enter");
+ 	/*
+ 	 * cpu_start() passes NULL,NULL: x20/x21 are set by LowResetVectorBase.
+ 	 * The boot core is MPIDR 0x100, so phys_id 0 is a real secondary
+@@ -658,13 +660,16 @@ SweetCPU::startCPU(vm_offset_t start_paddr, vm_offset_t arg_paddr)
+ 	IOLog("SWEET CPU: cpu=%u CPU_ON target=0x%x entry_pa=0x%llx context=%u\n",
+ 	    getCPUNumber(), cpu->phys_id, (uint64_t)entry, getCPUNumber());
+ 	__builtin_arm_dsb(DSB_SY);
++	sweet_emmc_step("startCPU: pre-smc");
+ 	int32_t rc = sweet_psci_cpu_on(cpu->phys_id, entry, getCPUNumber());
+ 	first_psci_rc = last_psci_rc = rc;
++	sweet_emmc_step("startCPU: post-smc");
+ 	IOLog("SWEET CPU: cpu=%u PSCI CPU_ON rc=%d\n", getCPUNumber(), rc);
+ 	/* cpu_start() discards PE_cpu_start's return; do not silently carry on. */
+ 	if (rc != 0) {
+ 		panic("SWEET CPU: cpu=%u NOT alive: PSCI CPU_ON rc=%d", getCPUNumber(), rc);
+ 	}
++	sweet_emmc_step("startCPU: done");
+ 	return KERN_SUCCESS;
+ }
+ 
+diff --git a/osfmk/arm64/cpu.c b/osfmk/arm64/cpu.c
+index d362c11..3ebfb3f 100644
+--- a/osfmk/arm64/cpu.c
++++ b/osfmk/arm64/cpu.c
+@@ -79,6 +79,13 @@
+ 
+ 
+ #include <libkern/section_keywords.h>
++#if defined(SWEET)
++/* 0161: synchronous bring-up markers; printf() feeds the persistent ring. */
++extern void sweet_emmc_step(const char *tag);
++#define SWEET_STEP(tag) sweet_emmc_step(tag)
++#else
++#define SWEET_STEP(tag) do { } while (0)
++#endif
+ 
+ extern boolean_t        idle_enable;
+ extern uint64_t         wake_abstime;
+@@ -920,6 +927,7 @@ cpu_start(int cpu)
+ 		cpu_machine_init();
+ 		configure_coresight_registers(cpu_data_ptr);
+ 	} else {
++		SWEET_STEP("cs: enter");
+ 		thread_t first_thread;
+ 		cpu_data_ptr->cpu_reset_handler = (vm_offset_t) start_cpu_paddr;
+ #if !XNU_MONITOR
+@@ -935,9 +943,11 @@ cpu_start(int cpu)
+ 		first_thread->machine.CpuDatap = cpu_data_ptr;
+ 		first_thread->machine.pcpu_data_base =
+ 		    (vm_address_t)cpu_data_ptr - __PERCPU_ADDR(cpu_data);
++		SWEET_STEP("cs: thread");
+ 
+ 		configure_coresight_registers(cpu_data_ptr);
+ 
++		SWEET_STEP("cs: coresight");
+ 		flush_dcache((vm_offset_t)&CpuDataEntries[cpu], sizeof(cpu_data_entry_t), FALSE);
+ 		flush_dcache((vm_offset_t)cpu_data_ptr, sizeof(cpu_data_t), FALSE);
+ #if defined(SWEET)
+@@ -953,6 +963,7 @@ cpu_start(int cpu)
+ 		CleanPoC_DcacheRegion_Force((vm_offset_t)bootstrap_pagetables, BOOTSTRAP_TABLE_SIZE);
+ 		__builtin_arm_dsb(DSB_SY);
+ #endif
++		SWEET_STEP("cs: flush");
+ #if defined(KERNEL_INTEGRITY_CTRR)
+ 
+ 		/* First CPU being started within a cluster goes ahead to lock CTRR for cluster;
+@@ -974,6 +985,7 @@ cpu_start(int cpu)
+ 			break;
+ 		}
+ #endif
++		SWEET_STEP("cs: pe_start");
+ 		(void) PE_cpu_start(cpu_data_ptr->cpu_id, (vm_offset_t)NULL, (vm_offset_t)NULL);
+ 	}
+ 
+diff --git a/osfmk/kern/processor.c b/osfmk/kern/processor.c
+index aad9f3b..09aa7c3 100644
+--- a/osfmk/kern/processor.c
++++ b/osfmk/kern/processor.c
+@@ -77,6 +77,13 @@
+ #include <kern/task.h>
+ #include <kern/thread.h>
+ #include <kern/timer.h>
++#if defined(SWEET)
++/* 0161: synchronous bring-up markers; the eMMC flush survives a wedged CPU_ON. */
++extern void sweet_emmc_step(const char *tag);
++#define SWEET_STEP(tag) sweet_emmc_step(tag)
++#else
++#define SWEET_STEP(tag) do { } while (0)
++#endif
+ #if KPERF
+ #include <kperf/kperf.h>
+ #endif /* KPERF */
+@@ -793,6 +800,7 @@ processor_startup(
+ 
+ 	lck_mtx_lock(&processor_updown_lock);
+ 
++	SWEET_STEP("ps: locked");
+ 	if (processor == master_processor) {
+ 		processor_t             prev;
+ 
+@@ -828,6 +836,7 @@ processor_startup(
+ 	s = splsched();
+ 	pset = processor->processor_set;
+ 	pset_lock(pset);
++	SWEET_STEP("ps: pset-locked");
+ 	if (flags & LOCK_STATE) {
+ 		processor->shutdown_locked = true;
+ 	} else if (flags & UNLOCK_STATE) {
+@@ -853,6 +862,7 @@ processor_startup(
+ 	}
+ 
+ 	pset_update_processor_state(pset, processor, PROCESSOR_START);
++	SWEET_STEP("ps: state-ok");
+ 	processor->last_startup_reason = reason;
+ 	pset_unlock(pset);
+ 	splx(s);
+@@ -874,6 +884,7 @@ processor_startup(
+ 		}
+ 	}
+ 
++	SWEET_STEP("ps: idle");
+ 	/*
+ 	 *	If there is no active thread, the processor
+ 	 *	has never been started.  Create a dedicated
+@@ -905,13 +916,19 @@ processor_startup(
+ 		thread_deallocate(thread);
+ 	}
+ 
++	SWEET_STEP("ps: kthread");
+ 	if (processor->processor_self == IP_NULL) {
+ 		ipc_processor_init(processor);
+ 	}
+ 
++	SWEET_STEP("ps: ipc");
+ 	ml_cpu_power_enable(processor->cpu_id);
++	SWEET_STEP("ps: power");
+ 	ml_cpu_begin_state_transition(processor->cpu_id);
++	SWEET_STEP("ps: trans");
+ 	ml_broadcast_cpu_event(CPU_BOOT_REQUESTED, processor->cpu_id);
++	SWEET_STEP("ps: bcast");
++	SWEET_STEP("ps: cpu_start");
+ 	result = cpu_start(processor->cpu_id);
+ #if defined (__arm__) || defined (__arm64__)
+ 	assert(result == KERN_SUCCESS);

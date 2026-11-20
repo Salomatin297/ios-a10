@@ -230,6 +230,10 @@ jobs:
           need dxb/xnu/bsd/kern/sweet_amfi.c 'sweet_amfi_dyld_syscall' present '0159 AMFI dyld policy'
           need dxb/xnu/bsd/dev/a10_touch.c 'a10_touch_boot_status' present '0160 touch boot status cache'
           need dxb/xnu/bsd/dev/a10_touch.c 'failed bring-ups' present '0160 touch retry without power-cycle storm'
+          need dxb/xnu/bsd/dev/sweet_emmc.c 'sweet_emmc_step' present '0161 synchronous SMP step helper'
+          need dxb/xnu/osfmk/kern/processor.c 'SWEET_STEP("ps: cpu_start")' present '0161 processor_start markers'
+          need dxb/xnu/osfmk/arm64/cpu.c 'SWEET_STEP("cs: pe_start")' present '0161 cpu_start markers'
+          need dxb/xnu/iokit/Kernel/arm/SweetCPU.cpp 'startCPU: pre-smc' present '0161 PSCI markers'
           if [ "$fail" -ne 0 ]; then
             echo "::error::A10 port patches did not apply cleanly"
             exit 1

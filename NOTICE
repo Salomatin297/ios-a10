@@ -1,0 +1,98 @@
+A10 iOS port: third-party notices and attributions
+==================================================
+
+This repository ports iOS 16 (XNU-8796 and the iPhone X 20H392 user space)
+to the Samsung Galaxy A10 (SM-A105F, Exynos 7884B).  It is an experimental
+project, not a product.  The code is distributed under the licences below;
+each imported project keeps its own copyright and licence text.
+
+1. Apple open source
+--------------------
+XNU, libpthread, HFS, IOHIDFamily and the other Apple open-source releases
+are under the Apple Public Source License 2.0 (APPLE_LICENSE).  Apple's
+files and the changes made to them stay under APSL 2.0, and Apple's notices
+stay in those files.
+
+2. ios-sweet
+------------
+https://github.com/dipa-studio/ios-sweet
+MIT License, Copyright (c) 2026 dipa-studio.
+The files added by ios-sweet are MIT; its changes to Apple's files are
+APSL 2.0.
+
+3. ios-viva / viva-gpu
+----------------------
+https://github.com/Nik300/ios-viva
+https://github.com/Nik300/viva-gpu
+The kernel changes imported from ios-viva are APSL 2.0 for Apple's files
+and MIT for the files ios-viva added.  The Mali/Metal GPU driver
+(mapple_gpu_mali) is GPL-3.0-or-later with an additional attribution term
+under GPL section 7(b):
+
+    viva-gpu by Nicola Leone Ciardi - https://github.com/Nik300/viva-gpu
+
+That attribution and the credits in the GPU project's NOTICE must be kept,
+shown in the documentation and any About screen, and modified versions must
+be marked as modified.  If any of that GPU code is imported into this
+repository, it lives in a separate directory with its own LICENSE and
+NOTICE and is not mixed into the APSL/MIT kernel sources.
+
+4. Open Mapple
+--------------
+https://github.com/open-mapple
+The Open Mapple kernel common (xnu_kernel_mediatek_common) is Apple's XNU
+with the ios-sweet and ios-viva patch series.  Apple's files and changes to
+them are APSL 2.0; files added by ios-sweet/ios-viva are MIT, Copyright (c)
+2026 dipa-studio.  Its memory-hole model (mp_mem4g), framebuffer design and
+other kernel changes are used as a reference; where code is adapted, the
+adapted file keeps this notice and the original copyright.
+
+The Open Mapple manifest is MIT, Copyright (c) 2026 the Open Mapple authors.
+
+The Open Mapple GPU (mapple_gpu_mali) is GPL-3.0-or-later with the section
+7(b) attribution term described in section 3 above.  Mesa and its patches,
+the libdrm headers and the tables from Arm's Valhall ISA description keep
+their MIT licences.  The Mapple application and the release assembler are
+proprietary and are not used here.
+
+5. blacktop/darwin-xnu-build
+----------------------------
+https://github.com/blacktop/darwin-xnu-build
+MIT License, Copyright (c) 2023-2025 blacktop.
+
+6. Other components
+-------------------
+ipsw (https://github.com/blacktop/ipsw): MIT.
+Samsung/Exynos kernel sources: GPL-2.0, used as hardware reference only.
+TWRP: GPL-3.0, used as the recovery, not linked into this port.
+Mesa (sweetgl): MIT.
+LLVM/Clang, SPIRV-LLVM-Translator and SPIRV-Tools: the licences distributed
+by their upstream projects (Apache-2.0 with LLVM exceptions / MIT).
+
+MIT licence text
+----------------
+The MIT licence of ios-sweet, ios-viva, the files they added to Open
+Mapple's kernel and darwin-xnu-build:
+
+MIT License
+
+Copyright (c) 2026 dipa-studio
+Copyright (c) 2023-2025 blacktop
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
