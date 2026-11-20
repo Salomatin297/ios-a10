@@ -22,16 +22,18 @@ A10 facts:
   - virtual timer: PPI 11 -> INTID 27, CNTFRQ 26 MHz;
   - framebuffer 0xEC000000, 720x1600, stride 2880 (SBOOT leaves it up);
   - RAM (live /proc/device-tree/reserved-memory + dmesg):
-      bank 1  0x80000000 + 0x3DA00000  SBOOT lives here: its DTB at
-        0x8DFE0000, the secure logs at 0x91200000, and OUR boot image
-        (measured load base 0x9BBF0000; SBOOT drifts it per boot).
-      bank 2  0xC0000000 + 0x40000000  kernel RAM: seclog 0xC0000000+0x80000,
+      bank 0  0x80000000 + 0x3D800000  SBOOT lives here: its DTB at
+        0x8DFE0000, the secure logs at 0x91200000, TIMA at 0xB8000000,
+        and OUR boot image (measured load base 0x9BBF0000; SBOOT drifts
+        it per boot).
+      gap     0xBD800000 .. 0xC0000000  no DRAM.
+      bank 1  0xC0000000 + 0x40000000  seclog 0xC0000000+0x80000,
         wifibt 0xE9000000, abox 0xE9400000, framebuffer 0xEC000000+0x1400000,
         modem_if 0xF5400000, cp_ram_logging 0xFCC00000, gnss 0xFFC00000.
-    The kernel window is bank 2 ONLY: copying the kernel into bank 1 would
-    overwrite the shim image (and the code that is doing the copy) when
-    SBOOT happens to load it there.  dram-size ends 1 MiB below the
-    wifibt reservation; that last MiB is the panic log.
+    The kernel gets all of DRAM from 0x80000000 up to the panic log at
+    0xE8F00000.  The shim hands XNU the ranges it must not touch (its own
+    live tree, the secure logs, TIMA, the bank gap, bank 1's seclog) as
+    holes in the boot_args page; see xnu patch 0162.
 """
 
 import hashlib, os, struct, sys
@@ -39,11 +41,14 @@ import hashlib, os, struct, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import adt  # noqa: E402
 
-# Kernel-managed RAM: bank 2, 0xC4000000..0xE8F00000 (591 MiB).  The base is
-# 32 MiB aligned because start.s maps the kernel with a 32 MiB block; the
-# top 1 MiB (0xE8F00000) is the panic log, carved off the dram range.
-PHYS_BASE = 0xC4000000
-MEM_SIZE = 0x24f00000		# 0xE8F00000 - PHYS_BASE (panic log excluded)
+# Kernel-managed RAM: all of DRAM from bank 0's base, 0x80000000..0xE8F00000
+# (1.64 GiB).  The base is 32 MiB aligned because start.s maps the kernel
+# with a 32 MiB block; the top 1 MiB (0xE8F00000) is the panic log, carved
+# off the dram range.  The ranges the kernel must not use (SBOOT's tree,
+# Samsung's secure logs, TIMA, the bank gap, bank 1's seclog) are holes
+# handed over by the shim; see xnu patch 0162.
+PHYS_BASE = 0x80000000
+MEM_SIZE = 0x68f00000		# 0xE8F00000 - PHYS_BASE (panic log excluded)
 # Panic log buffer, carved off the TOP of the dram range and exposed to
 # XNU as /pram + /chosen/embedded-panic-log-size.
 PANIC_LOG_SIZE = 0x100000

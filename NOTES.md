@@ -2,6 +2,35 @@
 
 ## >>> A10 PORT (Samsung Galaxy A10, SM-A105F) - active work 2026-11-13 <<<
 
+### >>> UPDATE 2026-11-20: 0161 SMP step markers, 0162 full RAM with holes <<<
+
+**0161 (SMP step markers).** `sweet_emmc_step(tag)` = `printf("SWEET STEP: %s\n")`
++ immediate eMMC flush, inserted through `processor_startup`, `cpu_start` and
+`SweetCPU::startCPU`, so the persistent log shows the exact step where the
+secondary CPU bring-up stops (probe87 stopped before `post-cpu-on`, i.e. inside
+`cpu_on`, with no SMC return). Kernel CI `44727848443` succeeded; the artifact
+`kernel.development.sweet` (SHA256 `a71d7133cfcb779a5d2649fc79df24a4cafc8e2b3cf5ac27beaa85699bdf8cf6`)
+contains all markers (`SWEET STEP: %s`, `ps: cpu_start`, `cs: pe_start`,
+`startCPU: pre-smc`, `post-smc`).
+
+**0162 (full RAM, holes kept out of the VM).** The shim now hands XNU all of
+DRAM from `0x80000000` and leaves the ranges it must not touch in the
+boot_args page, 8 KiB in, magic `SWHOLES1`: the live SBOOT tree (from x0),
+Samsung's secure logs `0x91200000-0x91700000`, TIMA `0xB8000000+0x200000`,
+the bank gap `0xBD800000-0xC0000000` and bank 1's seclog
+`0xC0000000+0x80000`. `arm_vm_init.c` drops them from `mem_actual`/`max_mem`/
+`sane_size`, `pa_valid()` reports them as I/O, `pmap_steal_memory()` skips
+them (`pmap_next_page_hi`) and `pmap_startup()` keeps their `vm_pages[]` slots
+marked `vmp_error` and never frees them; the physmap is mapped around them.
+The shim's overlap checks now compare against `[phys_base, top)` (the copy
+destination), so a kernel at `0x80000000` is accepted while SBOOT's own image
+at `0x9BBF0000` is not touched. `tools/mkadt-a10.py` now emits `dram-base
+0x80000000`, `dram-size 0x68F00000`; the panic log stays at `0xE8F00000`,
+just below wifibt. Adapted from Open Mapple's `mp_mem4g` (see NOTICE).
+Next: probe88 = mixed 4 cores (`0x100,0x0,0x1,0x101`) + 0161 kernel + the
+TRACE=2 sweetgl; probe89 = new ADT + 0162 kernel.
+
+
 ### >>> UPDATE 2026-11-18 (2): probe85 - Mesa works, backboardd crash was IOSurface wrap; 0046 fix <<<
 
 **probe85 = f2bbdd4 kernel (PAGE_SIZE BO alignment) + the same ramdisk dylib.** iOS boots and

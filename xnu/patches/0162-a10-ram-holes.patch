@@ -1,0 +1,316 @@
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index 0631685..46182fa 100644
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -22,6 +22,8 @@ public:
+ 
+ OSDefineMetaClassAndStructors(SweetPlatformExpert, IODTPlatformExpert);
+ 
++extern "C" void sweet_mem4g_report(void);   /* arm_vm_init.c: the A10 RAM holes */
++
+ bool
+ SweetPlatformExpert::start(IOService *provider)
+ {
+@@ -31,6 +33,7 @@ SweetPlatformExpert::start(IOService *provider)
+ 	}
+ 	registerService();
+ 	IOLog("SWEET: platform expert registered\n");
++	sweet_mem4g_report();
+ 	return true;
+ }
+ 
+diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
+index 9d4f2f2..a6b42b3 100644
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -2576,6 +2576,10 @@ pmap_virtual_region(
+  * need to skip those pages.
+  */
+ 
++#if defined(SWEET)
++extern pmap_paddr_t sweet_hole_skip(pmap_paddr_t pa);
++#endif
++
+ static unsigned int avail_page_count = 0;
+ static bool need_ram_ranges_init = true;
+ 
+@@ -2640,6 +2644,16 @@ pmap_next_page_hi(
+ 	ppnum_t            * pnum,
+ 	__unused boolean_t might_free)
+ {
++#if defined(SWEET)
++	/* pmap_steal_memory()'s pages skip the holes; pmap_startup() handles
++	 * them itself (it keeps them in vm_pages[] and never frees them). */
++	if (need_ram_ranges_init) {
++		initialize_ram_ranges();
++	}
++	pmap_paddr_t next = MIN(sweet_hole_skip(first_avail), avail_end);
++	avail_page_count -= MIN(avail_page_count, (unsigned int)atop(next - first_avail));
++	first_avail = next;
++#endif
+ 	return pmap_next_page(pnum);
+ }
+ 
+diff --git a/osfmk/arm/pmap/pmap_data.h b/osfmk/arm/pmap/pmap_data.h
+index 2883f63..be87065 100644
+--- a/osfmk/arm/pmap/pmap_data.h
++++ b/osfmk/arm/pmap/pmap_data.h
+@@ -71,9 +71,19 @@ extern pmap_paddr_t vm_first_phys, vm_last_phys;
+  *
+  * @param pa The physical address to check.
+  */
++#if defined(SWEET)
++extern unsigned int sweet_hole_count;
++extern bool sweet_pa_in_hole(pmap_paddr_t pa);         /* arm_vm_init.c, sweet_mem4g */
++#endif
++
+ static inline bool
+ pa_valid(pmap_paddr_t pa)
+ {
++#if defined(SWEET)
++	if (sweet_hole_count != 0 && sweet_pa_in_hole(pa)) {
++		return false;
++	}
++#endif
+ 	return (pa >= vm_first_phys) && (pa < vm_last_phys);
+ }
+ 
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index bc851f9..4f332eb 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1482,6 +1482,156 @@ SECURITY_READ_ONLY_LATE(static unsigned int) ptov_index = 0;
+ #define ROUND_L1(addr) (((addr) + ARM_TT_L1_OFFMASK) & ~(ARM_TT_L1_OFFMASK))
+ #define ROUND_TWIG(addr) (((addr) + ARM_TT_TWIG_OFFMASK) & ~(ARM_TT_TWIG_OFFMASK))
+ 
++#if defined(SWEET)
++/*
++ * 0162: A10 RAM holes.  The shim hands the VM all of DRAM from bank 0's base
++ * and leaves, in the 16 KiB boot_args page, the ranges it must not use:
++ * SBOOT's live tree, Samsung's secure logs, TIMA, the bank 0/1 gap (no DRAM)
++ * and bank 1's seclog.  The holes are kept out of the free pages, out of
++ * pa_valid() (so they stay I/O) and out of the physmap, so no cacheable alias
++ * can prefetch into memory the secure world owns.
++ *
++ * Adapted from Open Mapple's mp_mem4g; see NOTICE.
++ */
++#define SWEET_HOLES_OFF 0x2000          /* in the boot_args page, below topOfKernelData */
++#define SWEET_HOLES_MAX 16
++#define SWEET_DRAM_BASE 0x80000000ULL
++
++struct sweet_holes {
++	char magic[8];
++	uint32_t count, pad;
++	uint64_t range[SWEET_HOLES_MAX][2];
++};
++
++SECURITY_READ_ONLY_LATE(unsigned int) sweet_hole_count;
++SECURITY_READ_ONLY_LATE(static pmap_paddr_t) sweet_holes[SWEET_HOLES_MAX][2];
++SECURITY_READ_ONLY_LATE(static uint64_t) sweet_hole_bytes;
++SECURITY_READ_ONLY_LATE(static bool) sweet_mem4g_asked;
++
++static void
++sweet_mem4g_init(boot_args *args)
++{
++	/* ARGS is arm_init's copy of boot_args by now: the list is read where
++	 * the shim left it, through the bootstrap map. */
++	const pmap_paddr_t pa = args->topOfKernelData - 0x4000 + SWEET_HOLES_OFF;
++	const struct sweet_holes *h = (const struct sweet_holes *)(pa - gPhysBase + gVirtBase);
++	pmap_paddr_t prev = gPhysBase;
++	uint32_t on = 1;
++
++	PE_parse_boot_argn("sweet_mem4g", &on, sizeof(on));
++	sweet_mem4g_asked = on != 0;
++	if (!sweet_mem4g_asked || memcmp(h->magic, "SWHOLES1", 8) != 0) {
++		if (gPhysBase == SWEET_DRAM_BASE) {
++			panic("sweet_mem4g: all of DRAM and no hole list");
++		}
++		return;
++	}
++	if (h->count == 0 || h->count > SWEET_HOLES_MAX) {
++		panic("sweet_mem4g: %u holes", h->count);
++	}
++	for (unsigned int i = 0; i < h->count; i++) {
++		pmap_paddr_t b = h->range[i][0], e = h->range[i][1];
++
++		if (b < prev || e <= b || e > gPhysBase + mem_size || ((b | e) & PAGE_MASK)) {
++			panic("sweet_mem4g: hole %u 0x%llx-0x%llx", i, b, e);
++		}
++		sweet_holes[i][0] = b;
++		sweet_holes[i][1] = e;
++		sweet_hole_bytes += e - b;
++		prev = e;
++	}
++	sweet_hole_count = h->count;
++}
++
++bool
++sweet_pa_in_hole(pmap_paddr_t pa)
++{
++	unsigned int lo = 0, hi = sweet_hole_count;
++
++	while (lo < hi) {
++		unsigned int mid = (lo + hi) / 2;
++
++		if (pa >= sweet_holes[mid][1]) {
++			lo = mid + 1;
++		} else if (pa < sweet_holes[mid][0]) {
++			hi = mid;
++		} else {
++			return true;
++		}
++	}
++	return false;
++}
++
++/* PA itself, or the end of the hole it is in. */
++pmap_paddr_t
++sweet_hole_skip(pmap_paddr_t pa)
++{
++	for (unsigned int i = 0; i < sweet_hole_count; i++) {
++		if (pa >= sweet_holes[i][0] && pa < sweet_holes[i][1]) {
++			return sweet_holes[i][1];
++		}
++	}
++	return pa;
++}
++
++uint64_t
++sweet_hole_bytes_in(pmap_paddr_t b, pmap_paddr_t e)
++{
++	uint64_t n = 0;
++
++	for (unsigned int i = 0; i < sweet_hole_count; i++) {
++		pmap_paddr_t hb = MAX(b, sweet_holes[i][0]);
++		pmap_paddr_t he = MIN(e, sweet_holes[i][1]);
++
++		if (hb < he) {
++			n += he - hb;
++		}
++	}
++	return n;
++}
++
++/* Map the physmap's [PA, PA + LEN) at VA, all but the holes. */
++static void
++sweet_physmap_map(vm_offset_t va, pmap_paddr_t pa, vm_size_t len,
++    pmap_paddr_t pa_offset, int pte_prot_APX, unsigned granule)
++{
++	pmap_paddr_t cur = pa, end = pa + len;
++
++	for (unsigned int i = 0; i <= sweet_hole_count && cur < end; i++) {
++		pmap_paddr_t hb = i < sweet_hole_count ? MIN(sweet_holes[i][0], end) : end;
++		pmap_paddr_t he = i < sweet_hole_count ? sweet_holes[i][1] : end;
++
++		if (hb > cur) {
++			arm_vm_page_granular_prot(va + (cur - pa), hb - cur,
++			    pa_offset, 1, pte_prot_APX, 1, granule);
++		}
++		cur = MAX(cur, he);
++	}
++}
++
++void
++sweet_mem4g_report(void)
++{
++	if (sweet_hole_count == 0) {
++		if (sweet_mem4g_asked) {
++			printf("sweet_mem4g: no hole list from the shim\n");
++		}
++		return;
++	}
++	for (unsigned int i = 0; i < sweet_hole_count; i++) {
++		printf("sweet_mem4g: hole 0x%09llx-0x%09llx %llu KiB\n",
++		    (unsigned long long)sweet_holes[i][0],
++		    (unsigned long long)sweet_holes[i][1] - 1,
++		    (unsigned long long)(sweet_holes[i][1] - sweet_holes[i][0]) >> 10);
++	}
++	printf("sweet_mem4g: RAM 0x%llx-0x%llx, %u holes of %llu MiB, %llu MiB for the VM\n",
++	    (unsigned long long)gPhysBase,
++	    (unsigned long long)(gPhysBase + gPhysSize), sweet_hole_count,
++	    (unsigned long long)(sweet_hole_bytes >> 20),
++	    (unsigned long long)(max_mem >> 20));
++}
++#endif
++
+ static void
+ arm_vm_physmap_slide(ptov_table_entry *temp_ptov_table, vm_map_address_t orig_va, vm_size_t len, int pte_prot_APX, unsigned granule)
+ {
+@@ -1510,7 +1660,12 @@ arm_vm_physmap_slide(ptov_table_entry *temp_ptov_table, vm_map_address_t orig_va
+ 	assert((temp_ptov_table[ptov_index].va & ARM_PGMASK) == 0);
+ 	temp_ptov_table[ptov_index].len = round_page(len);
+ 	pa_offset = temp_ptov_table[ptov_index].va - orig_va;
++#if defined(SWEET)
++	sweet_physmap_map(temp_ptov_table[ptov_index].va, temp_ptov_table[ptov_index].pa,
++	    temp_ptov_table[ptov_index].len, pa_offset, pte_prot_APX, granule);
++#else
+ 	arm_vm_page_granular_prot(temp_ptov_table[ptov_index].va, temp_ptov_table[ptov_index].len, pa_offset, 1, pte_prot_APX, 1, granule);
++#endif
+ 	++ptov_index;
+ }
+ 
+@@ -1898,6 +2053,11 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 	} else {
+ 		max_mem_actual = mem_actual;
+ 	}
++#if defined(SWEET)
++	sweet_mem4g_init(args);
++	mem_actual -= sweet_hole_bytes;
++	max_mem_actual -= sweet_hole_bytes;
++#endif
+ 	if (mem_size >= ((VM_MAX_KERNEL_ADDRESS - VM_MIN_KERNEL_ADDRESS) / 2)) {
+ 		panic("Unsupported memory configuration %lx", mem_size);
+ 	}
+@@ -2256,6 +2416,10 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 
+ 	sane_size = mem_size - (avail_start - gPhysBase);
+ 	max_mem = mem_size;
++#if defined(SWEET)
++	sane_size -= sweet_hole_bytes;
++	max_mem -= sweet_hole_bytes;
++#endif
+ 	vm_kernel_slid_base = segLOWESTTEXT;
+ 	// vm_kernel_slide is set by arm_init()->arm_slide_rebase_and_sign_image()
+ 	vm_kernel_stext = segTEXTB;
+@@ -2424,6 +2588,12 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 
+ #if XNU_MONITOR
+ 	pmap_static_allocations_done();
++#endif
++#if defined(SWEET)
++	if (sweet_hole_bytes_in(args->topOfKernelData, avail_start) != 0) {
++		panic("sweet_mem4g: the boot allocations 0x%llx-0x%llx ran into a hole",
++		    args->topOfKernelData, avail_start);
++	}
+ #endif
+ 	first_avail = avail_start;
+ 	patch_low_glo_static_region(args->topOfKernelData, avail_start - args->topOfKernelData);
+diff --git a/osfmk/vm/vm_resident.c b/osfmk/vm/vm_resident.c
+index 6394730..138061f 100644
+--- a/osfmk/vm/vm_resident.c
++++ b/osfmk/vm/vm_resident.c
+@@ -1391,6 +1391,9 @@ uint64_t secluded_shutoff_headroom = 150 * 1024 * 1024; /* original value from N
+ #if defined(__arm64__)
+ extern void patch_low_glo_vm_page_info(void *, void *, uint32_t);
+ unsigned int vm_first_phys_ppnum = 0;
++#if defined(SWEET)
++extern bool sweet_pa_in_hole(uint64_t pa);     /* arm_vm_init.c, sweet_mem4g */
++#endif
+ #endif
+ 
+ void vm_page_release_startup(vm_page_t mem);
+@@ -1567,6 +1570,14 @@ pmap_startup(
+ #endif
+ 		++vm_pages_count;
+ 		vm_page_init(&vm_pages[i], phys_page, FALSE);
++#if defined(SWEET)
++		/* A hole's page keeps its slot in vm_pages[] (the index is the
++		 * physical page number) and is never freed. */
++		if (sweet_pa_in_hole(ptoa(phys_page))) {
++			vm_pages[i].vmp_error = TRUE;
++			continue;
++		}
++#endif
+ 		if (fill) {
+ 			fillPage(phys_page, fillval);
+ 		}
