@@ -2,6 +2,41 @@
 
 ## >>> A10 PORT (Samsung Galaxy A10, SM-A105F) - active work 2026-11-13 <<<
 
+### >>> UPDATE 2026-11-21: 0163 boots past the fb fault; 0164 kmem diagnostics <<<
+
+**probe91 (0163 kernel, full-RAM ADT, 4 cores, `sweet_mem4g=1`).** The
+splash-framebuffer mapping fix works: the screen gets past the early
+translation fault and shows a kernel panic from `arm_vm_init` /
+`kmem_range_init`, so `sweet_mem4g_init` accepted the 16K-rounded hole layout
+and the physmap came up. The persistent log was not updated (the ring still
+had probe88's `SWEETLOG total=8930 seq=7`), i.e. probe91 died before the log
+writer. Image `dist/boot-a10-probe91.img` SHA256
+`D5EB3D792898CF9569CD76E8C8575DC6FD7FB914EEEF824BCA8BC42152A5FD92`;
+the embedded payload was verified byte-identical to a deterministic rebuild
+from the CI kernel plus `work/a10-fullram-4cpu.adt`.
+
+**probe92 (`debug=0xd` = DB_HALT).** Same image with `debug=0xd` in the
+payload cmdline only, so the panic stays on screen:
+`panic(cpu 0 caller 0xfffffff007aa4678): kmem_range_unit:
+vm_map_locate_space failing for claim kmem_ptr_range_meta @vm_kern.c:3645`.
+Root cause: this arm64 build has no KTRR/CTRR, so
+`ZSECURITY_CONFIG_KERNEL_PTR_SPLIT` is off and `kmem_ptr_ranges = 1`. The
+claims (`data`, `ptr`, `sprayqtn`, `meta`) add up to exactly the largest free
+block and are placed sequentially from `kmem_fuzz_start()`, so the small
+`kmem_ptr_range_meta` claim is the one that no longer fits. The V=P physmap
+at `virtBase = 0xfffffff006000000` splits `kernel_map` into a ~64 GB lower and
+a ~46 GB upper block; the allocator picks the largest block and the claims
+consume all of it. Image `dist/boot-a10-probe92.img` SHA256
+`951C88A84C3078E6442C2EF0C4A69AAE0DA63F1043E12E6EF7C0CEF01895310B`.
+
+**0164 (kmem diagnostics + fallback).** `kmem_range_init` now dumps `free`,
+`totalclaims`, `sane`, `ranges`, `claimcount`, `ptr`, `spray`, `data`,
+`meta`, `mapmin`, `mapmax`, `fuzzstart` and per-claim `size`/`start`/`end`
+through `sweet_early_hex()` (the early console is still alive during
+`kmem_range_init`), and retries a failed `vm_map_locate_space` once from
+`kernel_map->min_offset` before panicking. The workflow verifies the new
+`kmem totalclaims` and `kmem retry at` markers.
+
 ### >>> UPDATE 2026-11-20: 0161 SMP step markers, 0162 full RAM with holes <<<
 
 **0161 (SMP step markers).** `sweet_emmc_step(tag)` = `printf("SWEET STEP: %s\n")`

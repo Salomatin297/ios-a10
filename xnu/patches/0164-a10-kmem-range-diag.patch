@@ -1,0 +1,92 @@
+diff --git a/osfmk/vm/vm_kern.c b/osfmk/vm/vm_kern.c
+index 54edb01..0e04562 100644
+--- a/osfmk/vm/vm_kern.c
++++ b/osfmk/vm/vm_kern.c
+@@ -95,6 +95,10 @@
+ #include <kern/zalloc_internal.h>
+ #include <libkern/crypto/rand.h>
+ 
++#if defined(SWEET)
++#include <arm64/sweet_early.h>
++#endif
++
+ /*
+  *	Variables exported by this module.
+  */
+@@ -3544,6 +3548,14 @@ kmem_add_extra_claims(void)
+ 	assert((total_claims & PAGE_MASK) == 0);
+ 	largest_free_size -= total_claims;
+ 
++#if defined(SWEET)
++	sweet_early_hex("kmem free", largest_free_size);
++	sweet_early_hex("kmem totalclaims", total_claims);
++	sweet_early_hex("kmem sane", sane_size);
++	sweet_early_hex("kmem ranges", kmem_ptr_ranges);
++	sweet_early_hex("kmem claimcount", kmem_claim_count);
++#endif
++
+ 	/*
+ 	 * Use half the total available VA for all pointer allocations (this
+ 	 * includes the kmem_sprayqtn range). Given that we have 4 total
+@@ -3572,6 +3584,13 @@ kmem_add_extra_claims(void)
+ 	    ((ptr_range_size + kmem_meta_size) * kmem_ptr_ranges) <=
+ 	    largest_free_size);
+ 
++#if defined(SWEET)
++	sweet_early_hex("kmem ptr", ptr_range_size);
++	sweet_early_hex("kmem spray", sprayqtn_range_size);
++	sweet_early_hex("kmem data", data_range_size);
++	sweet_early_hex("kmem meta", kmem_meta_size);
++#endif
++
+ 	struct kmem_range_startup_spec kmem_spec_sprayqtn = {
+ 		.kc_name = "kmem_sprayqtn_range",
+ 		.kc_range = &kmem_ranges[KMEM_RANGE_ID_SPRAYQTN],
+@@ -3632,20 +3651,45 @@ kmem_scramble_ranges(void)
+ 	assert(kmem_claim_count < UINT16_MAX);
+ 	kmem_shuffle_claims();
+ 
++#if defined(SWEET)
++	sweet_early_hex("kmem mapmin", kernel_map->min_offset);
++	sweet_early_hex("kmem mapmax", kernel_map->max_offset);
++	sweet_early_hex("kmem fuzzstart", start);
++#endif
++
+ 	/*
+ 	 * Apply restrictions and determine range for each claim
+ 	 */
+ 	for (uint32_t i = 0; i < kmem_claim_count; i++) {
+ 		vm_map_offset_t end = 0;
++		kern_return_t kr;
+ 		struct kmem_range_startup_spec sp = kmem_claims[i];
+ 		struct mach_vm_range *sp_range = sp.kc_range;
+-		if (vm_map_locate_space(kernel_map, sp.kc_size, 0,
+-		    VM_MAP_KERNEL_FLAGS_ANYWHERE(), &start, NULL) != KERN_SUCCESS) {
++
++#if defined(SWEET)
++		sweet_early_mark(20, sp.kc_name);
++		sweet_early_hex("  size", sp.kc_size);
++		sweet_early_hex("  start", start);
++#endif
++		kr = vm_map_locate_space(kernel_map, sp.kc_size, 0,
++		    VM_MAP_KERNEL_FLAGS_ANYWHERE(), &start, NULL);
++#if defined(SWEET)
++		if (kr != KERN_SUCCESS) {
++			sweet_early_hex("  retry at", kernel_map->min_offset);
++			start = kernel_map->min_offset;
++			kr = vm_map_locate_space(kernel_map, sp.kc_size, 0,
++			    VM_MAP_KERNEL_FLAGS_ANYWHERE(), &start, NULL);
++		}
++#endif
++		if (kr != KERN_SUCCESS) {
+ 			panic("kmem_range_init: vm_map_locate_space failing for claim %s",
+ 			    sp.kc_name);
+ 		}
+ 
+ 		end = start + sp.kc_size;
++#if defined(SWEET)
++		sweet_early_hex("  end", end);
++#endif
+ 		/*
+ 		 * Re-adjust ranges if restriction not met
+ 		 */
