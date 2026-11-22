@@ -53,7 +53,29 @@ resolved PC-relatively (`adr`), so SBOOT's load base does not matter. The
 scratch is checked against the live DTB and against the source. Image
 `dist/boot-a10-probe90.img` SHA256
 `B9AF8DC42D23F8C15E1561004B377C2F39528C14259BA401915900D9B812CF33`,
-flashed and booting.
+flashed (boot partition SHA256 verified).
+
+**probe90 did not boot past the shim.** The pulled "probe90 log" was
+byte-identical to probe88's (`SWEETLOG` header `total=8930 seq=7`), i.e. a
+stale ring: probe90 never reached the persistent log writer. The screen stayed
+on the shim's last line, `XNU jumping (fbcon clears screen)`, and no
+`SWEET EARLY` marker appeared, so XNU died before or at the first
+`sweet_early_mark()` in `arm_init`.
+
+**0163 (root cause of the full-RAM early hang).** The SWEET splash-framebuffer
+mapping in `start.s` wrote its block entries at
+`bootstrap_pagetables + 2*PGBYTES`, i.e. the first V=P L2 page, and assumed
+the fb at `0xEC000000` lived there. That was true with `phys_base=0xC4000000`
+(the V=P mapping starts at L1 index 3, and so does the fb). With
+`phys_base=0x80000000` the V=P mapping starts at L1 index 2 and the fb is in
+the *second* L2 page (L1 index 3), so the entries were written at
+`0xAC000000` and `0xEC000000` stayed unmapped; the first early-console write
+took a translation fault. 0163 resolves the L2 table through the V=P L1
+entry (`ldr` the descriptor for the fb's L1 index, mask
+`ARM_TTE_TABLE_MASK`) instead of a fixed page offset, and adds
+`sweet_early_hex()` plus boot_args/hole-magic dumps at `arm_init` entry so the
+next probe prints `memSize`, `memActual`, `physBase`, `virtBase`,
+`topKernel` and the `SWHOLES1` magic on screen before the log exists.
 
 
 ### >>> UPDATE 2026-11-18 (2): probe85 - Mesa works, backboardd crash was IOSurface wrap; 0046 fix <<<

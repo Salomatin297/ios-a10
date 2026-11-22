@@ -234,6 +234,9 @@ jobs:
           need dxb/xnu/osfmk/kern/processor.c 'SWEET_STEP("ps: cpu_start")' present '0161 processor_start markers'
           need dxb/xnu/osfmk/arm64/cpu.c 'SWEET_STEP("cs: pe_start")' present '0161 cpu_start markers'
           need dxb/xnu/iokit/Kernel/arm/SweetCPU.cpp 'startCPU: pre-smc' present '0161 PSCI markers'
+          need dxb/xnu/osfmk/arm64/start.s 'V=P L1 entry -> L2 table PA' present '0163 framebuffer L2 lookup'
+          need dxb/xnu/osfmk/arm64/sweet_early.c 'sweet_early_hex' present '0163 early value dump'
+          need dxb/xnu/osfmk/arm/arm_init.c 'holeMagic' present '0163 boot_args dump at arm_init'
           if [ "$fail" -ne 0 ]; then
             echo "::error::A10 port patches did not apply cleanly"
             exit 1
