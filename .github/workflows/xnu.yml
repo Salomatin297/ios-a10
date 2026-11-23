@@ -238,7 +238,8 @@ jobs:
           need dxb/xnu/osfmk/arm64/sweet_early.c 'sweet_early_hex' present '0163 early value dump'
           need dxb/xnu/osfmk/arm/arm_init.c 'holeMagic' present '0163 boot_args dump at arm_init'
           need dxb/xnu/osfmk/vm/vm_kern.c 'kmem totalclaims' present '0164 kmem diagnostics'
-          need dxb/xnu/osfmk/vm/vm_kern.c 'retry at' present '0164 kmem fallback'
+          need dxb/xnu/osfmk/vm/vm_kern.c 'kmem holes=' present '0165 kmem hole dump'
+          need dxb/xnu/osfmk/vm/vm_kern.c 'KMEMFAIL' present '0165 kmem failure dump'
           if [ "$fail" -ne 0 ]; then
             echo "::error::A10 port patches did not apply cleanly"
             exit 1

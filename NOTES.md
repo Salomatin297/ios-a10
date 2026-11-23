@@ -1804,3 +1804,35 @@ What it took today (in order): 0058 HID services (Apple IOHIDFamily-1915 user cl
 - CI note: a push cancels the queued/running build (concurrency group), so
   patches are pushed one batch at a time and the artifact is downloaded before
   the next push.
+
+## Status 2026-11-23: probe93 kmem panic, 0165 largest-hole anchor
+
+- probe93 (0164 kernel, full-RAM ADT, `sweet_mem4g=1 nointr_consio=1 debug=0xd`)
+  panicked in `kmem_range_init`: `vm_map_locate_space failing for claim
+  kmem_ptr_range`.  The early console was overwritten by the video console, so
+  none of the 0164 `sweet_early_hex` values survived; the retry-from-min also
+  failed.
+- Geometry: on this non-KTRR/non-CTRR build `pmap_virtual_region` region 3
+  reserves `[VM_MIN_KERNEL_ADDRESS, LOW_GLOBAL_BASE_ADDRESS)` (64 GB) as
+  bootstrap mappings, and region 2 reserves 32 MB at `LOW_GLOBAL_BASE_ADDRESS`
+  for the early framebuffer alias.  The physmap sits just above the kernel
+  (`physmap_base = phystokv(topOfKernelData)` plus a random slide of up to
+  1 GB), so the free space is a small gap between the low globals and the
+  static kernel region plus a multi-GB gap between the static region and
+  VREGION1 near the top.
+- `kmem_fuzz_start()` is first-fit from `kernel_map->min_offset`, so it lands
+  in the small low-globals/static gap, while the claims are sized from
+  `vm_map_sizes`'s *largest* free extent (the upper gap).  The fuzz-end anchor
+  therefore does not match the hole the claims must fill.
+- 0165 anchors the claim loop at the start of the largest hole from
+  `kernel_map->holes_list` (or right after the fuzz allocation if it landed in
+  that hole), removes the unsafe retry-from-min (it can overlap already
+  assigned claims), and replaces the early-console diagnostics with `printf`
+  (`kmem free=`, `kmem map=`, `kmem holes=`, per-claim `kmem claim`/`-> kr=`,
+  and `KMEMFAIL`).
+- CI run for 8f49ff4 is green; the 0164 verify marker was fixed to the printed
+  `retry at` string and is now superseded by the 0165 markers.
+- Next: build probe94 with the 0165 kernel, flash from TWRP, and read the
+  `kmem` lines on the video console.  If the largest-hole anchor is right the
+  boot proceeds past kmem; if not, `kmem free` vs `kmem holes` shows whether
+  `vm_map_sizes` and the hole list disagree.

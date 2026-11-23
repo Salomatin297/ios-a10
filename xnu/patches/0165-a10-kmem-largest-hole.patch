@@ -1,0 +1,111 @@
+diff --git a/osfmk/vm/vm_kern.c b/osfmk/vm/vm_kern.c
+index 0e04562..3357d0b 100644
+--- a/osfmk/vm/vm_kern.c
++++ b/osfmk/vm/vm_kern.c
+@@ -3589,6 +3589,13 @@ kmem_add_extra_claims(void)
+ 	sweet_early_hex("kmem spray", sprayqtn_range_size);
+ 	sweet_early_hex("kmem data", data_range_size);
+ 	sweet_early_hex("kmem meta", kmem_meta_size);
++	printf("kmem free=%llx ptr=%llx spray=%llx data=%llx meta=%llx n=%u\n",
++	    (unsigned long long)largest_free_size,
++	    (unsigned long long)ptr_range_size,
++	    (unsigned long long)sprayqtn_range_size,
++	    (unsigned long long)data_range_size,
++	    (unsigned long long)kmem_meta_size,
++	    (unsigned int)kmem_claim_count);
+ #endif
+ 
+ 	struct kmem_range_startup_spec kmem_spec_sprayqtn = {
+@@ -3652,9 +3659,51 @@ kmem_scramble_ranges(void)
+ 	kmem_shuffle_claims();
+ 
+ #if defined(SWEET)
+-	sweet_early_hex("kmem mapmin", kernel_map->min_offset);
+-	sweet_early_hex("kmem mapmax", kernel_map->max_offset);
+-	sweet_early_hex("kmem fuzzstart", start);
++	/*
++	 * The fuzz allocation above is first-fit from the map's lowest hole,
++	 * but the claims below are sized to fill the *largest* hole.  On this
++	 * port the lowest hole is a small bootstrap gap between the low
++	 * globals and the static kernel region, so anchor the claims at the
++	 * start of the largest hole instead.  If the fuzz allocation landed
++	 * inside that hole, start right after it.
++	 */
++	{
++		vm_map_offset_t fuzz_end = start;
++		struct vm_map_links *h = kernel_map->holes_list;
++		struct vm_map_links *best = h;
++		vm_map_size_t best_size = 0;
++		unsigned int nholes = 0, guard = 0;
++
++		if (h != NULL) {
++			do {
++				vm_map_size_t hs = h->end - h->start;
++				nholes++;
++				if (hs > best_size) {
++					best_size = hs;
++					best = h;
++				}
++				h = h->next;
++			} while (h != kernel_map->holes_list && ++guard < 64);
++		}
++		if (best_size != 0) {
++			vm_map_offset_t anchor = best->start;
++			if (start > anchor && start < best->end) {
++				anchor = start;
++			}
++			start = anchor;
++		}
++		printf("kmem map=%llx-%llx fuzz=%llx anchor=%llx\n",
++		    (unsigned long long)kernel_map->min_offset,
++		    (unsigned long long)kernel_map->max_offset,
++		    (unsigned long long)fuzz_end,
++		    (unsigned long long)start);
++		if (best != NULL) {
++			printf("kmem holes=%u best=%llx-%llx (%llx)\n", nholes,
++			    (unsigned long long)best->start,
++			    (unsigned long long)best->end,
++			    (unsigned long long)best_size);
++		}
++	}
+ #endif
+ 
+ 	/*
+@@ -3667,18 +3716,20 @@ kmem_scramble_ranges(void)
+ 		struct mach_vm_range *sp_range = sp.kc_range;
+ 
+ #if defined(SWEET)
+-		sweet_early_mark(20, sp.kc_name);
+-		sweet_early_hex("  size", sp.kc_size);
+-		sweet_early_hex("  start", start);
++		printf("kmem claim %s sz=%llx st=%llx\n", sp.kc_name,
++		    (unsigned long long)sp.kc_size, (unsigned long long)start);
+ #endif
+ 		kr = vm_map_locate_space(kernel_map, sp.kc_size, 0,
+ 		    VM_MAP_KERNEL_FLAGS_ANYWHERE(), &start, NULL);
+ #if defined(SWEET)
++		printf("kmem  -> kr=%d at=%llx\n", kr,
++		    (unsigned long long)start);
+ 		if (kr != KERN_SUCCESS) {
+-			sweet_early_hex("  retry at", kernel_map->min_offset);
+-			start = kernel_map->min_offset;
+-			kr = vm_map_locate_space(kernel_map, sp.kc_size, 0,
+-			    VM_MAP_KERNEL_FLAGS_ANYWHERE(), &start, NULL);
++			printf("KMEMFAIL %s sz=%llx st=%llx min=%llx max=%llx\n",
++			    sp.kc_name, (unsigned long long)sp.kc_size,
++			    (unsigned long long)start,
++			    (unsigned long long)kernel_map->min_offset,
++			    (unsigned long long)kernel_map->max_offset);
+ 		}
+ #endif
+ 		if (kr != KERN_SUCCESS) {
+@@ -3687,9 +3738,6 @@ kmem_scramble_ranges(void)
+ 		}
+ 
+ 		end = start + sp.kc_size;
+-#if defined(SWEET)
+-		sweet_early_hex("  end", end);
+-#endif
+ 		/*
+ 		 * Re-adjust ranges if restriction not met
+ 		 */
