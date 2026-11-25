@@ -240,6 +240,12 @@ jobs:
           need dxb/xnu/osfmk/vm/vm_kern.c 'kmem totalclaims' present '0164 kmem diagnostics'
           need dxb/xnu/osfmk/vm/vm_kern.c 'kmem holes=' present '0165 kmem hole dump'
           need dxb/xnu/osfmk/vm/vm_kern.c 'KMEMFAIL' present '0165 kmem failure dump'
+          need dxb/xnu/osfmk/vm/vm_kern.c 'kmem vmsizes total=' present '0166 kmem sizes split'
+          need dxb/xnu/osfmk/vm/vm_kern.c 'kmem hole%u=' present '0166 all kmem holes'
+          need dxb/xnu/osfmk/vm/vm_kern.c 'kmem placed=' present '0166 kmem claim sum'
+          need dxb/xnu/osfmk/kern/zalloc.c '#define ZONE_MAP_VA_SIZE        (8ULL << 30)' present '0166 zones VA 8G'
+          need dxb/xnu/osfmk/kern/zalloc.c 'zone va=' present '0166 zone sizing dump'
+          need dxb/xnu/osfmk/vm/vm_compressor.c 'compressor buf=' present '0166 compressor sizing dump'
           if [ "$fail" -ne 0 ]; then
             echo "::error::A10 port patches did not apply cleanly"
             exit 1

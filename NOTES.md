@@ -2,6 +2,55 @@
 
 ## >>> A10 PORT (Samsung Galaxy A10, SM-A105F) - active work 2026-11-13 <<<
 
+### >>> UPDATE 2026-11-25: probe94 kmem accounting; 0166 zones VA 8G <<<
+
+**probe94 (0165, 4 cores).** The largest-hole anchor works and the whole
+`kmem_range_init` log is now readable, but `compressor` fails:
+`kmem claim compressor sz=65fa9c000 st=fffffff68ddf4000`, `kr=3`,
+`KMEMFAIL compressor ... min=ffffffe000000000 max=fffffffbffffffff`.
+Visible claims before the failure: `gIOKitPageableFixed3` `0x6000000` at
+`fffffff082000000`, `zones` `0x600000000`, `zone_meta` `0x1ccc000`,
+`bufferhdr` `0x128000`, `ipc_kernel_map` `0x4000000`, then `compressor`
+`0x65fa9c000`. They sum to `0xC6B890000` (49.68 GiB) against the
+`0xb7ddfc000` (45.97 GiB) largest hole, so placement is ~3.7 GiB short.
+`n=15` at the `kmem_add_extra_claims` print is 13 registered claims plus the
+two `kmem_ptr_range*` claims; the remaining registered claims (the other
+`gIOKitPageableFixed0-2`, `io_submap`, `ipc_kernel_copy_map`, `mb`,
+`bsd_pageable`) were shuffled behind `compressor` and never printed. The
+`free=ffffffffef936400` on that line is not trustworthy: `ptr`, `spray`,
+`data` and `meta` reconstruct to a 120 TiB value, so the division input is
+already corrupt (stack-slot/varargs issue), while the claim starts and sizes
+are internally consistent. Image `dist/boot-a10-probe94.img` SHA256
+`D33C996BD4C5C383DD8C428CDC819615E77F2035748E3CB06C088319C9A5CBD3`,
+payload `70C326295F2004E4B95FC87AAEDDB9619A09B1BA9A5FBD36163CA044EF2C8CC4`,
+zip `C532042D9E74495A0BF4DB3BE1DFF644042DB9512F7C0D442D532113DB4E9005`;
+kernel CI `45192307556`, kernel SHA256
+`5842FB032FDB1BAD33CF3AA2D7A56E050AA0DBFBE4D2D8C054ED886C21032E4F`.
+
+**0166 (fit the zones claim into the A10 hole).** `ZONE_MAP_VA_SIZE` drops
+from 24 GiB to 8 GiB under `SWEET_4K_USERVA` (the `ZONE_MAP_MAX` value is
+unchanged, and the zone map's actual `zsize` is only `sane_size/2` =
+0.78 GiB). That removes ~16 GiB from the `zones` claim and a proportional
+amount from `zone_meta`, leaving roughly 12 GiB of slack for the 25.49 GiB
+compressor claim. The diagnostics are also split so each `printf` prints at
+most three values, and now include: `vm_map_sizes` total vs largest free,
+`gVirtBase`/`virtual_space_start`, all four `pmap_virtual_region` ranges,
+every `holes_list` entry, the running placed-claim sum, and the compressor
+internals (`c_seg_bufsize`, `c_seg_allocsize`, `c_segments_limit`,
+`compressor_pool_size/max_size`, `max_mem`, `c_segments_arr_size`,
+`c_buffers_size`, `compressor_size`, `vm_swap_get_max_configured_space()`,
+`vm_compression_limit`). Patch `xnu/patches/0166-a10-kmem-zone-va-fit.patch`
+(three files); workflow markers updated. The compressor claim was left as is
+until probe95 shows the real `max_mem`/pool arithmetic (16x `max_mem` on this
+macOS-target build, not the `max_mem` in the non-OSX branch).
+
+**Next:** commit/push 0166, run kernel CI, build probe95 with
+`tools/build_probe_smp.ps1`, force-reboot the phone to TWRP (probe94 is in
+`MACH Reboot`), flash with `tools/flash_probe.ps1`, and read the new `kmem`
+lines. If placement still fails, use the printed `free0`/`claims`/`placed`
+and compressor numbers to trim the compressor claim or adjust
+`ZONE_MAP_VA_SIZE` again.
+
 ### >>> UPDATE 2026-11-21: 0163 boots past the fb fault; 0164 kmem diagnostics <<<
 
 **probe91 (0163 kernel, full-RAM ADT, 4 cores, `sweet_mem4g=1`).** The

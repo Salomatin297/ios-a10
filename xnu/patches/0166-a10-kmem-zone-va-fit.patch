@@ -1,0 +1,194 @@
+diff --git a/osfmk/kern/zalloc.c b/osfmk/kern/zalloc.c
+index ae13272..d4b0a69 100644
+--- a/osfmk/kern/zalloc.c
++++ b/osfmk/kern/zalloc.c
+@@ -162,7 +162,8 @@ ZONE_DEFINE_TYPE(percpu_u64_zone, "percpu.64", uint64_t,
+ 
+ #if defined(SWEET_4K_USERVA)
+ #define ZONE_MAP_MAX            (8ULL << 30)
+-#define ZONE_MAP_VA_SIZE        (24ULL << 30)
++/* 0166: the zones claim must leave room for the compressor in the A10 hole. */
++#define ZONE_MAP_VA_SIZE        (8ULL << 30)
+ #elif XNU_PLATFORM_MacOSX
+ #define ZONE_MAP_MAX            (32ULL << 30)
+ #define ZONE_MAP_VA_SIZE        (128ULL << 30)
+@@ -10140,6 +10141,22 @@ zone_set_map_sizes(void)
+ 		zone_xtra_size = round_page(zone_bits_size * CHAR_BIT << zba_xtra_shift);
+ 	}
+ #endif /* VM_TAG_SIZECLASSES */
++
++#if defined(SWEET)
++	printf("zone va=%llx max=%llx zsize=%llx wiredmax=%llx\n",
++	    (unsigned long long)ZONE_MAP_VA_SIZE,
++	    (unsigned long long)ZONE_MAP_MAX,
++	    (unsigned long long)zsize,
++	    (unsigned long long)zone_pages_wired_max);
++	printf("zone submap=%llx rmax=%llx startmax=%llx\n",
++	    (unsigned long long)vm_submap_size,
++	    (unsigned long long)zone_restricted_va_max(),
++	    (unsigned long long)zone_map_range.min_address);
++	printf("zone meta=%llx bits=%llx xtra=%llx\n",
++	    (unsigned long long)zone_meta_size,
++	    (unsigned long long)zone_bits_size,
++	    (unsigned long long)zone_xtra_size);
++#endif
+ }
+ STARTUP(KMEM, STARTUP_RANK_FIRST, zone_set_map_sizes);
+ 
+diff --git a/osfmk/vm/vm_compressor.c b/osfmk/vm/vm_compressor.c
+index 1e7ca07..c3e2332 100644
+--- a/osfmk/vm/vm_compressor.c
++++ b/osfmk/vm/vm_compressor.c
+@@ -944,6 +944,23 @@ vm_compressor_set_size(void)
+ 	c_compressed_record_sbuf_size = (vm_size_t)c_seg_allocsize + (PAGE_SIZE * 2);
+ 	compressor_size += c_compressed_record_sbuf_size;
+ #endif /* RECORD_THE_COMPRESSED_DATA */
++
++#if defined(SWEET)
++	printf("compressor buf=%x alloc=%x segs=%u\n",
++	    (unsigned int)c_seg_bufsize, (unsigned int)c_seg_allocsize,
++	    (unsigned int)c_segments_limit);
++	printf("compressor pool=%llx max=%llx mem=%llx\n",
++	    (unsigned long long)compressor_pool_size,
++	    (unsigned long long)compressor_pool_max_size,
++	    (unsigned long long)max_mem);
++	printf("compressor arr=%llx buffers=%llx size=%llx\n",
++	    (unsigned long long)c_segments_arr_size,
++	    (unsigned long long)c_buffers_size,
++	    (unsigned long long)compressor_size);
++	printf("compressor swapmax=%llx limit=%u\n",
++	    (unsigned long long)vm_swap_get_max_configured_space(),
++	    (unsigned int)vm_compression_limit);
++#endif
+ }
+ STARTUP(KMEM, STARTUP_RANK_FIRST, vm_compressor_set_size);
+ 
+diff --git a/osfmk/vm/vm_kern.c b/osfmk/vm/vm_kern.c
+index 3357d0b..4451388 100644
+--- a/osfmk/vm/vm_kern.c
++++ b/osfmk/vm/vm_kern.c
+@@ -97,6 +97,8 @@
+ 
+ #if defined(SWEET)
+ #include <arm64/sweet_early.h>
++#include <arm/pmap.h>
++extern vm_offset_t virtual_space_start;
+ #endif
+ 
+ /*
+@@ -3528,8 +3530,14 @@ static void
+ kmem_add_extra_claims(void)
+ {
+ 	vm_map_size_t largest_free_size = 0, total_claims = 0;
++#if defined(SWEET)
++	vm_map_size_t total_free_size = 0, free_before_claims;
+ 
++	vm_map_sizes(kernel_map, NULL, &total_free_size, &largest_free_size);
++	free_before_claims = largest_free_size;
++#else
+ 	vm_map_sizes(kernel_map, NULL, NULL, &largest_free_size);
++#endif
+ 	largest_free_size = trunc_page(largest_free_size);
+ 
+ 	/*
+@@ -3549,6 +3557,28 @@ kmem_add_extra_claims(void)
+ 	largest_free_size -= total_claims;
+ 
+ #if defined(SWEET)
++	printf("kmem vmsizes total=%llx largest=%llx\n",
++	    (unsigned long long)total_free_size,
++	    (unsigned long long)free_before_claims);
++	printf("kmem gvirt=%llx vstart=%llx\n",
++	    (unsigned long long)gVirtBase,
++	    (unsigned long long)virtual_space_start);
++	{
++		vm_map_offset_t rstart;
++		vm_map_size_t rsize;
++
++		for (unsigned int r = 0; r < 4; r++) {
++			if (pmap_virtual_region(r, &rstart, &rsize)) {
++				printf("kmem vregion%u=%llx-%llx\n", r,
++				    (unsigned long long)rstart,
++				    (unsigned long long)(rstart + rsize));
++			}
++		}
++	}
++	printf("kmem claims=%llx free0=%llx free=%llx\n",
++	    (unsigned long long)total_claims,
++	    (unsigned long long)free_before_claims,
++	    (unsigned long long)largest_free_size);
+ 	sweet_early_hex("kmem free", largest_free_size);
+ 	sweet_early_hex("kmem totalclaims", total_claims);
+ 	sweet_early_hex("kmem sane", sane_size);
+@@ -3589,13 +3619,11 @@ kmem_add_extra_claims(void)
+ 	sweet_early_hex("kmem spray", sprayqtn_range_size);
+ 	sweet_early_hex("kmem data", data_range_size);
+ 	sweet_early_hex("kmem meta", kmem_meta_size);
+-	printf("kmem free=%llx ptr=%llx spray=%llx data=%llx meta=%llx n=%u\n",
+-	    (unsigned long long)largest_free_size,
+-	    (unsigned long long)ptr_range_size,
+-	    (unsigned long long)sprayqtn_range_size,
+-	    (unsigned long long)data_range_size,
+-	    (unsigned long long)kmem_meta_size,
+-	    (unsigned int)kmem_claim_count);
++	printf("kmem ptr=%llx\n", (unsigned long long)ptr_range_size);
++	printf("kmem spray=%llx\n", (unsigned long long)sprayqtn_range_size);
++	printf("kmem data=%llx\n", (unsigned long long)data_range_size);
++	printf("kmem meta=%llx\n", (unsigned long long)kmem_meta_size);
++	printf("kmem n=%u\n", (unsigned int)kmem_claim_count);
+ #endif
+ 
+ 	struct kmem_range_startup_spec kmem_spec_sprayqtn = {
+@@ -3678,6 +3706,10 @@ kmem_scramble_ranges(void)
+ 			do {
+ 				vm_map_size_t hs = h->end - h->start;
+ 				nholes++;
++				printf("kmem hole%u=%llx-%llx (%llx)\n", nholes,
++				    (unsigned long long)h->start,
++				    (unsigned long long)h->end,
++				    (unsigned long long)hs);
+ 				if (hs > best_size) {
+ 					best_size = hs;
+ 					best = h;
+@@ -3709,6 +3741,9 @@ kmem_scramble_ranges(void)
+ 	/*
+ 	 * Apply restrictions and determine range for each claim
+ 	 */
++#if defined(SWEET)
++	vm_map_size_t claim_sum = 0;
++#endif
+ 	for (uint32_t i = 0; i < kmem_claim_count; i++) {
+ 		vm_map_offset_t end = 0;
+ 		kern_return_t kr;
+@@ -3716,8 +3751,9 @@ kmem_scramble_ranges(void)
+ 		struct mach_vm_range *sp_range = sp.kc_range;
+ 
+ #if defined(SWEET)
+-		printf("kmem claim %s sz=%llx st=%llx\n", sp.kc_name,
+-		    (unsigned long long)sp.kc_size, (unsigned long long)start);
++		printf("kmem claim %s sz=%llx st=%llx sum=%llx\n", sp.kc_name,
++		    (unsigned long long)sp.kc_size, (unsigned long long)start,
++		    (unsigned long long)claim_sum);
+ #endif
+ 		kr = vm_map_locate_space(kernel_map, sp.kc_size, 0,
+ 		    VM_MAP_KERNEL_FLAGS_ANYWHERE(), &start, NULL);
+@@ -3736,6 +3772,9 @@ kmem_scramble_ranges(void)
+ 			panic("kmem_range_init: vm_map_locate_space failing for claim %s",
+ 			    sp.kc_name);
+ 		}
++#if defined(SWEET)
++		claim_sum += sp.kc_size;
++#endif
+ 
+ 		end = start + sp.kc_size;
+ 		/*
+@@ -3749,6 +3788,9 @@ kmem_scramble_ranges(void)
+ 		}
+ 		start = end;
+ 	}
++#if defined(SWEET)
++	printf("kmem placed=%llx\n", (unsigned long long)claim_sum);
++#endif
+ 
+ 	/*
+ 	 * We have settled on the ranges, now create temporary entries for the
