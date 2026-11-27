@@ -2,15 +2,81 @@
 
 ## >>> A10 PORT (Samsung Galaxy A10, SM-A105F) - active work 2026-11-13 <<<
 
+### >>> UPDATE 2026-11-27: 0168 commpage text alignment (write_pte_fast mixed-page panic) <<<
+
+**QEMU caught a real boot panic on the full-RAM 0166 kernel.** On a short
+(4 s) `tools/qemu-a10.py` run the kernel panicked:
+
+```
+write_pte_fast: PTE write is unaligned, ptep=0xfffffff0317c7f10, pte=0x420000082fc0ec3 @pmap.c:623
+```
+
+Backtrace (resolved against `kernel.development.sweet`):
+`panic <- write_pte_fast (inlined in pmap_enter_pte) <- pmap_enter_pte <-
+pmap_enter_options_internal+0xb48 <- pmap_enter_options_addr <-
+pmap_create_commpages+0x1e4 <- commpage_populate <- vm_commpage_init`.
+
+Root cause. Our build has `__ARM_16K_PG__` **not** defined, so
+`ARM_PGSHIFT=12` (4 KiB hardware page tables) while `PAGE_SHIFT=14`
+(`memSize > 1 GiB`, `osfmk/arm/arm_init.c`) → **PAGE_RATIO=4 mixed mode**.
+A 16 KiB VM page occupies **four** consecutive leaf PTEs. `write_pte_fast()`
+requires the 4-PTE group to be 32-byte aligned (`ptep & 0x1f == 0`), i.e. the
+leaf index must be a multiple of `PAGE_RATIO`. `pmap_create_commpages()`
+(`CONFIG_ARM_PFZ`) slides the commpage *text* page at a **random 4 KiB slot**:
+`text_leaf_index = random() % num_ptes; commpage_text_va |= text_leaf_index <<
+pt_attr_leaf_shift(pt_attr);`. With probability 3/4 the random index is not a
+multiple of 4, `pmap_enter_addr()` maps a VM page at a 4 KiB-aligned-but-not-
+16 KiB-aligned VA, and `write_pte_fast()` panics. The earlier 30 s QEMU run
+did not panic only because `random()` happened to pick an aligned slot; the
+4 s run picked index `0x1e2` (mod 4 = 2).
+
+**0168 (`xnu/patches/0168-a10-commpage-text-align.patch`, `osfmk/arm/pmap/pmap.c`)
+fixes three potential panic/critical-failure causes:**
+
+1. **Unaligned commpage text VA panic.** Choose a random *VM-page-aligned*
+   leaf slot: `ptes_per_page = PAGE_SIZE >> pt_attr_leaf_shift(pt_attr)`
+   (4 in mixed mode, 1 on a 4 KiB kernel); `num_slots = num_ptes /
+   ptes_per_page`; `text_leaf_index = slot * ptes_per_page`. Skip the two
+   occupied slots (`_COMM_PAGE64_BASE_ADDRESS`, `_COMM_PAGE64_RO_ADDRESS`).
+   Then `assert(ptes_per_page > 0 && num_ptes % ptes_per_page == 0 &&
+   num_slots > 0)` and `panic()` if no free VM-page-aligned slot or
+   `commpage_text_va & (PAGE_SIZE-1)`. `pmap_enter_addr` is called only with
+   a 16 KiB-aligned VA, so `write_pte_fast()` can't panic.
+2. **Unbounded random retry boot hang.** The original `do { ... } while
+   (collide);` can spin forever if `random()` keeps returning a colliding
+   index. Replace with a bounded scan of `num_slots` slots starting at a
+   random slot; `panic()` if none free.
+3. **Unchecked commpage page allocation.** The non-`XNU_MONITOR` path did
+   `(void) pmap_pages_alloc_zeroed(...)` and ignored the `kern_return_t`,
+   leaving `data_pa`/`ro_data_pa`/`text_pa` = 0 on `KERN_RESOURCE_SHORTAGE`.
+   `pmap_enter_addr(..., pa=0, ...)` would map PA 0 (`pa_valid(0)=false`),
+   `pmap_update_tt3e()` would read `tte_to_pa(ARM_TTE_EMPTY)=0`, and
+   `commpage_populate()` would write via `phystokv(0)` → panic/corruption.
+   Now `panic()` if `pmap_pages_alloc_zeroed != KERN_SUCCESS` or the
+   returned PA is 0. Also replace `assert(kr == KERN_SUCCESS)` for the
+   commpage `pmap_enter_addr` calls with `if (kr != KERN_SUCCESS)
+   panic(...)`, so a failed `pmap_expand`/allocation can't be silently
+   compiled out and can't reach `pmap_update_tt3e()` with no PTE.
+
+Patch applies after 0167; `git apply --check` verified. No A10 hardware
+change, no Apple artifacts, no private data. Hardware test still pending
+phone access; QEMU re-validation is the next offline step.
+
 ### >>> UPDATE 2026-11-27: audit 0165/0166, 0167 hardening; probe95 was mis-built <<<
 
-**probe95 is not a valid 0166 test.** The embedded payload of
-`dist/boot-a10-probe95.img` (sha `B9C19FA8...`) has `phys_base 0xC4000000`,
-`mem_size 0x24F00000` (591 MiB) and no `sweet_mem4g=1`: it was built with
-`dist/a10.adt` instead of `work/a10-fullram-4cpu.adt`. With 591 MiB every
-claim fits, so even a successful boot says nothing about the full-RAM path.
-The next image must pass `-Adt work/a10-fullram-4cpu.adt` and keep
-`sweet_mem4g=1`; `tools/build_a10_xnu.ps1` now needs a guard for this.
+**probe95 is not a valid 0166 test, and it could not boot.** The embedded
+payload of `dist/boot-a10-probe95.img` (sha `B9C19FA8...`) has
+`phys_base 0xC4000000`, `mem_size 0x24F00000` (591 MiB) and no
+`sweet_mem4g=1`: it was built with `dist/a10.adt` instead of
+`work/a10-fullram-4cpu.adt`. The old window alone would not matter, but 0166
+registers the `zones` claim as `ZONE_MAP_VA_SIZE` = 8 GiB regardless of
+`memSize`, and the compressor as 16 × `max_mem` (≈9.2 GiB for 591 MiB).
+Those two claims alone need ≈17.2 GiB against a ≈0.58 GiB hole, so the
+unsigned underflow in `kmem_add_extra_claims()` and an early panic were
+inevitable. The user reports the phone did not reach the system after this
+flash, which matches. The next image must pass
+`-Adt work/a10-fullram-4cpu.adt` and keep `sweet_mem4g=1`;
+`tools/build_a10_xnu.ps1` now needs a guard for this.
 
 **0167 hardening (five audit findings).** (1) `kmem_add_extra_claims()` panics
 with `KMEMOVER claims=... hole=... short=...` before subtracting

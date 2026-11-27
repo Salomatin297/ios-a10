@@ -1,0 +1,184 @@
+diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
+index a6b42b3..f0c3188 100644
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -10860,16 +10860,33 @@ pmap_create_commpages(vm_map_address_t *kernel_data_addr, vm_map_address_t *kern
+ #endif
+ 
+ #else /* XNU_MONITOR */
+-	(void) pmap_pages_alloc_zeroed(&data_pa, PAGE_SIZE, 0);
+ 	/*
+-	 * For non-PPL devices, we have neither page lockdown nor a physical aperture
+-	 * mapped at page granularity, so a separate page for kernel RO data would not
+-	 * be useful.
++	 * 0168: a failed page allocation must not fall through with pa=0.
++	 * data_pa/ro_data_pa/text_pa start at 0; mapping PA 0 would later
++	 * panic in pmap_update_tt3e()/write_pte_fast() or corrupt memory.
+ 	 */
+-	ro_data_pa = data_pa;
++	{
++		kern_return_t alloc_kr;
++
++		alloc_kr = pmap_pages_alloc_zeroed(&data_pa, PAGE_SIZE, 0);
++		if (alloc_kr != KERN_SUCCESS || data_pa == 0) {
++			panic("%s: failed to allocate commpage data page (kr=%d, pa=%p)",
++			    __func__, alloc_kr, (void *)data_pa);
++		}
++		/*
++		 * For non-PPL devices, we have neither page lockdown nor a physical aperture
++		 * mapped at page granularity, so a separate page for kernel RO data would not
++		 * be useful.
++		 */
++		ro_data_pa = data_pa;
+ #if CONFIG_ARM_PFZ
+-	(void) pmap_pages_alloc_zeroed(&text_pa, PAGE_SIZE, 0);
++		alloc_kr = pmap_pages_alloc_zeroed(&text_pa, PAGE_SIZE, 0);
++		if (alloc_kr != KERN_SUCCESS || text_pa == 0) {
++			panic("%s: failed to allocate commpage text page (kr=%d, pa=%p)",
++			    __func__, alloc_kr, (void *)text_pa);
++		}
+ #endif
++	}
+ 
+ #endif /* XNU_MONITOR */
+ 
+@@ -10892,11 +10909,15 @@ pmap_create_commpages(vm_map_address_t *kernel_data_addr, vm_map_address_t *kern
+ 
+ 	/* The user 64-bit mappings... */
+ 	kr = pmap_enter_addr(commpage_pmap_default, _COMM_PAGE64_BASE_ADDRESS, data_pa, VM_PROT_READ, VM_PROT_NONE, VM_WIMG_USE_DEFAULT, TRUE);
+-	assert(kr == KERN_SUCCESS);
++	if (kr != KERN_SUCCESS) {
++		panic("%s: pmap_enter_addr failed (kr=%d)", __func__, kr);
++	}
+ 	pmap_update_tt3e(commpage_pmap_default, _COMM_PAGE64_BASE_ADDRESS, PMAP_COMM_PAGE_PTE_TEMPLATE);
+ 
+ 	kr = pmap_enter_addr(commpage_pmap_default, _COMM_PAGE64_RO_ADDRESS, ro_data_pa, VM_PROT_READ, VM_PROT_NONE, VM_WIMG_USE_DEFAULT, TRUE);
+-	assert(kr == KERN_SUCCESS);
++	if (kr != KERN_SUCCESS) {
++		panic("%s: pmap_enter_addr failed (kr=%d)", __func__, kr);
++	}
+ 	pmap_update_tt3e(commpage_pmap_default, _COMM_PAGE64_RO_ADDRESS, PMAP_COMM_PAGE_PTE_TEMPLATE);
+ #if CONFIG_ARM_PFZ
+ 	/* User mapping of comm page text section for 64 bit mapping only
+@@ -10913,16 +10934,52 @@ pmap_create_commpages(vm_map_address_t *kernel_data_addr, vm_map_address_t *kern
+ 	const pt_attr_t * const pt_attr = pmap_get_pt_attr(commpage_pmap_default);
+ 	int num_ptes = pt_attr_leaf_size(pt_attr) >> PTE_SHIFT;
+ 
++	/*
++	 * 0168: in mixed page-size configurations a VM page spans several leaf
++	 * PTEs (PAGE_RATIO > 1).  The commpage text mapping must start on a VM
++	 * page boundary; write_pte_fast() panics on an unaligned PTE group.
++	 * Choose a random *VM-page-aligned* leaf slot.
++	 */
++	int ptes_per_page = (int)(PAGE_SIZE >> pt_attr_leaf_shift(pt_attr));
++	int num_slots = num_ptes / ptes_per_page;
++	const vm_map_address_t l3_base =
++	    _COMM_PAGE64_BASE_ADDRESS & ~(vm_map_address_t)pt_attr_leaf_index_mask(pt_attr);
++	const unsigned int leaf_shift = pt_attr_leaf_shift(pt_attr);
++
++	assert(ptes_per_page > 0);
++	assert((num_ptes % ptes_per_page) == 0);
++	assert(num_slots > 0);
++
+ 	vm_map_address_t commpage_text_va = 0;
+ 
+-	do {
+-		int text_leaf_index = random() % num_ptes;
++	/* 0168: bounded scan; the original do/while can spin forever if
++	 * random() keeps returning a colliding index. */
++	if (num_slots > 0) {
++		int start = random() % num_slots;
+ 
+-		// Generate a VA for the commpage text with the same root and twig index as data
+-		// comm page, but with new leaf index we've just generated.
+-		commpage_text_va = (_COMM_PAGE64_BASE_ADDRESS & ~pt_attr_leaf_index_mask(pt_attr));
+-		commpage_text_va |= (text_leaf_index << pt_attr_leaf_shift(pt_attr));
+-	} while ((commpage_text_va == _COMM_PAGE64_BASE_ADDRESS) || (commpage_text_va == _COMM_PAGE64_RO_ADDRESS)); // Try again if we collide (should be unlikely)
++		for (int tries = 0; tries < num_slots; tries++) {
++			int slot = (start + tries) % num_slots;
++			int text_leaf_index = slot * ptes_per_page;
++			vm_map_address_t va = l3_base | ((vm_map_address_t)text_leaf_index << leaf_shift);
++
++			if (va == _COMM_PAGE64_BASE_ADDRESS || va == _COMM_PAGE64_RO_ADDRESS) {
++				continue;
++			}
++
++			commpage_text_va = va;
++			break;
++		}
++	}
++
++	/*
++	 * 0168: never map an unaligned VM page; write_pte_fast() panics.
++	 * No free VM-page-aligned slot is a hard error, not a silent
++	 * mis-mapping.
++	 */
++	if (commpage_text_va == 0 || (commpage_text_va & (PAGE_SIZE - 1))) {
++		panic("%s: no free VM-page-aligned commpage text slot "
++		    "(num_slots=%d, ptes_per_page=%d)", __func__, num_slots, ptes_per_page);
++	}
+ 
+ 	// Assert that this is empty
+ 	__assert_only pt_entry_t *ptep = pmap_pte(commpage_pmap_default, commpage_text_va);
+@@ -10931,7 +10988,9 @@ pmap_create_commpages(vm_map_address_t *kernel_data_addr, vm_map_address_t *kern
+ 
+ 	// At this point, we've found the address we want to insert our comm page at
+ 	kr = pmap_enter_addr(commpage_pmap_default, commpage_text_va, text_pa, VM_PROT_READ | VM_PROT_EXECUTE, VM_PROT_NONE, VM_WIMG_USE_DEFAULT, TRUE);
+-	assert(kr == KERN_SUCCESS);
++	if (kr != KERN_SUCCESS) {
++		panic("%s: pmap_enter_addr failed (kr=%d)", __func__, kr);
++	}
+ 	// Mark it as global page R/X so that it doesn't get thrown out on tlb flush
+ 	pmap_update_tt3e(commpage_pmap_default, commpage_text_va, PMAP_COMM_PAGE_TEXT_PTE_TEMPLATE);
+ 
+@@ -10940,11 +10999,15 @@ pmap_create_commpages(vm_map_address_t *kernel_data_addr, vm_map_address_t *kern
+ 
+ 	/* ...and the user 32-bit mappings. */
+ 	kr = pmap_enter_addr(commpage_pmap_default, _COMM_PAGE32_BASE_ADDRESS, data_pa, VM_PROT_READ, VM_PROT_NONE, VM_WIMG_USE_DEFAULT, TRUE);
+-	assert(kr == KERN_SUCCESS);
++	if (kr != KERN_SUCCESS) {
++		panic("%s: pmap_enter_addr failed (kr=%d)", __func__, kr);
++	}
+ 	pmap_update_tt3e(commpage_pmap_default, _COMM_PAGE32_BASE_ADDRESS, PMAP_COMM_PAGE_PTE_TEMPLATE);
+ 
+ 	kr = pmap_enter_addr(commpage_pmap_default, _COMM_PAGE32_RO_ADDRESS, ro_data_pa, VM_PROT_READ, VM_PROT_NONE, VM_WIMG_USE_DEFAULT, TRUE);
+-	assert(kr == KERN_SUCCESS);
++	if (kr != KERN_SUCCESS) {
++		panic("%s: pmap_enter_addr failed (kr=%d)", __func__, kr);
++	}
+ 	pmap_update_tt3e(commpage_pmap_default, _COMM_PAGE32_RO_ADDRESS, PMAP_COMM_PAGE_PTE_TEMPLATE);
+ #if __ARM_MIXED_PAGE_SIZE__
+ 	/**
+@@ -10959,20 +11022,28 @@ pmap_create_commpages(vm_map_address_t *kernel_data_addr, vm_map_address_t *kern
+ 
+ 	/* The user 64-bit mappings... */
+ 	kr = pmap_enter_addr(commpage_pmap_4k, _COMM_PAGE64_BASE_ADDRESS, data_pa, VM_PROT_READ, VM_PROT_NONE, VM_WIMG_USE_DEFAULT, TRUE);
+-	assert(kr == KERN_SUCCESS);
++	if (kr != KERN_SUCCESS) {
++		panic("%s: pmap_enter_addr failed (kr=%d)", __func__, kr);
++	}
+ 	pmap_update_tt3e(commpage_pmap_4k, _COMM_PAGE64_BASE_ADDRESS, PMAP_COMM_PAGE_PTE_TEMPLATE);
+ 
+ 	kr = pmap_enter_addr(commpage_pmap_4k, _COMM_PAGE64_RO_ADDRESS, ro_data_pa, VM_PROT_READ, VM_PROT_NONE, VM_WIMG_USE_DEFAULT, TRUE);
+-	assert(kr == KERN_SUCCESS);
++	if (kr != KERN_SUCCESS) {
++		panic("%s: pmap_enter_addr failed (kr=%d)", __func__, kr);
++	}
+ 	pmap_update_tt3e(commpage_pmap_4k, _COMM_PAGE64_RO_ADDRESS, PMAP_COMM_PAGE_PTE_TEMPLATE);
+ 
+ 	/* ...and the user 32-bit mapping. */
+ 	kr = pmap_enter_addr(commpage_pmap_4k, _COMM_PAGE32_BASE_ADDRESS, data_pa, VM_PROT_READ, VM_PROT_NONE, VM_WIMG_USE_DEFAULT, TRUE);
+-	assert(kr == KERN_SUCCESS);
++	if (kr != KERN_SUCCESS) {
++		panic("%s: pmap_enter_addr failed (kr=%d)", __func__, kr);
++	}
+ 	pmap_update_tt3e(commpage_pmap_4k, _COMM_PAGE32_BASE_ADDRESS, PMAP_COMM_PAGE_PTE_TEMPLATE);
+ 
+ 	kr = pmap_enter_addr(commpage_pmap_4k, _COMM_PAGE32_RO_ADDRESS, ro_data_pa, VM_PROT_READ, VM_PROT_NONE, VM_WIMG_USE_DEFAULT, TRUE);
+-	assert(kr == KERN_SUCCESS);
++	if (kr != KERN_SUCCESS) {
++		panic("%s: pmap_enter_addr failed (kr=%d)", __func__, kr);
++	}
+ 	pmap_update_tt3e(commpage_pmap_4k, _COMM_PAGE32_RO_ADDRESS, PMAP_COMM_PAGE_PTE_TEMPLATE);
+ #endif
+ 
