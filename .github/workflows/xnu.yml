@@ -246,6 +246,11 @@ jobs:
           need dxb/xnu/osfmk/kern/zalloc.c '#define ZONE_MAP_VA_SIZE        (8ULL << 30)' present '0166 zones VA 8G'
           need dxb/xnu/osfmk/kern/zalloc.c 'zone va=' present '0166 zone sizing dump'
           need dxb/xnu/osfmk/vm/vm_compressor.c 'compressor buf=' present '0166 compressor sizing dump'
+          need dxb/xnu/osfmk/vm/vm_kern.c 'KMEMOVER claims=' present '0167 kmem underflow guard'
+          need dxb/xnu/osfmk/vm/vm_kern.c 'kmem redo %s' present '0167 first-claim restriction retry'
+          need dxb/xnu/osfmk/vm/vm_map.c 'all three outputs are optional' present '0167 vm_map_sizes NULL outputs'
+          need dxb/xnu/osfmk/kern/zalloc.c 'zone map may never exceed' present '0167 zsize VA clamp'
+          need dxb/xnu/osfmk/kern/zalloc.c 'cannot place the VM submap' present '0167 zone start guard'
           if [ "$fail" -ne 0 ]; then
             echo "::error::A10 port patches did not apply cleanly"
             exit 1

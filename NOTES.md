@@ -2,6 +2,38 @@
 
 ## >>> A10 PORT (Samsung Galaxy A10, SM-A105F) - active work 2026-11-13 <<<
 
+### >>> UPDATE 2026-11-27: audit 0165/0166, 0167 hardening; probe95 was mis-built <<<
+
+**probe95 is not a valid 0166 test.** The embedded payload of
+`dist/boot-a10-probe95.img` (sha `B9C19FA8...`) has `phys_base 0xC4000000`,
+`mem_size 0x24F00000` (591 MiB) and no `sweet_mem4g=1`: it was built with
+`dist/a10.adt` instead of `work/a10-fullram-4cpu.adt`. With 591 MiB every
+claim fits, so even a successful boot says nothing about the full-RAM path.
+The next image must pass `-Adt work/a10-fullram-4cpu.adt` and keep
+`sweet_mem4g=1`; `tools/build_a10_xnu.ps1` now needs a guard for this.
+
+**0167 hardening (five audit findings).** (1) `kmem_add_extra_claims()` panics
+with `KMEMOVER claims=... hole=... short=...` before subtracting
+`total_claims` from the largest hole, instead of wrapping to a garbage
+`ptr_range_size`. (2) `zone_set_map_sizes()` clamps `zsize` to
+`MIN(ZONE_MAP_MAX, ZONE_MAP_VA_SIZE)` even when the `zsize` boot-arg is
+present. (3) `vm_map_sizes(NULL, ...)` now tolerates each of its three output
+pointers being NULL. (4) a restricted first claim retries
+`vm_map_locate_space()` at the restriction instead of calling
+`kmem_readjust_ranges(0)` and tripping its assert; a real failure now panics
+with the claim name and both addresses. (5) a zero `zone_map_range.min_address`
+(overflow in `zone_restricted_va_max() - vm_submap_size`) panics instead of
+letting `zone_init()` suballocate at address 0.
+
+**QEMU.** QEMU 11.1.0 is installed; the A10 harness (`tools/qemu-a10.py`) is
+being adapted from the a5xelte runner: GICv2, cortex-a53, framebuffer
+`0xEC000000` 720x1600 stride 2880, 16K pages, and a `SWHOLES1` hole list in
+the boot_args page. `mkadt-a10.py --qemu` still emits the 26 MHz timebase and
+must become 62.5 MHz for virt.
+
+Next: build 0167 in CI, run the QEMU harness against 0166/0167, add the
+ADT/cmdline guard to the image builder, then flash a 2-core full-RAM probe.
+
 ### >>> UPDATE 2026-11-25: probe94 kmem accounting; 0166 zones VA 8G <<<
 
 **probe94 (0165, 4 cores).** The largest-hole anchor works and the whole
@@ -40,9 +72,22 @@ internals (`c_seg_bufsize`, `c_seg_allocsize`, `c_segments_limit`,
 `compressor_pool_size/max_size`, `max_mem`, `c_segments_arr_size`,
 `c_buffers_size`, `compressor_size`, `vm_swap_get_max_configured_space()`,
 `vm_compression_limit`). Patch `xnu/patches/0166-a10-kmem-zone-va-fit.patch`
-(three files); workflow markers updated. The compressor claim was left as is
-until probe95 shows the real `max_mem`/pool arithmetic (16x `max_mem` on this
-macOS-target build, not the `max_mem` in the non-OSX branch).
+(three files); workflow markers updated.
+
+**The live kernel is running 16 KB pages.** `arm_init.c` selects
+`PAGE_SHIFT_CONST = PAGE_MAX_SHIFT` (14) whenever `args->memSize > 1 GiB`;
+with the 0162 full-RAM ADT (`dram-size 0x68F00000`) that condition is now
+true. The probe94 compressor size confirms it exactly: `c_seg_bufsize` 64 KiB,
+`c_seg_allocsize` 0x14000, `max_mem` = 0x65F7FC00 (0x68F00000 minus 47.5 MiB
+of holes), `compressor_pool_size` = 16x `max_mem` = 0x65F7FC000,
+`c_segments_limit` = 334131, and 334131*0x14000 + round16K(8*334131) + 0x10000
+= `0x65FA9C000`, the value on screen. The `0x1CCC000` `zone_meta` claim also
+matches 16 KB pages (zone map `zsize` is 3/8 of `sane_size` = 599 MiB).
+So the "4 KB-page kernel" note from probe84 applies to the pre-0162 images
+(`memSize` then was <= 1 GiB); the current probes have 16 KB kernel pages and
+4 KB user VA (`SWEET_4K_USERVA`). This matters for every driver that uses
+`PAGE_SIZE`. The compressor claim was left as is until probe95 prints the
+same internals from the new kernel.
 
 **Next:** commit/push 0166, run kernel CI, build probe95 with
 `tools/build_probe_smp.ps1`, force-reboot the phone to TWRP (probe94 is in
@@ -50,6 +95,16 @@ macOS-target build, not the `max_mem` in the non-OSX branch).
 lines. If placement still fails, use the printed `free0`/`claims`/`placed`
 and compressor numbers to trim the compressor claim or adjust
 `ZONE_MAP_VA_SIZE` again.
+
+**probe95 built (0166 kernel).** CI run `45636063474` (run 105) succeeded in
+~7 minutes with all 0166 markers verified; kernel SHA256
+`776CC3DFFE489A601F66701F626C4016F463BE971662A71843AC6C8135618A56`
+(16,740,400 bytes). Image `dist/boot-a10-probe95.img` SHA256
+`6BA44A84710F16326B40ADEF3AD1E9FB44383D31879CF4B4777B9889FC0F31FC`,
+payload `B9C19FA82E83713D811CCD73B78BD3E5C68C01878BD5C5D3D894ED7C9347C9DB`,
+zip `92FE7004B97224DBD91970EBFEEEB0B65320DB7F48DBE3DF23398F4FFEE18D3A`.
+The cmdline/ADT are identical to probe94 (`cpus=4`, full-RAM ADT). Awaiting a
+manual force-reboot into TWRP and the flash.
 
 ### >>> UPDATE 2026-11-21: 0163 boots past the fb fault; 0164 kmem diagnostics <<<
 

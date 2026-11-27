@@ -1,0 +1,139 @@
+diff --git a/osfmk/kern/zalloc.c b/osfmk/kern/zalloc.c
+index d4b0a69..7dc552b 100644
+--- a/osfmk/kern/zalloc.c
++++ b/osfmk/kern/zalloc.c
+@@ -10092,12 +10092,30 @@ zone_set_map_sizes(void)
+ 	if (zsize > sane_size >> 1) {
+ 		zsize = (vm_size_t)(sane_size >> 1); /* Clamp to half of RAM max */
+ 	}
++#if defined(SWEET)
++	/*
++	 * 0167: the zone map may never exceed the VA reservation that the
++	 * kmem claim makes for it, even when a zsize boot-arg asks for more.
++	 * Otherwise zone_pages_wired_max promises more wired pages than the
++	 * submap can ever map.
++	 */
++	{
++		vm_size_t zlimit = MIN(ZONE_MAP_MAX, (vm_size_t)ZONE_MAP_VA_SIZE);
++
++		if (zsize > zlimit) {
++			printf("NOTE: zonemap size reduced from 0x%lx to 0x%lx\n",
++			    (uintptr_t)zsize, (uintptr_t)zlimit);
++			zsize = zlimit;
++		}
++	}
++#else
+ 	if (zsizearg == 0 && zsize > ZONE_MAP_MAX) {
+ 		/* if zsize boot-arg not present and zsize exceeds platform maximum, clip zsize */
+ 		printf("NOTE: zonemap size reduced from 0x%lx to 0x%lx\n",
+ 		    (uintptr_t)zsize, (uintptr_t)ZONE_MAP_MAX);
+ 		zsize = ZONE_MAP_MAX;
+ 	}
++#endif
+ 
+ 	zone_pages_wired_max = (uint32_t)atop(trunc_page(zsize));
+ 
+@@ -10116,6 +10134,14 @@ zone_set_map_sizes(void)
+ 	    &zone_map_range.min_address)) {
+ 		zone_map_range.min_address = 0;
+ 	}
++#if defined(SWEET)
++	/* 0167: a zero start would make zone_init() suballocate at address 0. */
++	if (zone_map_range.min_address == 0) {
++		panic("zone: cannot place the VM submap (%llx) below %llx",
++		    (unsigned long long)vm_submap_size,
++		    (unsigned long long)zone_restricted_va_max());
++	}
++#endif
+ 
+ 	zone_meta_size = round_page(atop(ZONE_MAP_VA_SIZE) *
+ 	    sizeof(struct zone_page_metadata)) + ZONE_GUARD_SIZE * 2;
+diff --git a/osfmk/vm/vm_kern.c b/osfmk/vm/vm_kern.c
+index 4451388..b31907a 100644
+--- a/osfmk/vm/vm_kern.c
++++ b/osfmk/vm/vm_kern.c
+@@ -3554,6 +3554,23 @@ kmem_add_extra_claims(void)
+ 		total_claims += kmem_claims[i].kc_size;
+ 	}
+ 	assert((total_claims & PAGE_MASK) == 0);
++#if defined(SWEET)
++	/*
++	 * 0167: never let the subtraction wrap.  If the registered claims do
++	 * not fit the largest hole, say exactly how much is missing and stop
++	 * here instead of computing a garbage ptr_range_size and panicking
++	 * later in an unrelated claim.
++	 */
++	if (total_claims > largest_free_size) {
++		printf("KMEMOVER claims=%llx hole=%llx short=%llx\n",
++		    (unsigned long long)total_claims,
++		    (unsigned long long)largest_free_size,
++		    (unsigned long long)(total_claims - largest_free_size));
++		panic("kmem: claims %llx exceed the largest hole %llx",
++		    (unsigned long long)total_claims,
++		    (unsigned long long)largest_free_size);
++	}
++#endif
+ 	largest_free_size -= total_claims;
+ 
+ #if defined(SWEET)
+@@ -3781,7 +3798,38 @@ kmem_scramble_ranges(void)
+ 		 * Re-adjust ranges if restriction not met
+ 		 */
+ 		if (sp_range->min_address && start > sp_range->min_address) {
++#if defined(SWEET)
++			if (i == 0) {
++				/*
++				 * 0167: kmem_readjust_ranges() cannot move
++				 * the first claim (assert(cur_idx != 0)).
++				 * Nothing has been placed yet, so retry the
++				 * search at the restriction instead of
++				 * asserting, then fail with a readable
++				 * message if the space is genuinely gone.
++				 */
++				start = sp_range->min_address;
++				kr = vm_map_locate_space(kernel_map, sp.kc_size, 0,
++				    VM_MAP_KERNEL_FLAGS_ANYWHERE(), &start, NULL);
++				printf("kmem redo %s sz=%llx st=%llx kr=%d\n",
++				    sp.kc_name, (unsigned long long)sp.kc_size,
++				    (unsigned long long)start, kr);
++				if (kr != KERN_SUCCESS ||
++				    start > sp_range->min_address) {
++					panic("kmem_range_init: %s cannot start at or below %llx (got %llx, kr=%d)",
++					    sp.kc_name,
++					    (unsigned long long)sp_range->min_address,
++					    (unsigned long long)start, kr);
++				}
++				end = start + sp.kc_size;
++				sp_range->min_address = start;
++				sp_range->max_address = end;
++			} else {
++				kmem_readjust_ranges(i);
++			}
++#else
+ 			kmem_readjust_ranges(i);
++#endif
+ 		} else {
+ 			sp_range->min_address = start;
+ 			sp_range->max_address = end;
+diff --git a/osfmk/vm/vm_map.c b/osfmk/vm/vm_map.c
+index e5a6f9f..1a94700 100644
+--- a/osfmk/vm/vm_map.c
++++ b/osfmk/vm/vm_map.c
+@@ -21595,7 +21595,16 @@ vm_map_sizes(vm_map_t map,
+ 	boolean_t       end;
+ 
+ 	if (!map) {
+-		*psize = *pfree = *plargest_free = 0;
++		/* 0167: all three outputs are optional; callers pass NULL. */
++		if (psize) {
++			*psize = 0;
++		}
++		if (pfree) {
++			*pfree = 0;
++		}
++		if (plargest_free) {
++			*plargest_free = 0;
++		}
+ 		return;
+ 	}
+ 	total_free = largest_free = 0;
